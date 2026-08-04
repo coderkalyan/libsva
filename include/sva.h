@@ -58,6 +58,16 @@
  * inspects one: evaluating and sampling atoms is your side of the fence. A clock
  * is a handle in its own space, since it delimits cycles rather than being
  * sampled in one.
+ *
+ * Atoms are assumed TWO-VALUED. sva_bool_not is boolean complement, evaluated as
+ * !atom once the guard layer has pushed it down to a leaf. If your own booleans
+ * are three-valued, do not use it: lower to negation normal form and give each
+ * polarity its own atom. SystemVerilog is the motivating case - LRM 16.6 reads an
+ * unknown expression as false, so both `a` and `!a` are false when a is x, and
+ * complementing the collapsed bit is simply wrong. De Morgan is sound in
+ * three-valued logic, so pushing negation to the leaves costs nothing else.
+ * sva_bool_and and sva_bool_or need no such care: they commute with a collapse to
+ * false, since an unknown operand cannot turn a known outcome around.
  */
 
 #ifndef SVA_H
@@ -178,6 +188,8 @@ typedef enum sva_kind {
 /* Boolean layer: the alphabet. */
 sva_status sva_bool_const(sva_ir *ir, bool value, sva_node *out);
 sva_status sva_bool_atom(sva_ir *ir, uint32_t atom, sva_node *out);
+/* Two-valued complement. See ATOMS above before using this from a front-end
+   whose booleans admit an unknown value. */
 sva_status sva_bool_not(sva_ir *ir, sva_node operand, sva_node *out);
 sva_status sva_bool_and(sva_ir *ir, sva_node lhs, sva_node rhs, sva_node *out);
 sva_status sva_bool_or(sva_ir *ir, sva_node lhs, sva_node rhs, sva_node *out);

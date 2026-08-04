@@ -19,6 +19,24 @@
 //! That is entirely the caller's business; a handle is only meaningful within
 //! the IR instance that produced it.
 //!
+//! **Atoms are assumed two-valued.** `bnot` is boolean complement: the guard
+//! layer pushes it down to a leaf and evaluates it as `!atom`. A front-end whose
+//! own booleans are *three*-valued must therefore not emit `bnot` over such a
+//! term. SystemVerilog is the motivating case: LRM 16.6 interprets an unknown
+//! expression as false, so under `a = 1'bx` both `a` and `!a` are false and
+//! `a || !a` does not hold — whereas `bnot` of the collapsed bit would report it
+//! as true. Such a front-end lowers to negation normal form instead, pushing
+//! negation to the leaves itself and supplying each polarity as its own atom;
+//! De Morgan is sound in three-valued logic, so nothing else changes. `band` and
+//! `bor` need no such care: they commute with the collapse to false, because an
+//! unknown operand can never turn a known outcome around.
+//!
+//! The cost of that encoding is that two polarities of one term are unrelated
+//! atoms, so a cube holding both is not recognised as unsatisfiable. Teaching
+//! the guard layer that a pair of atoms is mutually exclusive would recover it
+//! without this file learning anything about widths or unknown values, and is
+//! the intended move if state counts ever justify it.
+//!
 //! Operands always point *backwards*: a node's operands are nodes that were
 //! built before it, so an index is strictly less than the index of the node
 //! referring to it. The tree is therefore acyclic and already in topological

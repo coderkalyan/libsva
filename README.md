@@ -121,6 +121,23 @@ and the monitor one branch fewer.
 Atom handles must be **dense** from zero; `ir.atom_count` is the width of the
 per-cycle valuation a backend allocates and indexes by handle.
 
+**Atoms are assumed two-valued.** `bNot` is boolean complement — the guard layer
+pushes it down to a leaf and evaluates it as `!atom`. A front-end whose own
+booleans are *three*-valued must not emit it. SystemVerilog is the motivating
+case: LRM 16.6 reads an unknown expression as false, so under `a = 1'bx` both `a`
+and `!a` are false and `a || !a` does not hold, whereas complementing the
+collapsed bit reports it as true. Such a front-end lowers to negation normal form
+and gives each polarity its own atom; De Morgan is sound in three-valued logic,
+so nothing else changes. `band` and `bor` need no care — they commute with the
+collapse, because an unknown operand cannot turn a known outcome around.
+
+The cost is that two polarities of one term become unrelated atoms, so a cube
+holding both is not recognised as unsatisfiable (`Glushkov.zig` spots `x & !x`
+only when the negation is a real `bNot`). Teaching the guard layer that a pair of
+atoms is mutually exclusive would recover that without this library learning
+anything about widths or unknown values, and is the intended move if state counts
+ever justify it.
+
 ## Automata
 
 `sva.glushkov.sequence(gpa, &ir, node, .{}, null)` lowers a sequence to an
