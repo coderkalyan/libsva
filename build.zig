@@ -77,8 +77,30 @@ pub fn build(b: *std.Build) void {
     backend.root_module.linkLibrary(lib);
     const run_backend = b.addRunArtifact(backend);
 
-    const test_step = b.step("test", "Run unit tests and the C tests");
+    // Compiles the public header as C++ and drives the API from it. The C tests
+    // above cannot catch a header that is not *includable* from C++ — `alignas`
+    // versus `_Alignas` was one such break, found by a real consumer — and C++ is
+    // the expected consumer, not an exotic one.
+    const header = b.addExecutable(.{
+        .name = "sva-cpp-header",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    header.root_module.addCSourceFile(.{
+        .file = b.path("test/header.cpp"),
+        .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Wconversion", "-Werror" },
+    });
+    header.root_module.addIncludePath(b.path("include"));
+    header.root_module.linkLibrary(lib);
+    header.root_module.link_libcpp = true;
+    const run_header = b.addRunArtifact(header);
+
+    const test_step = b.step("test", "Run unit tests and the C / C++ tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_smoke.step);
     test_step.dependOn(&run_backend.step);
+    test_step.dependOn(&run_header.step);
 }

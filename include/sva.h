@@ -128,16 +128,24 @@ typedef enum sva_status {
 #define SVA_MONITOR_SIZE 288
 #define SVA_RUN_SIZE     160
 
+/* `alignas` is a keyword in C++11 and C23, and spelled `_Alignas` in C11. A C++
+   consumer is the expected case, so this cannot just use the C form. */
+#ifdef __cplusplus
+#define SVA_ALIGNAS(n) alignas(n)
+#else
+#define SVA_ALIGNAS(n) _Alignas(n)
+#endif
+
 typedef struct sva_ir {
-    _Alignas(8) unsigned char opaque[SVA_IR_SIZE];
+    SVA_ALIGNAS(8) unsigned char opaque[SVA_IR_SIZE];
 } sva_ir;
 
 typedef struct sva_monitor {
-    _Alignas(8) unsigned char opaque[SVA_MONITOR_SIZE];
+    SVA_ALIGNAS(8) unsigned char opaque[SVA_MONITOR_SIZE];
 } sva_monitor;
 
 typedef struct sva_run {
-    _Alignas(8) unsigned char opaque[SVA_RUN_SIZE];
+    SVA_ALIGNAS(8) unsigned char opaque[SVA_RUN_SIZE];
 } sva_run;
 
 /* Reached only by pointer, so it needs no size. */
