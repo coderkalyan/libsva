@@ -195,20 +195,23 @@ and you index it — one call per table, not per element.
 sva_ir ir;
 sva_ir_init(&ir);
 
-sva_node req, ack, consequent, property;
-uint32_t index;
+sva_node req, ack, consequent, property, reset;
 if (sva_bool_atom(&ir, 0, &req) != SVA_OK) goto fail;
 if (sva_seq_boolean(&ir, req, &req) != SVA_OK) goto fail;
 if (sva_bool_atom(&ir, 1, &ack) != SVA_OK) goto fail;
 if (sva_seq_boolean(&ir, ack, &ack) != SVA_OK) goto fail;
 if (sva_prop_sequence(&ir, SVA_WEAK, ack, &consequent) != SVA_OK) goto fail;
 if (sva_prop_implies(&ir, SVA_NONOVERLAPPING, req, consequent, &property) != SVA_OK) goto fail;
+if (sva_bool_const(&ir, false, &reset) != SVA_OK) goto fail; /* never resets */
 
-sva_directive d = { 0 };
-d.kind = SVA_ASSERT;
-d.clock = SVA_CLOCK_NONE;
-if (sva_bool_const(&ir, false, &d.reset) != SVA_OK) goto fail; /* never resets */
-d.property = property;
+const sva_directive d = {
+    .id = 0,
+    .kind = SVA_ASSERT,
+    .clock = SVA_CLOCK_NONE,
+    .reset = reset,
+    .property = property,
+};
+uint32_t index;
 if (sva_ir_add(&ir, &d, &index) != SVA_OK) goto fail;
 
 sva_monitor monitor;
