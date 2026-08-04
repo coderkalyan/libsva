@@ -23,6 +23,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/c.zig"),
             .target = target,
             .optimize = optimize,
+            // A C consumer's own build is very likely position-independent (a PIE
+            // executable is the default on most toolchains), and a non-PIC archive
+            // cannot be linked into one.
+            .pic = true,
         }),
     });
     lib.installHeader(b.path("include/sva.h"), "sva.h");
@@ -51,7 +55,30 @@ pub fn build(b: *std.Build) void {
     smoke.root_module.linkLibrary(lib);
     const run_smoke = b.addRunArtifact(smoke);
 
-    const test_step = b.step("test", "Run unit tests and the C smoke test");
+    // Proves the tables an `sva_monitor` exposes are enough to *compile* the
+    // per-cycle protocol, not just interpret it: it reimplements the protocol the
+    // way a code generator must - constants baked in, the state vector one machine
+    // integer, the bit iteration in `advance` transposed into a fold over
+    // statically-known states - and differential-tests that against `Monitor.State`
+    // over random traces.
+    const backend = b.addExecutable(.{
+        .name = "sva-c-backend",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    backend.root_module.addCSourceFile(.{
+        .file = b.path("test/backend.c"),
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Wconversion", "-Werror" },
+    });
+    backend.root_module.addIncludePath(b.path("include"));
+    backend.root_module.linkLibrary(lib);
+    const run_backend = b.addRunArtifact(backend);
+
+    const test_step = b.step("test", "Run unit tests and the C tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_smoke.step);
+    test_step.dependOn(&run_backend.step);
 }

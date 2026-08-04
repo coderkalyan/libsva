@@ -231,11 +231,41 @@ node that caused it, which is what a front-end turns into a diagnostic.
 `sva_bool_read` walks a boolean node back. A monitor's roots *are* boolean nodes,
 so this is how a backend discovers what to evaluate each cycle.
 
+### Compiling the protocol rather than interpreting it
+
+`Monitor.State` iterates the set bits of a state vector at run time. A code
+generator cannot — it has no loop over an unknown set. It reads every count and
+every mask out of the monitor once, then emits a fold over *statically known*
+states that selects each state's constant follow row by its own liveness bit:
+
+```c
+next = 0;
+for (each state s)                           /* unrolled at compile time */
+    next |= sext(current >> s) & FOLLOW_s;    /* FOLLOW_s is a constant */
+next &= satisfied;
+```
+
+`satisfy` transposes the same way, folding over guards instead of gathering per
+state — which is what `sva_automaton_guard_states` is for. Both collapse to
+branch-free integer arithmetic, and a state vector is one machine integer per
+attempt rather than a word array.
+
+`test/backend.c` is that backend, differential-tested against `Monitor.State`
+over random traces across eight property shapes. It is a test of the *contract*:
+if the exposed tables were not enough to reconstruct the protocol, or the
+transposition were unsound, it disagrees.
+
+One trap it pins down: `occupied` is **not** redundant with `pending != 0`. An
+attempt seeded into a cycle whose first letter does not hold has an empty state
+vector immediately, and that is a *failure* — the most common one there is. A
+backend that derives occupancy from emptiness cannot tell it from an absent
+attempt and silently reports nothing.
+
 ## Building the repository
 
 ```sh
 zig build          # build the static library into zig-out/
-zig build test     # run the unit tests
+zig build test     # unit tests, the C smoke test, and the backend test
 ```
 
 **Build it safe.** Everything above — operand layers, repetition and delay
