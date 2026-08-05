@@ -29,6 +29,12 @@ pub fn build(b: *std.Build) void {
             .pic = true,
         }),
     });
+    // A static library handed to a C or C++ consumer must be self-contained: it is
+    // linked by that project's linker, not Zig's, so nothing supplies Zig's
+    // compiler-rt for it. Without this, `__zig_probe_stack` (and any wide-integer
+    // helper the code happens to need) comes out undefined at the consumer's link
+    // step -- which no `zig build test` can catch, because those link with Zig.
+    lib.bundle_compiler_rt = true;
     lib.installHeader(b.path("include/sva.h"), "sva.h");
     b.installArtifact(lib);
 
