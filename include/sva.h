@@ -241,8 +241,35 @@ sva_status sva_seq_delay(sva_ir *ir, sva_node left, uint32_t lo, uint32_t hi,
                          sva_node right, sva_node *out);
 
 sva_status sva_seq_or(sva_ir *ir, sva_node lhs, sva_node rhs, sva_node *out);
+/* Both sides match from the same start cycle, and the match ends at the later
+   of the two ends: whichever side finishes first waits for the other. */
+sva_status sva_seq_and(sva_ir *ir, sva_node lhs, sva_node rhs, sva_node *out);
 /* Both sides match from the same start cycle *and* the same end cycle. */
 sva_status sva_seq_intersect(sva_ir *ir, sva_node lhs, sva_node rhs, sva_node *out);
+/* `exp` holds in every cycle a match of `sequence` spans. `exp` is a BOOLEAN
+   node, not a sequence — it is a condition on each cycle of the match rather
+   than something matching alongside it, and it is the only sequence-layer
+   operand that is.
+ *
+ * The LRM writes this as `(exp[*0:$]) intersect sequence`, which cannot be
+ * built here because that repetition admits an empty match. Since every
+ * sequence matches at least one cycle, `(exp[*1:$]) intersect sequence` is the
+ * same language, and is what this builds — for free, by conjoining `exp` into
+ * every state of the sequence's automaton. */
+sva_status sva_seq_throughout(sva_ir *ir, sva_node exp, sva_node sequence,
+                              sva_node *out);
+
+/* A match of `inner` lies somewhere inside a match of `outer`, and the match
+   ends where `outer` does.
+ *
+ * Sugar, not an operator of its own: this builds
+ * `(true ##[0:$] inner ##[0:$] true) intersect outer` from tags the IR already
+ * has, so nothing downstream has to learn a new one. The LRM pads with
+ * `1[*0:$]`, which is an empty match this IR cannot write; a `0..$` delay
+ * against a one-cycle `true` is the same padding without one, because delay 0
+ * fuses that cycle into the neighbouring match. */
+sva_status sva_seq_within(sva_ir *ir, sva_node inner, sva_node outer,
+                          sva_node *out);
 /* lo must be at least 1. Goto and non-consecutive repetition additionally
    require `sequence` to be an sva_seq_boolean, because they are defined in terms
    of the cycles in which the operand does not hold. */

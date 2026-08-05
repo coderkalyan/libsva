@@ -303,6 +303,45 @@ static sva_node build_intersect(sva_ir *ir) { /* (a ##[1:3] b) intersect (c ##2 
     return property;
 }
 
+/* `req |=> (en throughout (ack ##1 done))`. The boolean rides on every cycle of
+ * the obligation's match, so it lands in each state's guard rather than in a
+ * machine of its own — a backend sees one more root and no more states. */
+static sva_node build_throughout(sva_ir *ir) {
+    sva_node en = 0, body = 0, guarded = 0, consequent = 0, property = 0;
+    const sva_node req = atom_cycle(ir, 0);
+    BUILD(sva_bool_atom(ir, 1, &en));
+    BUILD(sva_seq_delay(ir, atom_cycle(ir, 2), 1, 1, atom_cycle(ir, 3), &body));
+    BUILD(sva_seq_throughout(ir, en, body, &guarded));
+    BUILD(sva_prop_sequence(ir, SVA_WEAK, guarded, &consequent));
+    BUILD(sva_prop_implies(ir, SVA_NONOVERLAPPING, req, consequent, &property));
+    return property;
+}
+
+/* `req |=> ((ack ##1 done) and rdy)`. The two sides end in different cycles, so
+ * the obligation stays live after `rdy` has matched and is discharged only when
+ * the longer side finishes — the case a plain product cannot express. */
+static sva_node build_and(sva_ir *ir) {
+    sva_node left = 0, both = 0, consequent = 0, property = 0;
+    const sva_node req = atom_cycle(ir, 0), rdy = atom_cycle(ir, 3);
+    BUILD(sva_seq_delay(ir, atom_cycle(ir, 1), 1, 1, atom_cycle(ir, 2), &left));
+    BUILD(sva_seq_and(ir, left, rdy, &both));
+    BUILD(sva_prop_sequence(ir, SVA_WEAK, both, &consequent));
+    BUILD(sva_prop_implies(ir, SVA_NONOVERLAPPING, req, consequent, &property));
+    return property;
+}
+
+/* `(a ##1 b) within c[*1:3]`, which is sugar: sva_seq_within expands into
+ * delays and an intersection, so this shape checks that what the expansion
+ * lowers to still reaches a backend through the same tables. */
+static sva_node build_within(sva_ir *ir) {
+    sva_node inner = 0, outer = 0, nested = 0, property = 0;
+    BUILD(sva_seq_delay(ir, atom_cycle(ir, 0), 1, 1, atom_cycle(ir, 1), &inner));
+    BUILD(sva_seq_repeat(ir, SVA_REPEAT_CONSECUTIVE, atom_cycle(ir, 2), 1, 3, &outer));
+    BUILD(sva_seq_within(ir, inner, outer, &nested));
+    BUILD(sva_prop_sequence(ir, SVA_WEAK, nested, &property));
+    return property;
+}
+
 typedef struct {
     const char *name;
     Build       build;
@@ -472,6 +511,9 @@ int main(void) {
         { "ack[->2] |=> done",        build_goto,        false },
         { "(a && !b) ##1 (c or d)",   build_cubes,       false },
         { "intersect product",        build_intersect,   false },
+        { "en throughout (a ##1 b)",  build_throughout,  false },
+        { "(a ##1 b) and c",          build_and,         false },
+        { "(a ##1 b) within c[*1:3]", build_within,      false },
     };
 
     printf("compiled backend vs reference runtime:\n");

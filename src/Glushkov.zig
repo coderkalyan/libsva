@@ -6,9 +6,10 @@
 //! `first`/`last`/`follow` as syntactic functions of an expression, this builds
 //! a small algebra of **fragments** — homogeneous ε-free automata carrying
 //! exactly those three sets — with one combinator per sequence tag. The base
-//! cases are Glushkov's; `intersect` is a synchronised product, and the product
-//! of two homogeneous automata is homogeneous (the pair state is entered under
-//! the conjunction of the two guards), so it composes as just another fragment.
+//! cases are Glushkov's; `intersect` and `and` are synchronised products, and
+//! the product of two homogeneous automata is homogeneous (the pair state is
+//! entered under the conjunction of the two guards), so it composes as just
+//! another fragment.
 //!
 //! The `Ir` guarantees every sequence matches at least one cycle, which is why
 //! no fragment carries a `nullable` flag: the empty-match disjuncts that make
@@ -26,6 +27,8 @@
 //! | `seq_repeat_goto` | a `b` state and a `¬b` gap state per occurrence | `2 · hi` |
 //! | `seq_repeat_nonconsec` | as goto, plus a trailing gap | `2 · hi + 1` |
 //! | `seq_intersect` | reachable product | `|A| · |B|` |
+//! | `seq_throughout` | a conjunction into every guard | 0 |
+//! | `seq_and` | product, plus a copy of each operand to run on alone | `|A| · |B| + |A| + |B|` |
 //!
 //! A delay range is *both* shapes at once when it spans zero: `a ##[0:2] b` is
 //! the fusion states and the filler chain in one fragment, not a disjunction of
@@ -41,7 +44,9 @@
 //!
 //! Fusion and product both manufacture states that cannot participate in a
 //! match — fusion leaves the right operand's entry states reachable from
-//! nothing, and either can produce a syntactically contradictory guard. A
+//! nothing, and either can produce a syntactically contradictory guard, as can
+//! a `throughout` whose boolean contradicts a guard it is conjoined into. A
+//! pass before materialisation keeps only the states reachable from `first`,
 //! co-reachable to `last`, and not guarded by an unsatisfiable cube.
 
 const std = @import("std");
@@ -225,7 +230,10 @@ fn maxLength(ir: *const Ir, node: Ir.Node.Index) ?u64 {
     const data = ir.dataOf(node);
     switch (ir.tagOf(node)) {
         .seq_boolean => return 1,
-        .seq_or => {
+        // `and` ends at the later of its two ends, so the longer side's bound
+        // is the pair's, and a side with no bound leaves the pair with none —
+        // which is exactly how a disjunction behaves too.
+        .seq_or, .seq_and => {
             const left = maxLength(ir, @enumFromInt(data.lhs)) orelse return null;
             const right = maxLength(ir, @enumFromInt(data.rhs)) orelse return null;
             return @max(left, right);
@@ -238,6 +246,9 @@ fn maxLength(ir: *const Ir, node: Ir.Node.Index) ?u64 {
             if (left) |bound| return if (right) |other| @min(bound, other) else bound;
             return right;
         },
+        // The boolean rides along on the operand's cycles without adding any,
+        // so it cannot lengthen a match and is not consulted.
+        .seq_throughout => return maxLength(ir, @enumFromInt(data.rhs)),
         .seq_delay => {
             const delay = ir.delayOf(node);
             if (delay.hi == Ir.unbounded) return null;
@@ -558,12 +569,29 @@ const Builder = struct {
                 defer right.deinit(builder.gpa);
                 return builder.lowerOr(node, &left, &right);
             },
+            .seq_and => {
+                var left = try builder.lower(@enumFromInt(data.lhs));
+                defer left.deinit(builder.gpa);
+                var right = try builder.lower(@enumFromInt(data.rhs));
+                defer right.deinit(builder.gpa);
+                return builder.lowerAnd(node, &left, &right);
+            },
             .seq_intersect => {
                 var left = try builder.lower(@enumFromInt(data.lhs));
                 defer left.deinit(builder.gpa);
                 var right = try builder.lower(@enumFromInt(data.rhs));
                 defer right.deinit(builder.gpa);
                 return builder.lowerIntersect(node, &left, &right);
+            },
+            .seq_throughout => {
+                // The left operand is a boolean, so it contributes a guard
+                // rather than a fragment, and the result is the operand's own
+                // fragment rewritten in place — there is nothing to combine.
+                const exp = try builder.guardOf(@enumFromInt(data.lhs), false);
+                var operand = try builder.lower(@enumFromInt(data.rhs));
+                errdefer operand.deinit(builder.gpa);
+                try builder.lowerThroughout(&operand, exp);
+                return operand;
             },
             .seq_delay => {
                 const delay = ir.delayOf(node);
@@ -614,6 +642,23 @@ const Builder = struct {
         blitMask(fragment.last, left.last, 0);
         blitMask(fragment.last, right.last, left.state_count);
         return fragment;
+    }
+
+    /// `exp throughout A`: `exp` holds in every cycle the match spans.
+    ///
+    /// A fragment is homogeneous, so a guard belongs to its state rather than
+    /// to the edges entering it, and a state is occupied exactly in the cycles
+    /// its guard holds. Requiring `exp` in every cycle of a match is therefore
+    /// a conjunction into every state's guard, with `first`, `follow` and
+    /// `last` untouched: no state is added, and the operand's fragment is
+    /// rewritten where it stands rather than copied.
+    ///
+    /// A state whose conjunction is unsatisfiable is simply one no cycle can
+    /// enter, which is a case pruning already handles — including the whole
+    /// fragment collapsing, for a `throughout` that contradicts its operand
+    /// everywhere.
+    fn lowerThroughout(builder: *Builder, fragment: *Fragment, exp: Guard.Index) Allocator.Error!void {
+        for (fragment.guard) |*guard| guard.* = try builder.conjoin(guard.*, exp);
     }
 
     /// One cycle that is simultaneously an exit of the left operand and an entry
@@ -856,6 +901,18 @@ const Builder = struct {
     /// A reachable state of the product, and the pair it stands for.
     const Pair = struct { left: u32, right: u32, guard: Guard.Index };
 
+    /// Where a cycle can take a product state: a pair before its guard is
+    /// known.
+    const Successor = struct { left: u32, right: u32 };
+
+    /// Stands in for an operand of an `and` that has already ended, in place of
+    /// a state of it. Not a state index: no operand has this many states, since
+    /// `Options.limit` is a `u32` count that has already been checked.
+    ///
+    /// Only `and` produces one. `intersect` ends both sides in the same cycle,
+    /// so neither is ever carried past the other.
+    const finished: u32 = std.math.maxInt(u32);
+
     /// Marks a product pair the guard conjunction ruled out, so it is looked up
     /// once rather than reconsidered from every predecessor.
     const rejected: u32 = std.math.maxInt(u32);
@@ -939,7 +996,7 @@ const Builder = struct {
             return if (entry.value_ptr.* == rejected) null else entry.value_ptr.*;
         }
 
-        const guard = try builder.conjoin(left.guard[left_state], right.guard[right_state]);
+        const guard = try builder.productGuard(left, right, left_state, right_state);
         if (guard == .never) {
             // An unsatisfiable product state can never be entered. Record the
             // rejection rather than a state, so the pair is not re-derived from
@@ -958,6 +1015,140 @@ const Builder = struct {
             .guard = guard,
         });
         return entry.value_ptr.*;
+    }
+
+    /// The guard on a product state: the conjunction of the two, or — for an
+    /// operand of an `and` that has already ended — just the live one's, since
+    /// a side that has finished matching constrains no further cycle.
+    fn productGuard(
+        builder: *Builder,
+        left: *const Fragment,
+        right: *const Fragment,
+        left_state: u32,
+        right_state: u32,
+    ) Allocator.Error!Guard.Index {
+        if (left_state == finished) return right.guard[right_state];
+        if (right_state == finished) return left.guard[left_state];
+        return builder.conjoin(left.guard[left_state], right.guard[right_state]);
+    }
+
+    /// Where a cycle can take an `and` product state.
+    ///
+    /// While both sides are live they advance together. A side sitting on one
+    /// of its own exits may instead have *ended there*, which leaves the other
+    /// to run on alone — so an exit contributes that continuation as well as
+    /// the paired one, and the two readings of the trace are both explored
+    /// rather than chosen between here.
+    fn andSuccessors(
+        gpa: Allocator,
+        left: *const Fragment,
+        right: *const Fragment,
+        pair: Pair,
+        out: *std.ArrayListUnmanaged(Successor),
+    ) Allocator.Error!void {
+        out.clearRetainingCapacity();
+
+        if (pair.left == finished) {
+            var next: BitIterator = .init(right.rowConst(pair.right));
+            while (next.next()) |state| try out.append(gpa, .{ .left = finished, .right = state });
+            return;
+        }
+        if (pair.right == finished) {
+            var next: BitIterator = .init(left.rowConst(pair.left));
+            while (next.next()) |state| try out.append(gpa, .{ .left = state, .right = finished });
+            return;
+        }
+
+        var left_next: BitIterator = .init(left.rowConst(pair.left));
+        while (left_next.next()) |left_state| {
+            var right_next: BitIterator = .init(right.rowConst(pair.right));
+            while (right_next.next()) |right_state| {
+                try out.append(gpa, .{ .left = left_state, .right = right_state });
+            }
+        }
+        if (Nfa.bitIsSet(right.last, pair.right)) {
+            var next: BitIterator = .init(left.rowConst(pair.left));
+            while (next.next()) |state| try out.append(gpa, .{ .left = state, .right = finished });
+        }
+        if (Nfa.bitIsSet(left.last, pair.left)) {
+            var next: BitIterator = .init(right.rowConst(pair.right));
+            while (next.next()) |state| try out.append(gpa, .{ .left = finished, .right = state });
+        }
+    }
+
+    /// `A and B`: both match from the same cycle, and the match ends at the
+    /// later of the two ends.
+    ///
+    /// The pair states `intersect` builds say both sides are live in the same
+    /// cycle, which is the whole of `intersect` because its two ends coincide.
+    /// `and` also has to say that one side has *already ended* while the other
+    /// runs on, and a position automaton cannot idle it: every state consumes a
+    /// cycle under its own guard, so a side still carried is a side still
+    /// constraining the trace. It is dropped from the state instead. A state is
+    /// a pair from `A × B`, or one operand's state alongside `finished` — a
+    /// copy of each operand to run on alone in, `|A| · |B| + |A| + |B|` states
+    /// before reachability takes its cut.
+    ///
+    /// Homogeneity survives, which is what keeps this a fragment: a pair state
+    /// is entered under the conjunction of the two guards and a half-finished
+    /// one under the live side's guard alone, so either way the guard is a
+    /// function of the state and not of the edge. So does ε-freedom — finishing
+    /// is not a transition but a property of the state a transition leaves.
+    fn lowerAnd(
+        builder: *Builder,
+        node: Ir.Node.Index,
+        left: *const Fragment,
+        right: *const Fragment,
+    ) Error!Fragment {
+        const gpa = builder.gpa;
+
+        var index: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+        defer index.deinit(gpa);
+        var pairs: std.ArrayListUnmanaged(Pair) = .empty;
+        defer pairs.deinit(gpa);
+        var successors: std.ArrayListUnmanaged(Successor) = .empty;
+        defer successors.deinit(gpa);
+
+        // Both sides start in the attempt's first cycle, and neither can have
+        // finished before it has matched one, so every entry is a live pair.
+        var left_entries: BitIterator = .init(left.first);
+        while (left_entries.next()) |left_state| {
+            var right_entries: BitIterator = .init(right.first);
+            while (right_entries.next()) |right_state| {
+                _ = try builder.discover(node, &index, &pairs, left, right, left_state, right_state);
+            }
+        }
+        const seed_count = pairs.items.len;
+
+        var frontier: usize = 0;
+        while (frontier < pairs.items.len) : (frontier += 1) {
+            try andSuccessors(gpa, left, right, pairs.items[frontier], &successors);
+            for (successors.items) |target| {
+                _ = try builder.discover(node, &index, &pairs, left, right, target.left, target.right);
+            }
+        }
+
+        const total = try builder.checkLimit(node, pairs.items.len);
+        var fragment = try Fragment.init(gpa, total);
+        errdefer fragment.deinit(gpa);
+
+        for (pairs.items, 0..) |pair, offset| {
+            const state: u32 = @intCast(offset);
+            fragment.guard[state] = pair.guard;
+            try andSuccessors(gpa, left, right, pair, &successors);
+            for (successors.items) |target| {
+                const next = index.get(pairKey(target.left, target.right)) orelse continue;
+                if (next != rejected) Nfa.bitSet(fragment.row(state), next);
+            }
+            if (offset < seed_count) Nfa.bitSet(fragment.first, state);
+            // The match ends where the later side does, so this cycle ends it
+            // if the live sides all end here — a side already `finished` ended
+            // in an earlier one.
+            const left_ends = pair.left == finished or Nfa.bitIsSet(left.last, pair.left);
+            const right_ends = pair.right == finished or Nfa.bitIsSet(right.last, pair.right);
+            if (left_ends and right_ends) Nfa.bitSet(fragment.last, state);
+        }
+        return fragment;
     }
 
     // -- Materialisation -----------------------------------------------------
@@ -1237,6 +1428,33 @@ fn bruteForceMatches(ir: *const Ir, node: Ir.Node.Index, trace: []const u64, sta
             bruteForceMatches(ir, @enumFromInt(data.rhs), trace, start),
         .seq_intersect => return bruteForceMatches(ir, @enumFromInt(data.lhs), trace, start) &
             bruteForceMatches(ir, @enumFromInt(data.rhs), trace, start),
+        .seq_and => {
+            // Both sides match from `start`, and the match ends at the later
+            // of the two ends: an end of one side counts if the other can
+            // finish at or before it.
+            const left = bruteForceMatches(ir, @enumFromInt(data.lhs), trace, start);
+            const right = bruteForceMatches(ir, @enumFromInt(data.rhs), trace, start);
+            if (left == 0 or right == 0) return 0;
+            // A side can finish at or before a cycle exactly when its earliest
+            // end is at or before it.
+            const after_left = ~((@as(u64, 1) << @intCast(@ctz(left))) - 1);
+            const after_right = ~((@as(u64, 1) << @intCast(@ctz(right))) - 1);
+            return (left & after_right) | (right & after_left);
+        },
+        .seq_throughout => {
+            // Every cycle the match spans has to satisfy the boolean, so the
+            // match cannot reach past the first cycle from `start` that fails
+            // it.
+            const ends = bruteForceMatches(ir, @enumFromInt(data.rhs), trace, start);
+            var spanned: u64 = 0;
+            var cycle = start;
+            while (cycle < length) : (cycle += 1) {
+                const atoms = [_]Word{trace[cycle]};
+                if (!Nfa.evaluateBoolean(ir, @enumFromInt(data.lhs), &atoms)) break;
+                spanned |= @as(u64, 1) << @intCast(cycle);
+            }
+            return ends & spanned;
+        },
         .seq_delay => {
             const delay = ir.delayOf(node);
             const hi = @min(delay.hi, length);
@@ -1307,6 +1525,27 @@ fn bruteForceMatches(ir: *const Ir, node: Ir.Node.Index, trace: []const u64, sta
     }
 }
 
+/// `inner within outer` read off the LRM rather than off the expansion
+/// `Ir.seqWithin` builds: a match of `inner` lies somewhere inside the match,
+/// which begins and ends where a match of `outer` does.
+fn bruteForceWithin(
+    ir: *const Ir,
+    inner: Ir.Node.Index,
+    outer: Ir.Node.Index,
+    trace: []const u64,
+    start: u32,
+) u64 {
+    // Where a match of `inner` beginning no earlier than `start` can end.
+    var inside: u64 = 0;
+    for (start..trace.len) |at| inside |= bruteForceMatches(ir, inner, trace, @intCast(at));
+    if (inside == 0) return 0;
+
+    // One of those has to fit, so the match cannot end before the earliest of
+    // them does.
+    const containing = ~((@as(u64, 1) << @intCast(@ctz(inside))) - 1);
+    return bruteForceMatches(ir, outer, trace, start) & containing;
+}
+
 const Runner = struct {
     automaton: *const Automaton,
     ir: *const Ir,
@@ -1363,6 +1602,38 @@ const Runner = struct {
     }
 };
 
+/// Every trace of `length` cycles over `atom_count` atoms, one per assignment
+/// of the atoms in each cycle.
+const Traces = struct {
+    atom_count: u5,
+    length: u32,
+    combinations: u64,
+    assignment: u64 = 0,
+    /// The assignment the current trace was built from, for a failure message.
+    bits: u64 = 0,
+    buffer: [8]u64 = undefined,
+
+    fn init(atom_count: u5, length: u32) Traces {
+        return .{
+            .atom_count = atom_count,
+            .length = length,
+            .combinations = @as(u64, 1) << @intCast(@as(u32, atom_count) * length),
+        };
+    }
+
+    fn next(traces: *Traces) ?[]const u64 {
+        if (traces.assignment == traces.combinations) return null;
+        traces.bits = traces.assignment;
+        traces.assignment += 1;
+
+        const per_cycle = (@as(u64, 1) << traces.atom_count) - 1;
+        for (0..traces.length) |cycle| {
+            traces.buffer[cycle] = (traces.bits >> @intCast(cycle * traces.atom_count)) & per_cycle;
+        }
+        return traces.buffer[0..traces.length];
+    }
+};
+
 /// Check the automaton against `bruteForceMatches` over every trace of `length`
 /// cycles over `atom_count` atoms, from every start cycle.
 fn differential(
@@ -1378,28 +1649,66 @@ fn differential(
     var runner = try Runner.init(gpa, &automaton, ir);
     defer runner.deinit(gpa);
 
-    const per_cycle = (@as(u64, 1) << atom_count) - 1;
-    const combinations = @as(u64, 1) << @intCast(@as(u32, atom_count) * length);
-    var trace: [8]u64 = undefined;
-
-    var assignment: u64 = 0;
-    while (assignment < combinations) : (assignment += 1) {
-        for (0..length) |cycle| {
-            trace[cycle] = (assignment >> @intCast(cycle * atom_count)) & per_cycle;
-        }
+    var traces: Traces = .init(atom_count, length);
+    while (traces.next()) |trace| {
         for (0..length) |index| {
             const start: u32 = @intCast(index);
-            const want = bruteForceMatches(ir, pattern, trace[0..length], start);
-            const got = runner.matches(trace[0..length], start);
+            const want = bruteForceMatches(ir, pattern, trace, start);
+            const got = runner.matches(trace, start);
             if (want != got) {
                 std.debug.print(
                     "trace bits {b}, start {d}: want ends {b}, got {b}\n",
-                    .{ assignment, start, want, got },
+                    .{ traces.bits, start, want, got },
                 );
                 return error.TestUnexpectedResult;
             }
         }
     }
+}
+
+/// Check that two patterns match over exactly the same cycles.
+///
+/// `differential` ties the automaton to `bruteForceMatches`; this ties one
+/// reading of `bruteForceMatches` to another, which is how an operator that
+/// also has a spelling in terms of operators verified before it gets a second
+/// opinion on what it means.
+fn sameLanguage(
+    ir: *const Ir,
+    left: Ir.Node.Index,
+    right: Ir.Node.Index,
+    atom_count: u5,
+    length: u32,
+) !void {
+    var traces: Traces = .init(atom_count, length);
+    while (traces.next()) |trace| {
+        for (0..length) |index| {
+            const start: u32 = @intCast(index);
+            const want = bruteForceMatches(ir, left, trace, start);
+            const got = bruteForceMatches(ir, right, trace, start);
+            if (want != got) {
+                std.debug.print(
+                    "trace bits {b}, start {d}: left ends {b}, right ends {b}\n",
+                    .{ traces.bits, start, want, got },
+                );
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+}
+
+/// The cycles a match starting at `start` can end on, read off the automaton.
+fn endsOf(
+    gpa: Allocator,
+    ir: *const Ir,
+    pattern: Ir.Node.Index,
+    trace: []const u64,
+    start: u32,
+) !u64 {
+    var automaton = try sequence(gpa, ir, pattern, .{}, null);
+    defer automaton.deinit(gpa);
+    var runner = try Runner.init(gpa, &automaton, ir);
+    defer runner.deinit(gpa);
+    return runner.matches(trace, start);
 }
 
 /// A one-cycle pattern over the atom named by `handle`.
@@ -1620,6 +1929,244 @@ test "differential: intersection over a contradictory pair" {
     const pattern = try ir.seqIntersect(gpa, left, right);
 
     try differential(gpa, &ir, pattern, 3, 4);
+}
+
+test "differential: throughout" {
+    const gpa = testing.allocator;
+
+    {
+        // The boolean has to reach every cycle of the match, including the
+        // filler cycles of a delay range and the cycles a repetition unrolls
+        // to, not just the ones the operand names a letter for.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const b = try atomCycle(&ir, gpa, 1);
+        const operand = try ir.seqDelay(gpa, b, 1, 3, try atomCycle(&ir, gpa, 2));
+        const pattern = try ir.seqThroughout(gpa, try ir.atom(gpa, @enumFromInt(0)), operand);
+        try differential(gpa, &ir, pattern, 3, 5);
+    }
+    {
+        // An open range loops on its last filler, so the conjunction has to
+        // land on a state the match can sit in for any number of cycles.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const b = try atomCycle(&ir, gpa, 1);
+        const operand = try ir.seqDelay(gpa, b, 1, Ir.unbounded, try atomCycle(&ir, gpa, 2));
+        const pattern = try ir.seqThroughout(gpa, try ir.atom(gpa, @enumFromInt(0)), operand);
+        try differential(gpa, &ir, pattern, 3, 5);
+    }
+    {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const operand = try ir.seqRepeat(gpa, .seq_repeat_consec, try atomCycle(&ir, gpa, 1), 1, 3);
+        const pattern = try ir.seqThroughout(gpa, try ir.atom(gpa, @enumFromInt(0)), operand);
+        try differential(gpa, &ir, pattern, 2, 5);
+    }
+    {
+        // `!a throughout (a ##1 b)` contradicts its operand in the first cycle
+        // and has no match at all; the fragment prunes to nothing rather than
+        // to something that still reports one.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const a = try ir.atom(gpa, @enumFromInt(0));
+        const operand = try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, 1, try atomCycle(&ir, gpa, 1));
+        const pattern = try ir.seqThroughout(gpa, try ir.bNot(gpa, a), operand);
+        try differential(gpa, &ir, pattern, 2, 4);
+
+        var automaton = try sequence(gpa, &ir, pattern, .{}, null);
+        defer automaton.deinit(gpa);
+        try testing.expectEqual(@as(u32, 0), automaton.nfa.state_count);
+    }
+    {
+        // A conjunction the operand already carries is the same cube, so the
+        // guard is unchanged rather than duplicated.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const a = try ir.atom(gpa, @enumFromInt(0));
+        const operand = try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 0, 2, try atomCycle(&ir, gpa, 1));
+        const pattern = try ir.seqThroughout(gpa, a, operand);
+        try differential(gpa, &ir, pattern, 2, 5);
+    }
+}
+
+test "throughout is an intersection the empty-match ban makes free" {
+    const gpa = testing.allocator;
+
+    // The LRM spells it `(exp[*0:$]) intersect seq`. No sequence here matches
+    // an empty span, so `[*1:$]` covers every match `[*0:$]` would, and the
+    // direct construction has to agree with that product exactly.
+    var ir: Ir = .init();
+    defer ir.deinit(gpa);
+    const a = try ir.atom(gpa, @enumFromInt(0));
+    const operand = try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 1), 1, 3, try atomCycle(&ir, gpa, 2));
+
+    const direct = try ir.seqThroughout(gpa, a, operand);
+    const spelled = try ir.seqIntersect(
+        gpa,
+        try ir.seqRepeat(gpa, .seq_repeat_consec, try ir.seqBoolean(gpa, a), 1, Ir.unbounded),
+        operand,
+    );
+    try sameLanguage(&ir, direct, spelled, 3, 5);
+    try differential(gpa, &ir, spelled, 3, 5);
+}
+
+test "differential: and" {
+    const gpa = testing.allocator;
+
+    {
+        // Different lengths in both directions: the shorter side finishes and
+        // the longer one carries the match to its own end.
+        for ([_]bool{ false, true }) |flip| {
+            var ir: Ir = .init();
+            defer ir.deinit(gpa);
+            const ab = try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, 1, try atomCycle(&ir, gpa, 1));
+            const c = try atomCycle(&ir, gpa, 2);
+            const pattern = if (flip)
+                try ir.seqAnd(gpa, c, ab)
+            else
+                try ir.seqAnd(gpa, ab, c);
+            try differential(gpa, &ir, pattern, 3, 5);
+        }
+    }
+    {
+        // Two ranges that overlap: for one trace either side can be the later
+        // one, so both wait copies are live in the same automaton.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const left = try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, 2, try atomCycle(&ir, gpa, 1));
+        const right = try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, 3, try atomCycle(&ir, gpa, 2));
+        const pattern = try ir.seqAnd(gpa, left, right);
+        try differential(gpa, &ir, pattern, 3, 5);
+    }
+    {
+        // Repetition puts a state in `last` that also has somewhere to go, so
+        // ending there and running on are both readings of the same cycle.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const left = try ir.seqRepeat(gpa, .seq_repeat_consec, try atomCycle(&ir, gpa, 0), 1, 3);
+        const right = try ir.seqRepeat(gpa, .seq_repeat_consec, try atomCycle(&ir, gpa, 1), 2, 3);
+        const pattern = try ir.seqAnd(gpa, left, right);
+        try differential(gpa, &ir, pattern, 2, 5);
+    }
+    {
+        // An unbounded side: the wait copy it leaves behind loops, which is
+        // sound for a sequence even though it costs the shape its `depth`.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const left = try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, Ir.unbounded, try atomCycle(&ir, gpa, 1));
+        const pattern = try ir.seqAnd(gpa, left, try atomCycle(&ir, gpa, 2));
+        try differential(gpa, &ir, pattern, 3, 5);
+    }
+    {
+        // Contradictory sides never both start, so there is no match to end.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const a = try ir.atom(gpa, @enumFromInt(0));
+        const pattern = try ir.seqAnd(
+            gpa,
+            try ir.seqBoolean(gpa, a),
+            try ir.seqDelay(gpa, try ir.seqBoolean(gpa, try ir.bNot(gpa, a)), 1, 1, try atomCycle(&ir, gpa, 1)),
+        );
+        try differential(gpa, &ir, pattern, 2, 4);
+
+        var automaton = try sequence(gpa, &ir, pattern, .{}, null);
+        defer automaton.deinit(gpa);
+        try testing.expectEqual(@as(u32, 0), automaton.nfa.state_count);
+    }
+}
+
+test "and ends at the later end where intersect insists on one end" {
+    const gpa = testing.allocator;
+
+    // `(a ##1 b) and c` over a trace holding `a` and `c` in cycle 0 and `b` in
+    // cycle 1. The right side ended in cycle 0 and the left in cycle 1, so the
+    // match ends in cycle 1 — where `intersect`, which is the same product
+    // without the waiting, has no match at all.
+    var ir: Ir = .init();
+    defer ir.deinit(gpa);
+    const ab = try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, 1, try atomCycle(&ir, gpa, 1));
+    const c = try atomCycle(&ir, gpa, 2);
+    const conjunction = try ir.seqAnd(gpa, ab, c);
+    const product = try ir.seqIntersect(gpa, ab, c);
+
+    const trace = [_]u64{ 0b101, 0b010 };
+    try testing.expectEqual(@as(u64, 0b10), try endsOf(gpa, &ir, conjunction, &trace, 0));
+    try testing.expectEqual(@as(u64, 0), try endsOf(gpa, &ir, product, &trace, 0));
+}
+
+test "and is an intersection against a side padded to the later end" {
+    const gpa = testing.allocator;
+
+    // `A and B` is `(A intersect (B ##[0:$] true)) or ((A ##[0:$] true)
+    // intersect B)`: whichever side ends later fixes the end, and the other is
+    // padded out to meet it. That spelling costs two products where the direct
+    // construction costs one, but it is written in operators that were
+    // verified before this one, so it is worth an opinion on what `and` means.
+    var ir: Ir = .init();
+    defer ir.deinit(gpa);
+    const pad = try ir.seqBoolean(gpa, try ir.boolConst(gpa, true));
+    const left = try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, 2, try atomCycle(&ir, gpa, 1));
+    const right = try ir.seqRepeat(gpa, .seq_repeat_consec, try atomCycle(&ir, gpa, 2), 1, 2);
+
+    const direct = try ir.seqAnd(gpa, left, right);
+    const spelled = try ir.seqOr(
+        gpa,
+        try ir.seqIntersect(gpa, left, try ir.seqDelay(gpa, right, 0, Ir.unbounded, pad)),
+        try ir.seqIntersect(gpa, try ir.seqDelay(gpa, left, 0, Ir.unbounded, pad), right),
+    );
+    try sameLanguage(&ir, direct, spelled, 3, 5);
+    try differential(gpa, &ir, spelled, 3, 5);
+}
+
+test "differential: within" {
+    const gpa = testing.allocator;
+
+    {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const inner = try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, 1, try atomCycle(&ir, gpa, 1));
+        const outer = try ir.seqRepeat(gpa, .seq_repeat_consec, try atomCycle(&ir, gpa, 2), 2, 4);
+        try differential(gpa, &ir, try ir.seqWithin(gpa, inner, outer), 3, 5);
+    }
+    {
+        // A one-cycle inner sequence is the case the padding has to get right
+        // at both ends at once: it can sit in the first cycle of the outer
+        // match, the last, or anywhere between.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const inner = try atomCycle(&ir, gpa, 0);
+        const outer = try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 1), 1, 3, try atomCycle(&ir, gpa, 2));
+        try differential(gpa, &ir, try ir.seqWithin(gpa, inner, outer), 3, 5);
+    }
+}
+
+test "within is the LRM reading, padding and all" {
+    const gpa = testing.allocator;
+
+    // `Ir.seqWithin` is an expansion, so the expansion is what needs checking:
+    // `bruteForceWithin` reads the operator off the LRM instead, without
+    // going near a delay.
+    var ir: Ir = .init();
+    defer ir.deinit(gpa);
+    const inner = try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, 1, try atomCycle(&ir, gpa, 1));
+    const outer = try ir.seqRepeat(gpa, .seq_repeat_consec, try atomCycle(&ir, gpa, 2), 1, 4);
+    const pattern = try ir.seqWithin(gpa, inner, outer);
+
+    var traces: Traces = .init(3, 5);
+    while (traces.next()) |trace| {
+        for (0..trace.len) |index| {
+            const start: u32 = @intCast(index);
+            const want = bruteForceWithin(&ir, inner, outer, trace, start);
+            const got = bruteForceMatches(&ir, pattern, trace, start);
+            if (want != got) {
+                std.debug.print(
+                    "trace bits {b}, start {d}: want ends {b}, got {b}\n",
+                    .{ traces.bits, start, want, got },
+                );
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
 }
 
 test "a contradictory fusion prunes to nothing" {
@@ -2083,17 +2630,10 @@ fn differentialMonitor(
     var state = try Monitor.State.init(gpa, &monitor);
     defer state.deinit(gpa);
 
-    const per_cycle = (@as(u64, 1) << atom_count) - 1;
     const cycles_mask = (@as(u64, 1) << @intCast(length)) - 1;
-    const combinations = @as(u64, 1) << @intCast(@as(u32, atom_count) * length);
-    var trace: [8]u64 = undefined;
 
-    var assignment: u64 = 0;
-    while (assignment < combinations) : (assignment += 1) {
-        for (0..length) |cycle| {
-            trace[cycle] = (assignment >> @intCast(cycle * atom_count)) & per_cycle;
-        }
-        const window = trace[0..length];
+    var traces: Traces = .init(atom_count, length);
+    while (traces.next()) |window| {
 
         // Which cycles an obligation starts in: every cycle without a trigger,
         // and otherwise wherever some antecedent match ends, shifted by the
@@ -2131,7 +2671,7 @@ fn differentialMonitor(
                     "trace bits {b}, cycle {d}: want {d} failures / {d} matches," ++
                         " got {d} / {d}\n",
                     .{
-                        assignment,          cycle,           want_failures[cycle],
+                        traces.bits,         cycle,           want_failures[cycle],
                         want_matches[cycle], report.failures, report.matches,
                     },
                 );
@@ -2144,7 +2684,7 @@ fn differentialMonitor(
         if (final.failures != want_final) {
             std.debug.print(
                 "trace bits {b}: {d} pending at end, want {d} failures, got {d}\n",
-                .{ assignment, want_pending, want_final, final.failures },
+                .{ traces.bits, want_pending, want_final, final.failures },
             );
             return error.TestUnexpectedResult;
         }
@@ -2329,6 +2869,78 @@ test "differential: a bare sequence property" {
     }
 }
 
+test "differential: an and obligation" {
+    const gpa = testing.allocator;
+
+    // An `and` under per-attempt tracking. Its two sides can finish in either
+    // order, and an attempt is only discharged once the later one has, so a
+    // wait copy that accepted too early would show up here as a match reported
+    // a cycle before the semantics allow one.
+    for ([_]Ir.Node.Tag{ .prop_seq_weak, .prop_seq_strong }) |strength| {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const body = try ir.seqAnd(
+            gpa,
+            try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, 1, try atomCycle(&ir, gpa, 1)),
+            try atomCycle(&ir, gpa, 1),
+        );
+        const index = try addDirective(&ir, gpa, try ir.propSeq(gpa, strength, body), null);
+        try differentialMonitor(gpa, &ir, index, 2, 4);
+    }
+}
+
+test "differential: a throughout obligation" {
+    const gpa = testing.allocator;
+
+    for ([_]Ir.Node.Tag{ .prop_seq_weak, .prop_seq_strong }) |strength| {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const body = try ir.seqThroughout(
+            gpa,
+            try ir.atom(gpa, @enumFromInt(0)),
+            try ir.seqRepeat(gpa, .seq_repeat_consec, try atomCycle(&ir, gpa, 1), 1, 3),
+        );
+        const index = try addDirective(&ir, gpa, try ir.propSeq(gpa, strength, body), null);
+        try differentialMonitor(gpa, &ir, index, 2, 4);
+    }
+}
+
+test "an obligation that prunes to nothing fails every attempt" {
+    const gpa = testing.allocator;
+
+    // `throughout` and `and` make an empty automaton easy to reach — a boolean
+    // that contradicts the operand it guards, or two sides that cannot both
+    // start — and an obligation with no states at all is a shape a monitor has
+    // to handle rather than a malformed one. Every attempt is seeded, finds no
+    // live state and fails in the cycle it started, which is the case the
+    // `occupied` flag exists for.
+    for ([_]Ir.Node.Tag{ .prop_seq_weak, .prop_seq_strong }) |strength| {
+        {
+            var ir: Ir = .init();
+            defer ir.deinit(gpa);
+            const body = try ir.seqThroughout(
+                gpa,
+                try ir.boolConst(gpa, false),
+                try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, 1, try atomCycle(&ir, gpa, 1)),
+            );
+            const index = try addDirective(&ir, gpa, try ir.propSeq(gpa, strength, body), null);
+            try differentialMonitor(gpa, &ir, index, 2, 4);
+        }
+        {
+            var ir: Ir = .init();
+            defer ir.deinit(gpa);
+            const a = try ir.atom(gpa, @enumFromInt(0));
+            const body = try ir.seqAnd(
+                gpa,
+                try ir.seqBoolean(gpa, a),
+                try ir.seqBoolean(gpa, try ir.bNot(gpa, a)),
+            );
+            const index = try addDirective(&ir, gpa, try ir.propSeq(gpa, strength, body), null);
+            try differentialMonitor(gpa, &ir, index, 2, 4);
+        }
+    }
+}
+
 test "depth is the obligation's longest match" {
     const gpa = testing.allocator;
 
@@ -2384,6 +2996,28 @@ test "depth is the obligation's longest match" {
                     gpa_,
                     try ir.seqDelay(gpa_, try atomCycle(ir, gpa_, 1), 1, 1, try atomCycle(ir, gpa_, 1)),
                     try ir.seqRepeat(gpa_, .seq_repeat_consec, try atomCycle(ir, gpa_, 2), 1, 5),
+                );
+            }
+        }.make },
+        // An `and` is as long as its *longer* branch, which is the one place
+        // its bound parts company with `intersect`'s.
+        .{ .length = 3, .build = struct {
+            fn make(ir: *Ir, gpa_: Allocator) anyerror!Ir.Node.Index {
+                return ir.seqAnd(
+                    gpa_,
+                    try ir.seqDelay(gpa_, try atomCycle(ir, gpa_, 1), 1, 1, try atomCycle(ir, gpa_, 1)),
+                    try ir.seqRepeat(gpa_, .seq_repeat_consec, try atomCycle(ir, gpa_, 2), 1, 3),
+                );
+            }
+        }.make },
+        // A boolean required throughout rides on the operand's cycles and adds
+        // none of its own.
+        .{ .length = 2, .build = struct {
+            fn make(ir: *Ir, gpa_: Allocator) anyerror!Ir.Node.Index {
+                return ir.seqThroughout(
+                    gpa_,
+                    try ir.atom(gpa_, @enumFromInt(2)),
+                    try ir.seqDelay(gpa_, try atomCycle(ir, gpa_, 1), 1, 1, try atomCycle(ir, gpa_, 1)),
                 );
             }
         }.make },
@@ -2617,6 +3251,36 @@ test "an obligation without a bounded length is rejected" {
         error.ObligationNotBounded,
         assertion(gpa, &counted, try addDirective(&counted, gpa, marked, null), .{}, null),
     );
+
+    // An `and` is unbounded as soon as *either* side is, where an intersection
+    // survives one unbounded side: an intersection's two ends coincide, so the
+    // bounded side bounds the pair, but an `and` runs on to the later end.
+    var waited: Ir = .init();
+    defer waited.deinit(gpa);
+    const open = try leadingDelay(&waited, gpa, 1, Ir.unbounded, try atomCycle(&waited, gpa, 1));
+    const later = try waited.seqAnd(gpa, open, try atomCycle(&waited, gpa, 2));
+    const waits = try waited.propImplies(
+        gpa,
+        .prop_implies_nonoverlap,
+        try atomCycle(&waited, gpa, 0),
+        try waited.propSeq(gpa, .prop_seq_weak, later),
+    );
+    try testing.expectError(
+        error.ObligationNotBounded,
+        assertion(gpa, &waited, try addDirective(&waited, gpa, waits, null), .{}, null),
+    );
+
+    // The contrast, so that asymmetry is pinned rather than assumed.
+    const met = try waited.seqIntersect(gpa, open, try atomCycle(&waited, gpa, 2));
+    const meets = try waited.propImplies(
+        gpa,
+        .prop_implies_nonoverlap,
+        try atomCycle(&waited, gpa, 0),
+        try waited.propSeq(gpa, .prop_seq_weak, met),
+    );
+    var monitor = try assertion(gpa, &waited, try addDirective(&waited, gpa, meets, null), .{}, null);
+    defer monitor.deinit(gpa);
+    try testing.expectEqual(@as(u32, 1), monitor.depth);
 }
 
 test "a nested implication is rejected" {

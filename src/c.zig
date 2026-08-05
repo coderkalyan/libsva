@@ -141,8 +141,23 @@ export fn sva_seq_or(ir: *Ir, lhs: u32, rhs: u32, out: *u32) Status {
     return deliver(out, ir.seqOr(gpa, @enumFromInt(lhs), @enumFromInt(rhs)));
 }
 
+export fn sva_seq_and(ir: *Ir, lhs: u32, rhs: u32, out: *u32) Status {
+    return deliver(out, ir.seqAnd(gpa, @enumFromInt(lhs), @enumFromInt(rhs)));
+}
+
 export fn sva_seq_intersect(ir: *Ir, lhs: u32, rhs: u32, out: *u32) Status {
     return deliver(out, ir.seqIntersect(gpa, @enumFromInt(lhs), @enumFromInt(rhs)));
+}
+
+/// `exp` is a *boolean* node, not a sequence.
+export fn sva_seq_throughout(ir: *Ir, exp: u32, sequence: u32, out: *u32) Status {
+    return deliver(out, ir.seqThroughout(gpa, @enumFromInt(exp), @enumFromInt(sequence)));
+}
+
+/// Sugar: builds `(true ##[0:$] inner ##[0:$] true) intersect outer` out of the
+/// tags the IR already has, rather than being one of its own.
+export fn sva_seq_within(ir: *Ir, inner: u32, outer: u32, out: *u32) Status {
+    return deliver(out, ir.seqWithin(gpa, @enumFromInt(inner), @enumFromInt(outer)));
 }
 
 const Repeat = enum(c_int) {

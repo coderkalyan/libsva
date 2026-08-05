@@ -9,8 +9,9 @@
 //!      combinations of opaque atoms. Each maximal boolean node is the guard on
 //!      an NFA transition.
 //!   2. **Sequence layer** — regular patterns over cycles: delayed
-//!      concatenation, disjunction, length-matching intersection, and the three
-//!      flavors of repetition.
+//!      concatenation, disjunction, conjunction, length-matching intersection,
+//!      a boolean required throughout a match, and the three flavors of
+//!      repetition.
 //!   3. **Property layer** — sequences promoted to properties, and implication.
 //!
 //! A leaf of the boolean layer is an `Atom`: an opaque `u32` handle the
@@ -114,8 +115,15 @@
 //!
 //! Every sequence in the IR matches at least one cycle. Repetition counts are
 //! `>= 1` and nothing else can introduce an empty match, so `seq_delay`,
-//! `seq_intersect`, implication antecedents and property promotion need no
-//! empty-match special cases and have none.
+//! `seq_and`, `seq_intersect`, `seq_throughout`, implication antecedents and
+//! property promotion need no empty-match special cases and have none.
+//!
+//! For two of them the ban is load-bearing rather than incidental.
+//! `seq_throughout` is `(exp[*1:$]) intersect seq` only because no match is
+//! empty — the LRM's `[*0:$]` would otherwise say something weaker — and
+//! `seqWithin` can pad with a `0..$` delay against a one-cycle `true` where
+//! the LRM pads with `1[*0:$]`, because a delay of 0 fuses that cycle into the
+//! match beside it.
 //!
 //! A source language with a zero-count repetition must therefore eliminate it
 //! before building the IR — expanding into a disjunction whose empty
@@ -260,9 +268,24 @@ pub const Node = struct {
         /// Sequence disjunction: matches if either side matches. `lhs`, `rhs` =
         /// sequence nodes.
         seq_or,
+        /// Both sides match from the same start cycle, and the match ends at
+        /// the *later* of the two ends: a side that finishes early waits for
+        /// the other rather than constraining it. `lhs`, `rhs` = sequence
+        /// nodes. `seq_intersect` is this operator plus the requirement that
+        /// the two ends coincide.
+        seq_and,
         /// Length-matching intersection: both sides match from the same start
         /// cycle *and* the same end cycle. `lhs`, `rhs` = sequence nodes.
         seq_intersect,
+        /// A boolean that must hold in every cycle of a match of a sequence.
+        /// `lhs` = boolean node — the one sequence-layer tag whose operands are
+        /// not all sequences — and `rhs` = sequence node.
+        ///
+        /// The LRM writes this as `(exp[*0:$]) intersect seq`, which this IR
+        /// cannot build: the repetition admits an empty match. Because every
+        /// sequence here matches at least one cycle, `(exp[*1:$]) intersect
+        /// seq` is the same language, and it is what the operator means.
+        seq_throughout,
         /// Consecutive repetition: `lo..hi` back-to-back matches of the
         /// operand, `lo >= 1`. `lhs` = the repeated sequence, `rhs` = `extra`
         /// index of `[lo, hi]`.
@@ -310,7 +333,9 @@ pub const Node = struct {
                 .seq_boolean,
                 .seq_delay,
                 .seq_or,
+                .seq_and,
                 .seq_intersect,
+                .seq_throughout,
                 .seq_repeat_consec,
                 .seq_repeat_goto,
                 .seq_repeat_nonconsec,
@@ -501,11 +526,53 @@ pub fn seqOr(ir: *Ir, gpa: Allocator, lhs: Node.Index, rhs: Node.Index) Allocato
     return ir.addNode(gpa, .{ .tag = .seq_or, .data = .{ .lhs = @intFromEnum(lhs), .rhs = @intFromEnum(rhs) } });
 }
 
+/// Both sides match from the same start cycle, and the match ends at the later
+/// of the two ends: whichever side finishes first waits for the other.
+pub fn seqAnd(ir: *Ir, gpa: Allocator, lhs: Node.Index, rhs: Node.Index) Allocator.Error!Node.Index {
+    ir.assertOperand(lhs, .sequence);
+    ir.assertOperand(rhs, .sequence);
+    return ir.addNode(gpa, .{ .tag = .seq_and, .data = .{ .lhs = @intFromEnum(lhs), .rhs = @intFromEnum(rhs) } });
+}
+
 /// Length-matching intersection: both sides match over the same cycle span.
 pub fn seqIntersect(ir: *Ir, gpa: Allocator, lhs: Node.Index, rhs: Node.Index) Allocator.Error!Node.Index {
     ir.assertOperand(lhs, .sequence);
     ir.assertOperand(rhs, .sequence);
     return ir.addNode(gpa, .{ .tag = .seq_intersect, .data = .{ .lhs = @intFromEnum(lhs), .rhs = @intFromEnum(rhs) } });
+}
+
+/// `exp` holds in every cycle a match of `seq` spans.
+///
+/// The left operand is a *boolean*, not a sequence — it is a condition on each
+/// cycle of the match rather than something matching alongside it — and is the
+/// only sequence-layer operand that is.
+pub fn seqThroughout(ir: *Ir, gpa: Allocator, exp: Node.Index, seq: Node.Index) Allocator.Error!Node.Index {
+    ir.assertOperand(exp, .boolean);
+    ir.assertOperand(seq, .sequence);
+    return ir.addNode(gpa, .{ .tag = .seq_throughout, .data = .{
+        .lhs = @intFromEnum(exp),
+        .rhs = @intFromEnum(seq),
+    } });
+}
+
+/// A match of `inner` lies somewhere inside a match of `outer`, and the match
+/// ends where `outer` does.
+///
+/// Sugar, not a tag: this builds `(true ##[0:$] inner ##[0:$] true) intersect
+/// outer` out of operators the IR already has. The LRM pads with `1[*0:$]`,
+/// which this IR cannot write because that repetition admits an empty match,
+/// but a `0..$` delay against a one-cycle `true` is the same padding without
+/// one — delay 0 fuses that cycle into the neighbouring match, so the padding
+/// can cost nothing, and delay `k` places the neighbour `k` cycles away. A tag
+/// every consumer of the IR would carry forever buys nothing over that.
+pub fn seqWithin(ir: *Ir, gpa: Allocator, inner: Node.Index, outer: Node.Index) Allocator.Error!Node.Index {
+    ir.assertOperand(inner, .sequence);
+    ir.assertOperand(outer, .sequence);
+
+    const cycle = try ir.seqBoolean(gpa, try ir.boolConst(gpa, true));
+    const lead = try ir.seqDelay(gpa, cycle, 0, unbounded, inner);
+    const padded = try ir.seqDelay(gpa, lead, 0, unbounded, cycle);
+    return ir.seqIntersect(gpa, padded, outer);
 }
 
 /// Repetition of `seq` `lo..hi` times, in the flavor named by `tag`
@@ -617,7 +684,9 @@ pub fn operandsOf(ir: *const Ir, node: Node.Index, buf: *[max_operands]Node.Inde
         .band,
         .bor,
         .seq_or,
+        .seq_and,
         .seq_intersect,
+        .seq_throughout,
         .prop_implies_overlap,
         .prop_implies_nonoverlap,
         => {
@@ -734,7 +803,7 @@ pub const magic: [4]u8 = .{ 'S', 'V', 'A', 'B' };
 /// On-disk format version. The IR reserves no space for future operators, so
 /// this is bumped on any layout *or* `Node.Tag` change; readers reject a
 /// mismatch and the caller recompiles from source.
-pub const format_version: u32 = 4;
+pub const format_version: u32 = 5;
 
 const checksum_len = Blake3.digest_length;
 /// Bytes preceding the first payload word: `magic` + `format_version`.

@@ -62,8 +62,9 @@ Constructors come in three layers, and each asserts that its operands belong to
 the layer it expects:
 
 - **boolean** — `atom`, `boolConst`, `bNot`, `bBinary` (`.band`, `.bor`).
-- **sequence** — `seqBoolean`, `seqDelay`, `seqOr`, `seqIntersect`, `seqRepeat`
-  (`.seq_repeat_consec`, `.seq_repeat_goto`, `.seq_repeat_nonconsec`).
+- **sequence** — `seqBoolean`, `seqDelay`, `seqOr`, `seqAnd`, `seqIntersect`,
+  `seqThroughout`, `seqWithin`, `seqRepeat` (`.seq_repeat_consec`,
+  `.seq_repeat_goto`, `.seq_repeat_nonconsec`).
 - **property** — `propSeq` (`.prop_seq_weak`, `.prop_seq_strong`),
   `propImplies` (`.prop_implies_overlap`, `.prop_implies_nonoverlap`).
 
@@ -104,6 +105,25 @@ repetition counts are `>= 1` and nothing else can introduce an empty match, so
 none of the operators carry empty-match special cases. A source language with a
 zero-count repetition expands it away before building the IR, per that
 language's own empty-match rules.
+
+That ban is what shapes the three operators SVA writes over whole matches.
+`seqAnd` is `seqIntersect` without the requirement that the two matches end in
+the same cycle: both start in the cycle the attempt does, and the match ends at
+the later of the two ends, so a side that has already finished stops
+constraining the trace rather than waiting on it. `seqThroughout` takes a
+*boolean* on the left — the only sequence-layer operand that is not a sequence
+— and requires it in every cycle the match spans; the LRM writes that as
+`(exp[*0:$]) intersect seq`, which cannot be built here, but since no sequence
+matches an empty span, `(exp[*1:$]) intersect seq` is the same language, and
+that product is a conjunction into every state's guard and nothing else.
+
+`seqWithin` is not an operator of its own. It expands into
+`(true ##[0:$] inner ##[0:$] true) intersect outer`, which is the LRM's own
+reading with its `1[*0:$]` padding replaced by a `0..$` delay against a
+one-cycle `true` — the same padding without the empty match, because a delay
+of 0 fuses the padding cycle into the match beside it and so can cost nothing.
+A tag is worth adding for a construction the existing ones cannot reach, and
+every consumer of the IR carries it forever; `within` is not one.
 
 An assertion's `reset` is a boolean node: whenever it holds, every in-flight
 attempt is abandoned — neither holding nor failing nor matching — and fresh
@@ -162,10 +182,12 @@ each one, so building the satisfied mask folds over guards rather than gathering
 per state. Seeding an attempt every cycle is one `or`; a reset is `current = 0`.
 
 A delay range costs a filler state per cycle it may skip, repetition unrolls,
-and `intersect` is a product, so every one of those is a blow-up vector.
-`Options.limit` caps the state count, checked before anything is allocated, and
-`Diagnostic` names the node that tripped it. Goto and non-consecutive
-repetition are rejected over an operand that is not a `seqBoolean`.
+and `intersect` and `and` are products — `and` carrying, on top of the pairs, a
+copy of each operand to run on alone in once the other has finished — so every
+one of those is a blow-up vector. `Options.limit` caps the state count, checked
+before anything is allocated, and `Diagnostic` names the node that tripped it.
+Goto and non-consecutive repetition are rejected over an operand that is not a
+`seqBoolean`.
 
 ## Monitors
 
@@ -189,6 +211,12 @@ started in cycle `t` has either matched or run out of live states by cycle
 any goto repetition — is rejected with `ObligationNotBounded`, because tracking
 it soundly needs the obligation determinised so that one state characterises an
 attempt. A consequent that is itself an implication is rejected too.
+
+An `and` is bounded only if *both* its sides are, where an `intersect` needs
+only one: an intersection's two ends coincide, so a bounded side bounds the
+pair, but an `and` runs on to the later end and inherits whichever side has no
+bound. So `req |=> (ack ##[1:$] done) and rdy` is rejected as a consequent
+while the same shape under `intersect` is not.
 
 `Monitor.State` is a reference implementation of the whole per-cycle protocol,
 which is the contract a backend reproduces rather than something it calls.
