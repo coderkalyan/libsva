@@ -29,6 +29,7 @@
 //! | `seq_intersect` | reachable product | `|A| · |B|` |
 //! | `seq_throughout` | a conjunction into every guard | 0 |
 //! | `seq_and` | product, plus a copy of each operand to run on alone | `|A| · |B| + |A| + |B|` |
+//! | `seq_first_match` | the operand determinised, cut off at its first match | `|subsets| · |cells|` |
 //!
 //! A delay range is *both* shapes at once when it spans zero: `a ##[0:2] b` is
 //! the fusion states and the filler chain in one fragment, not a disjunction of
@@ -249,6 +250,13 @@ fn maxLength(ir: *const Ir, node: Ir.Node.Index) ?u64 {
         // The boolean rides along on the operand's cycles without adding any,
         // so it cannot lengthen a match and is not consulted.
         .seq_throughout => return maxLength(ir, @enumFromInt(data.rhs)),
+        // Every match `first_match` keeps is one of its operand's, so the
+        // operand's bound bounds it too. An operand without one leaves it
+        // without one, even where the shortest match is in fact bounded —
+        // `first_match(a[*1:$])` is just `a`. Seeing that needs the longest
+        // path over the automaton and this reads the tree, so the answer is a
+        // rejected obligation rather than a wrong `depth`.
+        .seq_first_match => return maxLength(ir, @enumFromInt(data.lhs)),
         .seq_delay => {
             const delay = ir.delayOf(node);
             if (delay.hi == Ir.unbounded) return null;
@@ -548,6 +556,53 @@ const Builder = struct {
         return builder.intern();
     }
 
+    /// The cube of `left ∧ ¬literal`.
+    ///
+    /// The complement of a whole cube is a disjunction and so not a guard;
+    /// falsifying one literal of it is the piece of that disjunction which
+    /// still is one.
+    fn conjoinNegated(
+        builder: *Builder,
+        left: Guard.Index,
+        literal: Literal,
+    ) Allocator.Error!Guard.Index {
+        if (left == .never) return .never;
+
+        builder.scratch.clearRetainingCapacity();
+        if (left != .always) {
+            try builder.scratch.appendSlice(
+                builder.gpa,
+                builder.literalsOf(@intFromEnum(left)),
+            );
+        }
+        try builder.scratch.append(builder.gpa, .{
+            .negated = !literal.negated,
+            .root = literal.root,
+        });
+        return builder.intern();
+    }
+
+    /// Whether `cell` entails `guard`. Both are canonical cubes, so this is the
+    /// literals of the second being a subset of the literals of the first, read
+    /// off as a merge over two sorted runs.
+    fn entails(builder: *const Builder, cell: Guard.Index, guard: Guard.Index) bool {
+        if (cell == .never) return true; // false entails anything
+        if (guard == .never) return false;
+        if (guard == .always or cell == guard) return true;
+        if (cell == .always) return false;
+
+        const want = builder.literalsOf(@intFromEnum(guard));
+        const have = builder.literalsOf(@intFromEnum(cell));
+        var at: usize = 0;
+        for (want) |literal| {
+            while (at < have.len and literalLess({}, have[at], literal)) at += 1;
+            if (at == have.len) return false;
+            if (@as(u32, @bitCast(have[at])) != @as(u32, @bitCast(literal))) return false;
+            at += 1;
+        }
+        return true;
+    }
+
     // -- Lowering ------------------------------------------------------------
 
     fn lower(builder: *Builder, node: Ir.Node.Index) Error!Fragment {
@@ -592,6 +647,11 @@ const Builder = struct {
                 errdefer operand.deinit(builder.gpa);
                 try builder.lowerThroughout(&operand, exp);
                 return operand;
+            },
+            .seq_first_match => {
+                var operand = try builder.lower(@enumFromInt(data.lhs));
+                defer operand.deinit(builder.gpa);
+                return builder.lowerFirstMatch(node, &operand);
             },
             .seq_delay => {
                 const delay = ir.delayOf(node);
@@ -1151,6 +1211,316 @@ const Builder = struct {
         return fragment;
     }
 
+    /// A determinised state of a `first_match`: where the operand can be this
+    /// cycle, and the cube the cycle was entered under.
+    const Reached = struct { subset: u32, guard: Guard.Index };
+
+    /// Subsets of an operand's states, interned by content so a determinised
+    /// state can name one by a dense index.
+    ///
+    /// Content-addressed the way the cube table is, and for the same reason: a
+    /// map keyed by a slice of `pool` would be invalidated the moment `pool`
+    /// grew, so a hash heads a chain threaded through `chain` and a candidate
+    /// is compared against the chain exactly.
+    const Subsets = struct {
+        /// Words per mask — over the operand's states, not the result's.
+        words: u32,
+        /// Flat `count · words` matrix of the interned masks.
+        pool: std.ArrayListUnmanaged(Word) = .empty,
+        bucket: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+        chain: std.ArrayListUnmanaged(u32) = .empty,
+
+        fn deinit(subsets: *Subsets, gpa: Allocator) void {
+            subsets.pool.deinit(gpa);
+            subsets.bucket.deinit(gpa);
+            subsets.chain.deinit(gpa);
+        }
+
+        fn maskOf(subsets: *const Subsets, subset: u32) []const Word {
+            return subsets.pool.items[@as(usize, subset) * subsets.words ..][0..subsets.words];
+        }
+
+        fn intern(subsets: *Subsets, gpa: Allocator, mask: []const Word) Allocator.Error!u32 {
+            const hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(mask));
+            const bucket = try subsets.bucket.getOrPut(gpa, hash);
+            if (!bucket.found_existing) bucket.value_ptr.* = end_of_chain;
+
+            var subset = bucket.value_ptr.*;
+            while (subset != end_of_chain) : (subset = subsets.chain.items[subset]) {
+                if (std.mem.eql(Word, subsets.maskOf(subset), mask)) return subset;
+            }
+
+            const fresh: u32 = @intCast(subsets.chain.items.len);
+            try subsets.pool.appendSlice(gpa, mask);
+            try subsets.chain.append(gpa, bucket.value_ptr.*);
+            bucket.value_ptr.* = fresh;
+            return fresh;
+        }
+    };
+
+    /// Everything one `first_match` lowering carries: the determinised states
+    /// found so far, their successors, and the scratch the cell enumeration
+    /// runs on.
+    const Determinisation = struct {
+        /// Interned subsets of the operand's states.
+        subsets: Subsets,
+        /// The states found so far, and a content index over them keyed by
+        /// `pairKey(subset, cube)`.
+        states: std.ArrayListUnmanaged(Reached) = .empty,
+        index: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+        /// Successors, flattened: state `s` owns `edges[start[s]..start[s + 1]]`.
+        /// Recorded as they are found rather than recomputed in a second pass
+        /// the way the products do it, because a cell costs cube interning
+        /// where a product's successor costs a bit iteration.
+        edges: std.ArrayListUnmanaged(u32) = .empty,
+        start: std.ArrayListUnmanaged(u32) = .empty,
+        /// Where the operand can go this cycle before its guards are consulted,
+        /// and what one cell of the valuation space leaves of that.
+        candidates: []Word,
+        subset: []Word,
+        /// The distinct guards over `candidates`, and the literals of the one
+        /// being split on — copied out, because interning a cube can move the
+        /// pool they would otherwise be read from.
+        guards: std.ArrayListUnmanaged(Guard.Index) = .empty,
+        literals: std.ArrayListUnmanaged(Literal) = .empty,
+        /// The cells cut so far, and the buffer the next split fills.
+        cells: std.ArrayListUnmanaged(Guard.Index) = .empty,
+        split: std.ArrayListUnmanaged(Guard.Index) = .empty,
+        /// Membership over whichever of those is being filled.
+        seen: std.AutoHashMapUnmanaged(u32, void) = .empty,
+
+        fn init(gpa: Allocator, words: u32) Allocator.Error!Determinisation {
+            const candidates = try maskAlloc(gpa, words);
+            errdefer gpa.free(candidates);
+            return .{
+                .subsets = .{ .words = words },
+                .candidates = candidates,
+                .subset = try maskAlloc(gpa, words),
+            };
+        }
+
+        fn deinit(into: *Determinisation, gpa: Allocator) void {
+            into.subsets.deinit(gpa);
+            into.states.deinit(gpa);
+            into.index.deinit(gpa);
+            into.edges.deinit(gpa);
+            into.start.deinit(gpa);
+            gpa.free(into.candidates);
+            gpa.free(into.subset);
+            into.guards.deinit(gpa);
+            into.literals.deinit(gpa);
+            into.cells.deinit(gpa);
+            into.split.deinit(gpa);
+            into.seen.deinit(gpa);
+        }
+
+        /// Keep a cell, unless it is unsatisfiable or already in `split`.
+        fn record(into: *Determinisation, gpa: Allocator, cell: Guard.Index) Allocator.Error!void {
+            if (cell == .never) return;
+            if ((try into.seen.getOrPut(gpa, @intFromEnum(cell))).found_existing) return;
+            try into.split.append(gpa, cell);
+        }
+    };
+
+    /// Cut the valuation space into the cells the guards on `candidates`
+    /// distinguish, leaving them in `into.cells`.
+    ///
+    /// `candidates` is where the operand can be next cycle before its guards
+    /// are consulted. Which of them it is actually in is decided by those
+    /// guards, so two valuations agreeing on every one of them leave the
+    /// operand in the same place — the cells of that agreement are exactly the
+    /// distinct successors.
+    ///
+    /// A cell is `⋀ g ∧ ⋀ ¬h` over the guards that hold and those that do not,
+    /// and the complement of a cube is a disjunction rather than a cube. So a
+    /// cell is enumerated as one branch per guard holding and one per *literal*
+    /// of it failing: those branches still cover the space, and each one is a
+    /// cube, which is what a state's guard has to be. Two of them may overlap,
+    /// and that costs a duplicate state and nothing else — a valuation in both
+    /// is in one cell, so both branches leave the operand in the same place and
+    /// behave identically from there on.
+    ///
+    /// Nothing carries a subset down the enumeration, because a cell's cube
+    /// already fixes the truth of every candidate guard: a guard holds in a
+    /// cell exactly when the cell entails it. `reach` reads the subset back off
+    /// the cube that way.
+    fn firstMatchCells(
+        builder: *Builder,
+        node: Ir.Node.Index,
+        operand: *const Fragment,
+        candidates: []const Word,
+        into: *Determinisation,
+    ) Error!void {
+        const gpa = builder.gpa;
+
+        // The distinct guards, rather than one split per state carrying one:
+        // a filler chain is a run of states all guarded by `always`, and it
+        // should cost nothing.
+        into.guards.clearRetainingCapacity();
+        into.seen.clearRetainingCapacity();
+        var candidate: BitIterator = .init(candidates);
+        while (candidate.next()) |state| {
+            const guard = operand.guard[state];
+            // `always` is in every cell and `never` in none, so neither of them
+            // tells two valuations apart.
+            if (guard == .always or guard == .never) continue;
+            if ((try into.seen.getOrPut(gpa, @intFromEnum(guard))).found_existing) continue;
+            try into.guards.append(gpa, guard);
+        }
+
+        into.cells.clearRetainingCapacity();
+        try into.cells.append(gpa, .always);
+        for (into.guards.items) |guard| {
+            into.literals.clearRetainingCapacity();
+            try into.literals.appendSlice(gpa, builder.literalsOf(@intFromEnum(guard)));
+
+            into.split.clearRetainingCapacity();
+            into.seen.clearRetainingCapacity();
+            for (into.cells.items) |cell| {
+                try into.record(gpa, try builder.conjoin(cell, guard));
+                for (into.literals.items) |literal| {
+                    try into.record(gpa, try builder.conjoinNegated(cell, literal));
+                }
+            }
+            // Every surviving cell becomes at most one state, so the projected
+            // size is checked here as well as against the state list.
+            if (into.split.items.len > builder.options.limit) {
+                return builder.fail(node, into.split.items.len);
+            }
+            std.mem.swap(std.ArrayListUnmanaged(Guard.Index), &into.cells, &into.split);
+        }
+    }
+
+    /// The determinised state one cell leads to, discovered if it is new.
+    ///
+    /// Null for a cell that leaves the operand nowhere to be: that is an
+    /// attempt dying, which a position automaton spells as having no state to
+    /// enter rather than as a state of its own.
+    fn reach(
+        builder: *Builder,
+        node: Ir.Node.Index,
+        operand: *const Fragment,
+        into: *Determinisation,
+        candidates: []const Word,
+        cell: Guard.Index,
+    ) Error!?u32 {
+        const gpa = builder.gpa;
+
+        @memset(into.subset, 0);
+        var candidate: BitIterator = .init(candidates);
+        while (candidate.next()) |state| {
+            if (builder.entails(cell, operand.guard[state])) Nfa.bitSet(into.subset, state);
+        }
+        if (!Nfa.bitAny(into.subset)) return null;
+
+        const subset = try into.subsets.intern(gpa, into.subset);
+        const entry = try into.index.getOrPut(gpa, pairKey(subset, @intFromEnum(cell)));
+        if (entry.found_existing) return entry.value_ptr.*;
+        if (into.states.items.len >= builder.options.limit) {
+            return builder.fail(node, @as(u64, builder.options.limit) + 1);
+        }
+
+        entry.value_ptr.* = @intCast(into.states.items.len);
+        try into.states.append(gpa, .{ .subset = subset, .guard = cell });
+        return entry.value_ptr.*;
+    }
+
+    /// `first_match(A)`: the shortest match of `A` from each start cycle, with
+    /// every longer match of the same attempt suppressed.
+    ///
+    /// Every other combinator here is a language operation on matches taken one
+    /// at a time, which is why a union or a product of fragments is one. This
+    /// one is not. A match survives only if no *shorter* match of the operand
+    /// covers the same cycles, which is the set difference `L \ L·Σ⁺` — a
+    /// complement, and complementing an ε-free automaton is determinising it.
+    /// Whether a shorter match ended is a property of *where the operand could
+    /// be*, and no single position knows that; one thread can be short of an
+    /// exit while another sits on one.
+    ///
+    /// So this determinises. A state is a subset of the operand's states paired
+    /// with the cube the cycle was entered under, and the pairing is what keeps
+    /// the result a fragment: a subset on its own would have to be entered
+    /// under `⋀ g ∧ ⋀ ¬h`, which is not a cube and so not a guard, so a subset
+    /// is split across the cells its predecessor's guards cut the valuation
+    /// space into — see `firstMatchCells`. Homogeneity survives, because a
+    /// state's guard is the cell it stands for; so does ε-freedom, because a
+    /// subset consumes exactly one cycle like any other state.
+    ///
+    /// Suppression is then one line. A subset holding an exit of the operand
+    /// has just matched, so it is an exit here and has *no successors at all*:
+    /// every longer match of that attempt dies with the states that would have
+    /// carried it. Attempts do not interfere, even sharing one state vector —
+    /// two attempts meeting in the same state agree on everything the operand
+    /// could still do, so they end together and both end on their own first
+    /// match.
+    ///
+    /// `nullable` stays identically false: the shortest match of a language
+    /// with no empty match is not empty. And every match kept is one of the
+    /// operand's, so the longest is no longer than the operand's longest and
+    /// no `depth` gets worse — see `maxLength`.
+    ///
+    /// The cost is the determinisation's: `|subsets| · |cells|` states in the
+    /// worst case, capped by `Options.limit` like every other blow-up here.
+    /// Reachability takes most of it back, because a subset is only ever
+    /// explored while no match has ended yet, which is a short window.
+    fn lowerFirstMatch(
+        builder: *Builder,
+        node: Ir.Node.Index,
+        operand: *const Fragment,
+    ) Error!Fragment {
+        const gpa = builder.gpa;
+        if (operand.state_count == 0) return Fragment.init(gpa, 0);
+
+        var into: Determinisation = try .init(gpa, operand.words);
+        defer into.deinit(gpa);
+
+        // The attempt's first cycle: the operand is wherever its entry states
+        // and this cycle's valuation leave it.
+        try builder.firstMatchCells(node, operand, operand.first, &into);
+        for (into.cells.items) |cell| {
+            _ = try builder.reach(node, operand, &into, operand.first, cell);
+        }
+        const seed_count = into.states.items.len;
+
+        var frontier: usize = 0;
+        while (frontier < into.states.items.len) : (frontier += 1) {
+            try into.start.append(gpa, @intCast(into.edges.items.len));
+            const subset = into.states.items[frontier].subset;
+            // A match of the operand ends here, so the attempt is over and this
+            // state leads nowhere. This is the whole of `first_match`.
+            if (Nfa.bitOverlaps(into.subsets.maskOf(subset), operand.last)) continue;
+
+            @memset(into.candidates, 0);
+            var live: BitIterator = .init(into.subsets.maskOf(subset));
+            while (live.next()) |state| Nfa.bitUnion(into.candidates, operand.rowConst(state));
+
+            try builder.firstMatchCells(node, operand, into.candidates, &into);
+            for (into.cells.items) |cell| {
+                const target = try builder.reach(node, operand, &into, into.candidates, cell) orelse
+                    continue;
+                try into.edges.append(gpa, target);
+            }
+        }
+        try into.start.append(gpa, @intCast(into.edges.items.len));
+
+        const total = try builder.checkLimit(node, into.states.items.len);
+        var fragment = try Fragment.init(gpa, total);
+        errdefer fragment.deinit(gpa);
+
+        for (into.states.items, 0..) |state, offset| {
+            const index: u32 = @intCast(offset);
+            fragment.guard[index] = state.guard;
+            for (into.edges.items[into.start.items[offset]..into.start.items[offset + 1]]) |target| {
+                Nfa.bitSet(fragment.row(index), target);
+            }
+            if (offset < seed_count) Nfa.bitSet(fragment.first, index);
+            if (Nfa.bitOverlaps(into.subsets.maskOf(state.subset), operand.last)) {
+                Nfa.bitSet(fragment.last, index);
+            }
+        }
+        return fragment;
+    }
+
     // -- Materialisation -----------------------------------------------------
 
     /// Walk `mask` to a fixpoint over `edges`, never entering a state outside
@@ -1455,6 +1825,13 @@ fn bruteForceMatches(ir: *const Ir, node: Ir.Node.Index, trace: []const u64, sta
             }
             return ends & spanned;
         },
+        .seq_first_match => {
+            // Every match from one start is a prefix of every longer one, so
+            // they are ordered by length and the shortest is the earliest end.
+            const ends = bruteForceMatches(ir, @enumFromInt(data.lhs), trace, start);
+            if (ends == 0) return 0;
+            return @as(u64, 1) << @intCast(@ctz(ends));
+        },
         .seq_delay => {
             const delay = ir.delayOf(node);
             const hi = @min(delay.hi, length);
@@ -1600,6 +1977,22 @@ const Runner = struct {
         }
         return ends;
     }
+
+    /// The same, with an attempt seeded every cycle and all of them sharing
+    /// one state vector — what an engine actually runs, and what an operator
+    /// defined per attempt has to survive.
+    fn seededMatches(runner: *Runner, trace: []const u64) u64 {
+        var ends: u64 = 0;
+        @memset(runner.current, 0);
+        for (trace, 0..) |cycle, index| {
+            runner.evaluate(cycle);
+            runner.automaton.nfa.advance(runner.current, runner.satisfied, runner.next);
+            @memcpy(runner.current, runner.next);
+            runner.automaton.nfa.seed(runner.satisfied, runner.current);
+            if (runner.automaton.nfa.matched(runner.current)) ends |= @as(u64, 1) << @intCast(index);
+        }
+        return ends;
+    }
 };
 
 /// Every trace of `length` cycles over `atom_count` atoms, one per assignment
@@ -1709,6 +2102,13 @@ fn endsOf(
     var runner = try Runner.init(gpa, &automaton, ir);
     defer runner.deinit(gpa);
     return runner.matches(trace, start);
+}
+
+/// How many states a pattern lowers to, after pruning.
+fn stateCount(gpa: Allocator, ir: *const Ir, pattern: Ir.Node.Index) !u32 {
+    var automaton = try sequence(gpa, ir, pattern, .{}, null);
+    defer automaton.deinit(gpa);
+    return automaton.nfa.state_count;
 }
 
 /// A one-cycle pattern over the atom named by `handle`.
@@ -2167,6 +2567,339 @@ test "within is the LRM reading, padding and all" {
             }
         }
     }
+}
+
+test "differential: first match" {
+    const gpa = testing.allocator;
+
+    {
+        // A delay range: every cycle it spans is another match of the operand
+        // from the same start, so there is something to suppress.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const operand = try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, 3, try atomCycle(&ir, gpa, 1));
+        try differential(gpa, &ir, try ir.seqFirstMatch(gpa, operand), 2, 5);
+    }
+    {
+        // Repetition, where every exit of the operand also has somewhere to
+        // go: ending there and running on are both readings of the cycle, and
+        // only the first survives.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const operand = try ir.seqRepeat(gpa, .seq_repeat_consec, try atomCycle(&ir, gpa, 0), 1, 4);
+        try differential(gpa, &ir, try ir.seqFirstMatch(gpa, operand), 1, 5);
+    }
+    {
+        // A disjunction of two lengths: which side is the shortest match
+        // depends on the trace, so neither can be chosen while building.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const short = try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 2, 2, try atomCycle(&ir, gpa, 1));
+        const long = try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, 4, try atomCycle(&ir, gpa, 2));
+        const operand = try ir.seqOr(gpa, short, long);
+        try differential(gpa, &ir, try ir.seqFirstMatch(gpa, operand), 3, 5);
+    }
+    {
+        // An unbounded operand — the shape `first_match` exists for. The
+        // filler loop is a subset reached from itself.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const operand = try leadingDelay(&ir, gpa, 1, Ir.unbounded, try atomCycle(&ir, gpa, 0));
+        try differential(gpa, &ir, try ir.seqFirstMatch(gpa, operand), 1, 6);
+    }
+    {
+        // Non-consecutive repetition, which is unbounded *and* keeps matching
+        // every cycle once it has started: without the cut-off every one of
+        // them would be reported.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const operand = try ir.seqRepeat(gpa, .seq_repeat_nonconsec, try atomCycle(&ir, gpa, 0), 2, 2);
+        try differential(gpa, &ir, try ir.seqFirstMatch(gpa, operand), 1, 6);
+    }
+    {
+        // Multi-literal guards, which is where a cell stops being one branch
+        // per guard: `¬(a ∧ b)` is a disjunction, so failing that guard costs
+        // a branch per literal and two of them overlap.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const a = try ir.atom(gpa, @enumFromInt(0));
+        const b = try ir.atom(gpa, @enumFromInt(1));
+        const both = try ir.seqBoolean(gpa, try ir.bBinary(gpa, .band, a, b));
+        const operand = try ir.seqOr(
+            gpa,
+            try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 2), 1, 1, both),
+            try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 2), 1, 3, try atomCycle(&ir, gpa, 0)),
+        );
+        try differential(gpa, &ir, try ir.seqFirstMatch(gpa, operand), 3, 5);
+    }
+    {
+        // Guards that overlap without either entailing the other, so a cell
+        // has to pin both down: `a` and `a ∨ b` share valuations in either
+        // direction and neither is the other's complement.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const a = try ir.atom(gpa, @enumFromInt(0));
+        const b = try ir.atom(gpa, @enumFromInt(1));
+        const either = try ir.seqBoolean(gpa, try ir.bBinary(gpa, .bor, a, b));
+        const operand = try ir.seqOr(
+            gpa,
+            try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 2), 1, 2, try ir.seqBoolean(gpa, a)),
+            try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 2), 1, 3, either),
+        );
+        try differential(gpa, &ir, try ir.seqFirstMatch(gpa, operand), 3, 5);
+    }
+    {
+        // Two multi-literal guards sharing a literal, over one candidate set.
+        // Several cells then leave the operand in exactly the same place
+        // without any one of their cubes covering the rest — `{¬a, ¬b}` and
+        // `{¬b, ¬c}` both leave only the filler live — so a state has to be
+        // named by its cell as well as by its subset. Naming it by the subset
+        // alone would keep one cube and lose every valuation in the others.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const a = try ir.atom(gpa, @enumFromInt(0));
+        const b = try ir.atom(gpa, @enumFromInt(1));
+        const c = try ir.atom(gpa, @enumFromInt(2));
+        const operand = try ir.seqDelay(gpa, try ir.seqBoolean(gpa, a), 1, 2, try ir.seqOr(
+            gpa,
+            try ir.seqBoolean(gpa, try ir.bBinary(gpa, .band, a, b)),
+            try ir.seqBoolean(gpa, try ir.bBinary(gpa, .band, b, c)),
+        ));
+        try differential(gpa, &ir, try ir.seqFirstMatch(gpa, operand), 3, 5);
+    }
+    {
+        // An unsatisfiable guard among the candidates, and one that is in
+        // `last` at that. No cycle can enter it, so it belongs to no subset —
+        // it would otherwise report a match in every cycle — and it tells no
+        // two valuations apart, so it must not split the space either, which
+        // it would do by ruling every cell out.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const never = try ir.seqBoolean(gpa, try ir.boolConst(gpa, false));
+        const operand = try ir.seqOr(
+            gpa,
+            try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, 1, never),
+            try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, 2, try atomCycle(&ir, gpa, 1)),
+        );
+        try differential(gpa, &ir, try ir.seqFirstMatch(gpa, operand), 2, 5);
+    }
+    {
+        // A contradictory operand can never match, so there is nothing to
+        // determinise and nothing survives pruning.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const a = try ir.atom(gpa, @enumFromInt(0));
+        const operand = try ir.seqDelay(
+            gpa,
+            try ir.seqBoolean(gpa, a),
+            0,
+            0,
+            try ir.seqBoolean(gpa, try ir.bNot(gpa, a)),
+        );
+        const pattern = try ir.seqFirstMatch(gpa, operand);
+        try differential(gpa, &ir, pattern, 1, 4);
+
+        var automaton = try sequence(gpa, &ir, pattern, .{}, null);
+        defer automaton.deinit(gpa);
+        try testing.expectEqual(@as(u32, 0), automaton.nfa.state_count);
+    }
+}
+
+test "differential: a first match inside a larger sequence" {
+    const gpa = testing.allocator;
+
+    const inner_of = struct {
+        fn build(ir: *Ir, allocator: Allocator) !Ir.Node.Index {
+            return ir.seqDelay(allocator, try atomCycle(ir, allocator, 0), 1, 3, try atomCycle(ir, allocator, 1));
+        }
+    }.build;
+
+    {
+        // The shortest match fixes where the rest of the sequence starts, so
+        // a suppressed longer match is a continuation that never happens.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const inner = try inner_of(&ir, gpa);
+        const pattern = try ir.seqDelay(gpa, try ir.seqFirstMatch(gpa, inner), 1, 1, try atomCycle(&ir, gpa, 2));
+        try differential(gpa, &ir, pattern, 3, 5);
+    }
+    {
+        // A delay of 0 fuses a neighbouring guard into a cell's cube. A cell
+        // is a cube precisely so that this stays a cube.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const inner = try inner_of(&ir, gpa);
+        const pattern = try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 2), 0, 0, try ir.seqFirstMatch(gpa, inner));
+        try differential(gpa, &ir, pattern, 3, 5);
+    }
+    {
+        // Against an intersection, which has to agree with the end cycle the
+        // suppression picked rather than with any the operand offered.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const inner = try inner_of(&ir, gpa);
+        const other = try ir.seqRepeat(gpa, .seq_repeat_consec, try atomCycle(&ir, gpa, 2), 2, 4);
+        try differential(gpa, &ir, try ir.seqIntersect(gpa, try ir.seqFirstMatch(gpa, inner), other), 3, 5);
+    }
+    {
+        // Against an `and`, whose half-finished copies carry a determinised
+        // state alongside `finished`.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const inner = try inner_of(&ir, gpa);
+        const pattern = try ir.seqAnd(gpa, try ir.seqFirstMatch(gpa, inner), try atomCycle(&ir, gpa, 2));
+        try differential(gpa, &ir, pattern, 3, 5);
+    }
+    {
+        // A `throughout` conjoins into every guard, cells included: it can
+        // shorten a cell but never split one, so coverage survives.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const inner = try inner_of(&ir, gpa);
+        const en = try ir.atom(gpa, @enumFromInt(2));
+        try differential(gpa, &ir, try ir.seqThroughout(gpa, en, try ir.seqFirstMatch(gpa, inner)), 3, 5);
+    }
+    {
+        // Determinising a determinised operand. Idempotent, and the second
+        // pass runs over a fragment whose exits are all dead ends.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const inner = try inner_of(&ir, gpa);
+        const once = try ir.seqFirstMatch(gpa, inner);
+        const twice = try ir.seqFirstMatch(gpa, once);
+        try differential(gpa, &ir, twice, 2, 5);
+        try sameLanguage(&ir, once, twice, 2, 5);
+    }
+    {
+        // Suppression is on the operand's own matches, so `first_match` of a
+        // repetition is not the repetition of a `first_match`.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const inner = try inner_of(&ir, gpa);
+        const pattern = try ir.seqRepeat(gpa, .seq_repeat_consec, try ir.seqFirstMatch(gpa, inner), 1, 2);
+        try differential(gpa, &ir, pattern, 2, 6);
+    }
+}
+
+test "first match keeps the earliest end and nothing else" {
+    const gpa = testing.allocator;
+
+    // Bit 0 is `a`, bit 1 is `b`. `a ##[1:3] b` matches wherever `b` holds in
+    // the three cycles after an `a`, so a trace holding `b` throughout gives
+    // one attempt three matches.
+    var ir: Ir = .init();
+    defer ir.deinit(gpa);
+    const operand = try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, 3, try atomCycle(&ir, gpa, 1));
+    const pattern = try ir.seqFirstMatch(gpa, operand);
+
+    const every = [_]u64{ 0b01, 0b10, 0b10, 0b10 };
+    try testing.expectEqual(@as(u64, 0b1110), try endsOf(gpa, &ir, operand, &every, 0));
+    try testing.expectEqual(@as(u64, 0b0010), try endsOf(gpa, &ir, pattern, &every, 0));
+
+    // The kept end is the earliest one there is, not a fixed one: drop the
+    // first `b` and the survivor moves with it.
+    const later = [_]u64{ 0b01, 0b00, 0b10, 0b10 };
+    try testing.expectEqual(@as(u64, 0b1100), try endsOf(gpa, &ir, operand, &later, 0));
+    try testing.expectEqual(@as(u64, 0b0100), try endsOf(gpa, &ir, pattern, &later, 0));
+
+    // And an operand that never matches keeps nothing.
+    const never = [_]u64{ 0b01, 0b00, 0b00, 0b00 };
+    try testing.expectEqual(@as(u64, 0), try endsOf(gpa, &ir, pattern, &never, 0));
+}
+
+test "first match is the identity on an operand that cannot match twice" {
+    const gpa = testing.allocator;
+
+    // Every match of `a ##1 b` from one start is the same length, so no match
+    // has a shorter one to lose to and the determinisation must not change the
+    // language.
+    var ir: Ir = .init();
+    defer ir.deinit(gpa);
+    const operand = try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, 1, try atomCycle(&ir, gpa, 1));
+    try sameLanguage(&ir, operand, try ir.seqFirstMatch(gpa, operand), 2, 5);
+}
+
+test "first match suppresses inside an attempt, not across them" {
+    const gpa = testing.allocator;
+
+    // Every attempt shares one state vector, so an attempt whose first match
+    // is still ahead must not be cut off by an earlier attempt's. It is not,
+    // because the suppression is in the language rather than in the stepping:
+    // two attempts meeting in one determinised state agree on everything the
+    // operand could still do, so sharing a bit is exactly right.
+    var ir: Ir = .init();
+    defer ir.deinit(gpa);
+    const operand = try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, 3, try atomCycle(&ir, gpa, 1));
+    const pattern = try ir.seqFirstMatch(gpa, operand);
+
+    var automaton = try sequence(gpa, &ir, pattern, .{}, null);
+    defer automaton.deinit(gpa);
+    var runner = try Runner.init(gpa, &automaton, &ir);
+    defer runner.deinit(gpa);
+
+    var traces: Traces = .init(2, 6);
+    while (traces.next()) |trace| {
+        var want: u64 = 0;
+        for (0..trace.len) |start| {
+            want |= bruteForceMatches(&ir, pattern, trace, @intCast(start));
+        }
+        const got = runner.seededMatches(trace);
+        if (want != got) {
+            std.debug.print(
+                "trace bits {b}: want ends {b}, got {b}\n",
+                .{ traces.bits, want, got },
+            );
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "determinising costs subsets times cells" {
+    const gpa = testing.allocator;
+
+    // The blow-up is the headline cost of the operator, so the shapes it is
+    // worth having are pinned rather than described.
+    const Case = struct { states: u32, kept: u32 };
+    for ([_]Case{
+        // `##[1:$] a`: the operand's own filler loop determinises to itself,
+        // so the shortest match costs nothing over the operand.
+        .{ .states = 3, .kept = 3 },
+    }) |case| {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const operand = try leadingDelay(&ir, gpa, 1, Ir.unbounded, try atomCycle(&ir, gpa, 0));
+        try testing.expectEqual(case.states, try stateCount(gpa, &ir, operand));
+        try testing.expectEqual(case.kept, try stateCount(gpa, &ir, try ir.seqFirstMatch(gpa, operand)));
+    }
+
+    // `a ##[1:3] b`: one subset per cycle the range spans, each split by
+    // whether `b` held, and the run stops at the first that did.
+    var ir: Ir = .init();
+    defer ir.deinit(gpa);
+    const ranged = try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, 3, try atomCycle(&ir, gpa, 1));
+    try testing.expectEqual(@as(u32, 4), try stateCount(gpa, &ir, ranged));
+    try testing.expectEqual(@as(u32, 6), try stateCount(gpa, &ir, try ir.seqFirstMatch(gpa, ranged)));
+}
+
+test "the state cap reports the first match that tripped it" {
+    const gpa = testing.allocator;
+
+    // Eight independent guards on the candidates cut the valuation space into
+    // 256 cells, which overruns the cap long before a state is allocated.
+    var ir: Ir = .init();
+    defer ir.deinit(gpa);
+    var wide = try atomCycle(&ir, gpa, 0);
+    for (1..8) |handle| wide = try ir.seqOr(gpa, wide, try atomCycle(&ir, gpa, @intCast(handle)));
+    const operand = try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 8), 1, 1, wide);
+    const pattern = try ir.seqFirstMatch(gpa, operand);
+
+    var diagnostic: Diagnostic = undefined;
+    try testing.expectError(
+        error.StateLimitExceeded,
+        sequence(gpa, &ir, pattern, .{ .limit = 64 }, &diagnostic),
+    );
+    try testing.expectEqual(pattern, diagnostic.node);
+    try testing.expectEqual(@as(u64, 128), diagnostic.size);
 }
 
 test "a contradictory fusion prunes to nothing" {
@@ -2707,6 +3440,28 @@ fn addDirective(
     });
 }
 
+/// Every failure a monitor reports over `trace`, including what the end of the
+/// trace makes of an attempt still pending there.
+fn failuresOver(
+    gpa: Allocator,
+    ir: *const Ir,
+    index: Ir.Assertion.Index,
+    trace: []const u64,
+) !u32 {
+    var monitor = try assertion(gpa, ir, index, .{}, null);
+    defer monitor.deinit(gpa);
+    var state = try Monitor.State.init(gpa, &monitor);
+    defer state.deinit(gpa);
+
+    state.clear();
+    var failures: u32 = 0;
+    for (trace) |cycle| {
+        const atoms = [_]Word{cycle};
+        failures += state.stepAtoms(ir, &atoms).failures;
+    }
+    return failures + state.finish().failures;
+}
+
 test "differential: implication" {
     const gpa = testing.allocator;
 
@@ -2905,6 +3660,193 @@ test "differential: a throughout obligation" {
     }
 }
 
+test "differential: a first match obligation" {
+    const gpa = testing.allocator;
+
+    // Per-attempt tracking over an obligation whose states are subsets, whose
+    // exits have empty follow rows, and which therefore goes empty the cycle
+    // it matches. That is what is being checked: the monitor path handles the
+    // shape. It is *not* a check of the suppression, which is invisible from
+    // here — see the test below for why, and for where it is visible.
+    for ([_]Ir.Node.Tag{ .prop_seq_weak, .prop_seq_strong }) |strength| {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const body = try ir.seqFirstMatch(
+            gpa,
+            try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, 3, try atomCycle(&ir, gpa, 1)),
+        );
+        const index = try addDirective(&ir, gpa, try ir.propSeq(gpa, strength, body), null);
+        try differentialMonitor(gpa, &ir, index, 2, 4);
+    }
+}
+
+test "first match is invisible as a property and visible as an antecedent" {
+    const gpa = testing.allocator;
+
+    // Where the operator can be observed at all, which is not everywhere.
+    //
+    // A sequence property holds as soon as its sequence completes a match —
+    // the earliest, which is exactly the one `first_match` keeps — and fails
+    // as soon as it can no longer match, which while pending is the same
+    // question for both, because a match having ended would already have made
+    // it hold. Pending-at-end coincides too. So over a *property* the operator
+    // is a no-op on the verdict, whatever its strength.
+    //
+    // It bites where the operand's later matches are themselves observable:
+    // as an antecedent, because every antecedent match raises an obligation of
+    // its own, and inside a larger sequence, because a suppressed match is a
+    // continuation that never happens.
+    //
+    // Bit 0 is `a`, bit 1 is `b`, bit 2 is `c`. `a ##[1:2] b` matches from
+    // cycle 0 at cycle 1 *and* at cycle 2, which is what gives the suppression
+    // something to do.
+    const paired = [_]u64{ 0b001, 0b010, 0b110, 0b000 };
+
+    for ([_]Ir.Node.Tag{ .prop_seq_weak, .prop_seq_strong }) |strength| {
+        var verdict: [2]u32 = undefined;
+        for ([_]bool{ false, true }, &verdict) |suppress, *into| {
+            var ir: Ir = .init();
+            defer ir.deinit(gpa);
+            var body = try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, 2, try atomCycle(&ir, gpa, 1));
+            if (suppress) body = try ir.seqFirstMatch(gpa, body);
+            const property = try ir.propImplies(
+                gpa,
+                .prop_implies_overlap,
+                try atomCycle(&ir, gpa, 2),
+                try ir.propSeq(gpa, strength, body),
+            );
+            into.* = try failuresOver(gpa, &ir, try addDirective(&ir, gpa, property, null), &paired);
+        }
+        try testing.expectEqual(verdict[0], verdict[1]);
+    }
+
+    // As an antecedent the later match raises an obligation of its own, and
+    // that one is discharged by nothing.
+    var raised: [2]u32 = undefined;
+    for ([_]bool{ false, true }, &raised) |suppress, *into| {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        var trigger = try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, 2, try atomCycle(&ir, gpa, 1));
+        if (suppress) trigger = try ir.seqFirstMatch(gpa, trigger);
+        const property = try ir.propImplies(
+            gpa,
+            .prop_implies_nonoverlap,
+            trigger,
+            try ir.propSeq(gpa, .prop_seq_weak, try atomCycle(&ir, gpa, 2)),
+        );
+        into.* = try failuresOver(gpa, &ir, try addDirective(&ir, gpa, property, null), &paired);
+    }
+    try testing.expectEqual(@as(u32, 1), raised[0]);
+    try testing.expectEqual(@as(u32, 0), raised[1]);
+
+    // And inside a larger sequence it is the difference between a match and
+    // none at all: with `c` only in cycle 3, the run-on is reachable from the
+    // operand's later match and from nothing else.
+    const late = [_]u64{ 0b001, 0b010, 0b010, 0b100 };
+    var reached: [2]u64 = undefined;
+    for ([_]bool{ false, true }, &reached) |suppress, *into| {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        var inner = try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, 2, try atomCycle(&ir, gpa, 1));
+        if (suppress) inner = try ir.seqFirstMatch(gpa, inner);
+        const whole = try ir.seqDelay(gpa, inner, 1, 1, try atomCycle(&ir, gpa, 2));
+        into.* = try endsOf(gpa, &ir, whole, &late, 0);
+    }
+    try testing.expectEqual(@as(u64, 0b1000), reached[0]);
+    try testing.expectEqual(@as(u64, 0), reached[1]);
+}
+
+test "a first match obligation inherits its operand's bound" {
+    const gpa = testing.allocator;
+
+    {
+        // `req |=> first_match(##[1:$] ack)`. Taking only the earliest match
+        // does not bound how late it arrives, so this is still unbounded and
+        // still rejected.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const body = try ir.seqFirstMatch(
+            gpa,
+            try leadingDelay(&ir, gpa, 1, Ir.unbounded, try atomCycle(&ir, gpa, 1)),
+        );
+        const consequent = try ir.propSeq(gpa, .prop_seq_weak, body);
+        const property = try ir.propImplies(
+            gpa,
+            .prop_implies_nonoverlap,
+            try atomCycle(&ir, gpa, 0),
+            consequent,
+        );
+        var diagnostic: Diagnostic = undefined;
+        try testing.expectError(
+            error.ObligationNotBounded,
+            assertion(gpa, &ir, try addDirective(&ir, gpa, property, null), .{}, &diagnostic),
+        );
+        try testing.expectEqual(body, diagnostic.node);
+    }
+    {
+        // The conservative side of inheriting, pinned so that tightening it
+        // is a visible change: `first_match(a[*1:$])` is just `a`, and a
+        // longest path over the automaton would say so — but `maxLength` reads
+        // the tree, so the answer is a refusal rather than a depth of one.
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const body = try ir.seqFirstMatch(
+            gpa,
+            try ir.seqRepeat(gpa, .seq_repeat_consec, try atomCycle(&ir, gpa, 1), 1, Ir.unbounded),
+        );
+        const consequent = try ir.propSeq(gpa, .prop_seq_weak, body);
+        const property = try ir.propImplies(
+            gpa,
+            .prop_implies_nonoverlap,
+            try atomCycle(&ir, gpa, 0),
+            consequent,
+        );
+        try testing.expectError(
+            error.ObligationNotBounded,
+            assertion(gpa, &ir, try addDirective(&ir, gpa, property, null), .{}, null),
+        );
+
+        // The sequence itself lowers fine, and to exactly `a`: one state,
+        // which is the shortening the bound declines to notice.
+        try testing.expectEqual(@as(u32, 1), try stateCount(gpa, &ir, body));
+    }
+}
+
+test "no match survives first match that outlives the depth it reports" {
+    const gpa = testing.allocator;
+
+    // `depth` is an over-estimate here rather than the exact longest match, so
+    // the property that matters is the inequality: every match kept is one of
+    // the operand's, and none of them reaches past the bound the obligation
+    // was allocated for.
+    var ir: Ir = .init();
+    defer ir.deinit(gpa);
+    const operand = try ir.seqRepeat(gpa, .seq_repeat_consec, try atomCycle(&ir, gpa, 0), 1, 4);
+    const kept = try ir.seqFirstMatch(gpa, operand);
+    const depth = maxLength(&ir, kept).?;
+
+    var all = try sequence(gpa, &ir, operand, .{}, null);
+    defer all.deinit(gpa);
+    var one = try sequence(gpa, &ir, kept, .{}, null);
+    defer one.deinit(gpa);
+    var over_all = try Runner.init(gpa, &all, &ir);
+    defer over_all.deinit(gpa);
+    var over_one = try Runner.init(gpa, &one, &ir);
+    defer over_one.deinit(gpa);
+
+    var traces: Traces = .init(1, 6);
+    while (traces.next()) |trace| {
+        for (0..trace.len) |index| {
+            const start: u32 = @intCast(index);
+            const ends = over_one.matches(trace, start);
+            // Kept matches are a subset of the operand's...
+            try testing.expectEqual(ends, ends & over_all.matches(trace, start));
+            // ...and none of them spans more cycles than were allocated.
+            if (ends != 0) try testing.expect(@ctz(ends) - start + 1 <= depth);
+        }
+    }
+}
+
 test "an obligation that prunes to nothing fails every attempt" {
     const gpa = testing.allocator;
 
@@ -3018,6 +3960,30 @@ test "depth is the obligation's longest match" {
                     gpa_,
                     try ir.atom(gpa_, @enumFromInt(2)),
                     try ir.seqDelay(gpa_, try atomCycle(ir, gpa_, 1), 1, 1, try atomCycle(ir, gpa_, 1)),
+                );
+            }
+        }.make },
+        // `first_match` keeps a subset of its operand's matches, so it can only
+        // shorten the longest one. The bound is the operand's, which here is
+        // exact: with `b` first holding in the last cycle of the range, the
+        // earliest match is also the longest one there is.
+        .{ .length = 3, .build = struct {
+            fn make(ir: *Ir, gpa_: Allocator) anyerror!Ir.Node.Index {
+                return ir.seqFirstMatch(
+                    gpa_,
+                    try ir.seqDelay(gpa_, try atomCycle(ir, gpa_, 1), 1, 2, try atomCycle(ir, gpa_, 2)),
+                );
+            }
+        }.make },
+        // And here it is a strict over-estimate: every match of `a[*1:3]` has
+        // the one-cycle match as a prefix, so the earliest is always one cycle
+        // and three vectors are allocated where one would do. Over-estimating
+        // costs memory; under-estimating would lose attempts.
+        .{ .length = 3, .build = struct {
+            fn make(ir: *Ir, gpa_: Allocator) anyerror!Ir.Node.Index {
+                return ir.seqFirstMatch(
+                    gpa_,
+                    try ir.seqRepeat(gpa_, .seq_repeat_consec, try atomCycle(ir, gpa_, 1), 1, 3),
                 );
             }
         }.make },

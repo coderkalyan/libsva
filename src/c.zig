@@ -160,6 +160,12 @@ export fn sva_seq_within(ir: *Ir, inner: u32, outer: u32, out: *u32) Status {
     return deliver(out, ir.seqWithin(gpa, @enumFromInt(inner), @enumFromInt(outer)));
 }
 
+/// Determinises its operand, so it is the one sequence constructor whose
+/// lowering can be exponential in the size of what it is given.
+export fn sva_seq_first_match(ir: *Ir, sequence: u32, out: *u32) Status {
+    return deliver(out, ir.seqFirstMatch(gpa, @enumFromInt(sequence)));
+}
+
 const Repeat = enum(c_int) {
     consecutive,
     goto,

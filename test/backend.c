@@ -342,6 +342,22 @@ static sva_node build_within(sva_ir *ir) {
     return property;
 }
 
+/* `req |=> first_match(ack ##[1:3] done)`. The obligation is the operand
+ * determinised and cut off at its first match, so its states are subsets and
+ * cubes rather than letter occurrences — the one shape whose automaton is not
+ * built by combining its operands' — and a backend has to reproduce it from
+ * the same three tables as any other. Its exits have empty follow rows, which
+ * is what suppression looks like from out here. */
+static sva_node build_first_match(sva_ir *ir) {
+    sva_node body = 0, earliest = 0, consequent = 0, property = 0;
+    const sva_node req = atom_cycle(ir, 0);
+    BUILD(sva_seq_delay(ir, atom_cycle(ir, 1), 1, 3, atom_cycle(ir, 2), &body));
+    BUILD(sva_seq_first_match(ir, body, &earliest));
+    BUILD(sva_prop_sequence(ir, SVA_WEAK, earliest, &consequent));
+    BUILD(sva_prop_implies(ir, SVA_NONOVERLAPPING, req, consequent, &property));
+    return property;
+}
+
 typedef struct {
     const char *name;
     Build       build;
@@ -514,6 +530,7 @@ int main(void) {
         { "en throughout (a ##1 b)",  build_throughout,  false },
         { "(a ##1 b) and c",          build_and,         false },
         { "(a ##1 b) within c[*1:3]", build_within,      false },
+        { "first_match(a ##[1:3] b)", build_first_match, false },
     };
 
     printf("compiled backend vs reference runtime:\n");

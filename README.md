@@ -63,8 +63,8 @@ the layer it expects:
 
 - **boolean** — `atom`, `boolConst`, `bNot`, `bBinary` (`.band`, `.bor`).
 - **sequence** — `seqBoolean`, `seqDelay`, `seqOr`, `seqAnd`, `seqIntersect`,
-  `seqThroughout`, `seqWithin`, `seqRepeat` (`.seq_repeat_consec`,
-  `.seq_repeat_goto`, `.seq_repeat_nonconsec`).
+  `seqThroughout`, `seqWithin`, `seqFirstMatch`, `seqRepeat`
+  (`.seq_repeat_consec`, `.seq_repeat_goto`, `.seq_repeat_nonconsec`).
 - **property** — `propSeq` (`.prop_seq_weak`, `.prop_seq_strong`),
   `propImplies` (`.prop_implies_overlap`, `.prop_implies_nonoverlap`).
 
@@ -124,6 +124,28 @@ one-cycle `true` — the same padding without the empty match, because a delay
 of 0 fuses the padding cycle into the match beside it and so can cost nothing.
 A tag is worth adding for a construction the existing ones cannot reach, and
 every consumer of the IR carries it forever; `within` is not one.
+
+`seqFirstMatch` keeps only the **shortest** match of a sequence from each start
+cycle: as soon as one match completes, every longer match of that attempt is
+suppressed. It is the one sequence operator that is not a language operation on
+matches taken one at a time — whether a match survives depends on whether a
+*shorter* one covers the same cycles, which is the set difference against the
+operand's own longer matches, and a difference is a complement. Nothing built
+out of unions and products is one, so unlike `within` this does need a tag, and
+unlike every other operator it lowers by determinising rather than composing.
+
+It is worth knowing where that is observable, because it is not everywhere. Over
+a *property* it is a no-op: a sequence property holds as soon as its sequence
+completes a match — the earliest, which is the one `first_match` keeps — and
+fails as soon as it can no longer match, which while pending is the same
+question for both, since a match having ended would already have made it hold.
+Pending-at-end coincides too, so strength does not change it. `first_match`
+bites only where the operand's *later* matches are themselves observable: as an
+implication antecedent, because every antecedent match raises an obligation of
+its own, and inside a larger sequence, because a suppressed match is a
+continuation that never happens. A test written over a bare
+`assert property (first_match(s))` therefore passes whether the operator is
+implemented or ignored.
 
 An assertion's `reset` is a boolean node: whenever it holds, every in-flight
 attempt is abandoned — neither holding nor failing nor matching — and fresh
@@ -189,6 +211,18 @@ before anything is allocated, and `Diagnostic` names the node that tripped it.
 Goto and non-consecutive repetition are rejected over an operand that is not a
 `seqBoolean`.
 
+`first_match` is a blow-up vector of a different kind: it determinises its
+operand, so a state is a *subset* of the operand's states rather than a letter
+occurrence, paired with the cube that reached it. The pairing is what keeps the
+result homogeneous — the guard that says a subset is exactly what is live is
+`⋀ g ∧ ⋀ ¬h`, which is not a cube, so the subset is split across the cells its
+predecessor's guards cut the valuation space into, one branch per guard holding
+and one per *literal* of it failing. Suppression is then that a subset holding
+an exit of the operand has no successors at all. Reachability keeps this small
+in practice, because a subset is only explored while no match has ended yet,
+but the worst case is `|subsets| · |cells|` and the cap is what stands between
+that and an allocation.
+
 ## Monitors
 
 `sva.glushkov.assertion(gpa, &ir, index, .{}, null)` lowers a directive to an
@@ -217,6 +251,14 @@ only one: an intersection's two ends coincide, so a bounded side bounds the
 pair, but an `and` runs on to the later end and inherits whichever side has no
 bound. So `req |=> (ack ##[1:$] done) and rdy` is rejected as a consequent
 while the same shape under `intersect` is not.
+
+`first_match` keeps a subset of its operand's matches, so it reports the
+operand's bound: exact where the earliest match is also the longest on offer,
+and an over-estimate otherwise — which costs a state vector rather than a
+verdict. `req |=> first_match(##[1:$] ack)` is still unbounded and still
+rejected, which is the shape that matters. `first_match(ack[*1:$])` is really
+just `ack` and is rejected anyway: seeing that needs the longest path over the
+automaton, and the bound is read off the tree.
 
 `Monitor.State` is a reference implementation of the whole per-cycle protocol,
 which is the contract a backend reproduces rather than something it calls.

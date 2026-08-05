@@ -10,8 +10,8 @@
 //!      an NFA transition.
 //!   2. **Sequence layer** — regular patterns over cycles: delayed
 //!      concatenation, disjunction, conjunction, length-matching intersection,
-//!      a boolean required throughout a match, and the three flavors of
-//!      repetition.
+//!      a boolean required throughout a match, shortest-match selection, and
+//!      the three flavors of repetition.
 //!   3. **Property layer** — sequences promoted to properties, and implication.
 //!
 //! A leaf of the boolean layer is an `Atom`: an opaque `u32` handle the
@@ -286,6 +286,16 @@ pub const Node = struct {
         /// sequence here matches at least one cycle, `(exp[*1:$]) intersect
         /// seq` is the same language, and it is what the operator means.
         seq_throughout,
+        /// Only the *shortest* match of a sequence from each start cycle: as
+        /// soon as one match completes, every longer match of the same attempt
+        /// is suppressed. `lhs` = the sequence node.
+        ///
+        /// This is the one sequence-layer operator that is not a language
+        /// operation on its operand's matches taken one at a time — whether a
+        /// match survives depends on whether a *shorter* one exists over the
+        /// same cycles, so lowering it determinises the operand rather than
+        /// composing fragments. See `Glushkov.lowerFirstMatch`.
+        seq_first_match,
         /// Consecutive repetition: `lo..hi` back-to-back matches of the
         /// operand, `lo >= 1`. `lhs` = the repeated sequence, `rhs` = `extra`
         /// index of `[lo, hi]`.
@@ -336,6 +346,7 @@ pub const Node = struct {
                 .seq_and,
                 .seq_intersect,
                 .seq_throughout,
+                .seq_first_match,
                 .seq_repeat_consec,
                 .seq_repeat_goto,
                 .seq_repeat_nonconsec,
@@ -575,6 +586,17 @@ pub fn seqWithin(ir: *Ir, gpa: Allocator, inner: Node.Index, outer: Node.Index) 
     return ir.seqIntersect(gpa, padded, outer);
 }
 
+/// Only the shortest match of `seq` from each start cycle; a longer match of
+/// the same attempt is suppressed.
+///
+/// Unlike the operators around it this one cannot be spelled with the others:
+/// keeping the shortest match is a set difference against the operand's own
+/// longer matches, which is a complement, and no product of fragments is one.
+pub fn seqFirstMatch(ir: *Ir, gpa: Allocator, seq: Node.Index) Allocator.Error!Node.Index {
+    ir.assertOperand(seq, .sequence);
+    return ir.addNode(gpa, .{ .tag = .seq_first_match, .data = .{ .lhs = @intFromEnum(seq) } });
+}
+
 /// Repetition of `seq` `lo..hi` times, in the flavor named by `tag`
 /// (`seq_repeat_consec`, `_goto` or `_nonconsec`). `hi == Ir.unbounded` leaves
 /// the upper bound open.
@@ -671,6 +693,7 @@ pub fn operandsOf(ir: *const Ir, node: Node.Index, buf: *[max_operands]Node.Inde
         // One operand in `lhs`; for the repetitions `rhs` is an `extra` offset.
         .bnot,
         .seq_boolean,
+        .seq_first_match,
         .seq_repeat_consec,
         .seq_repeat_goto,
         .seq_repeat_nonconsec,
@@ -803,7 +826,7 @@ pub const magic: [4]u8 = .{ 'S', 'V', 'A', 'B' };
 /// On-disk format version. The IR reserves no space for future operators, so
 /// this is bumped on any layout *or* `Node.Tag` change; readers reject a
 /// mismatch and the caller recompiles from source.
-pub const format_version: u32 = 5;
+pub const format_version: u32 = 6;
 
 const checksum_len = Blake3.digest_length;
 /// Bytes preceding the first payload word: `magic` + `format_version`.
@@ -1013,10 +1036,11 @@ test "operandsOf is the exhaustive walk" {
     const lead = try ir.seqDelay(gpa, always, 2, 3, rep);
     const cat = try ir.seqDelay(gpa, sx, 1, 1, lead);
     const alt = try ir.seqOr(gpa, cat, try ir.seqIntersect(gpa, sx, cat));
+    const soonest = try ir.seqFirstMatch(gpa, alt);
     const prop = try ir.propImplies(
         gpa,
         .prop_implies_nonoverlap,
-        alt,
+        soonest,
         try ir.propSeq(gpa, .prop_seq_strong, sx),
     );
 
@@ -1043,6 +1067,7 @@ test "operandsOf is the exhaustive walk" {
     try std.testing.expectEqual(@as(usize, 0), ir.operandsOf(try ir.boolConst(gpa, true), &buf).len);
     try std.testing.expectEqualSlices(Node.Index, &.{ always, rep }, ir.operandsOf(lead, &buf));
     try std.testing.expectEqualSlices(Node.Index, &.{ sx, lead }, ir.operandsOf(cat, &buf));
+    try std.testing.expectEqualSlices(Node.Index, &.{alt}, ir.operandsOf(soonest, &buf));
 }
 
 test "sequence properties carry strength" {

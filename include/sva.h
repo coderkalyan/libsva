@@ -270,6 +270,15 @@ sva_status sva_seq_throughout(sva_ir *ir, sva_node exp, sva_node sequence,
  * fuses that cycle into the neighbouring match. */
 sva_status sva_seq_within(sva_ir *ir, sva_node inner, sva_node outer,
                           sva_node *out);
+/* Only the shortest match of `sequence` from each start cycle: as soon as one
+   match completes, every longer match of the same attempt is suppressed.
+ *
+ * The one sequence operator that is not a language operation on matches taken
+ * one at a time — whether a match survives depends on whether a shorter one
+ * covers the same cycles — so it lowers by determinising its operand rather
+ * than by combining automata, and it is the one operator whose state count can
+ * be exponential in its operand's. `SVA_ERROR_STATE_LIMIT` names it if it is. */
+sva_status sva_seq_first_match(sva_ir *ir, sva_node sequence, sva_node *out);
 /* lo must be at least 1. Goto and non-consecutive repetition additionally
    require `sequence` to be an sva_seq_boolean, because they are defined in terms
    of the cycles in which the operand does not hold. */
