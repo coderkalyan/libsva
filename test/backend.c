@@ -59,13 +59,14 @@ typedef struct {
 
 /* One abort scoped to part of the obligation. `mask` is the states it guards;
  * `resolves` says whether firing settles the whole attempt or only clears those
- * states. `sampled` is metadata a real backend would use to pick which
- * valuation of the root to compute, and is unused here because this test
- * supplies root bits directly. */
+ * states. `covers_trigger` says it also covers the antecedent, so a match ending
+ * this cycle is resolved by it rather than seeding. `sampled` is metadata a real
+ * backend would use to pick which valuation of the root to compute, and is
+ * unused here because this test supplies root bits directly. */
 typedef struct {
     uint32_t root;
     sva_word mask;
-    bool     accept, resolves, sampled;
+    bool     accept, resolves, covers_trigger, sampled;
 } Abort;
 
 typedef struct {
@@ -130,6 +131,7 @@ static void compile(const sva_monitor *m, Compiled *c) {
         c->abort[i].accept   = sva_monitor_abort_effect(m, i) == SVA_ABORT_ACCEPT;
         c->abort[i].resolves = sva_monitor_abort_resolves_attempt(m, i);
         c->abort[i].sampled  = sva_monitor_abort_sampled(m, i);
+        c->abort[i].covers_trigger = sva_monitor_abort_covers_trigger(m, i);
     }
 }
 
@@ -191,6 +193,28 @@ static sva_report emitted_step(const Compiled *c, Emitted *st, sva_word roots) {
         fires       = (next & c->trigger.last) != 0;
     }
 
+    /* An abort above the implication covers the antecedent too, so a match
+     * ending now is resolved by it and seeds nothing. This is the cycle the same
+     * abort written inside the consequent cannot see at all: there it arms only
+     * once the consequent starts, which for `|=>` is the cycle after.
+     *
+     * Last wins. The list runs innermost to outermost, and an outer abort beats
+     * an inner verdict landing in the same cycle. */
+    if (fires) {
+        bool resolved = false, accept = false;
+        for (uint32_t i = 0; i < c->aborts; i++) {
+            if (!c->abort[i].covers_trigger) continue;
+            if (!((roots >> c->abort[i].root) & 1u)) continue;
+            resolved = true;
+            accept   = c->abort[i].accept;
+        }
+        if (resolved) {
+            if (accept) report.matches++;
+            else report.failures++;
+            fires = false;
+        }
+    }
+
     /* Which aborts each attempt is inside for this cycle, guards aside: the
      * states it could reach, not the ones it ends up live in. An abort covers
      * the cycle its subtree is entered in and the cycle its last thread dies
@@ -228,8 +252,12 @@ static sva_report emitted_step(const Compiled *c, Emitted *st, sva_word roots) {
     /* Aborts resolve an attempt early: an accept discharges it, which is a pass,
      * and a reject fails it. After seeding, so an abort firing in the cycle an
      * attempt starts applies to that attempt, and before verdicts, because
-     * resolving early is the point. */
-    for (uint32_t i = 0; i < c->aborts; i++) {
+     * resolving early is the point.
+     *
+     * Outward, so the scan runs backwards: the list is innermost-first, and when
+     * two aborts resolve one attempt in one cycle the OUTER one wins.
+     * `accept_on(a) (reject_on(b) p)` with both holding is TRUE, not FALSE. */
+    for (uint32_t i = c->aborts; i-- > 0;) {
         if (!((roots >> c->abort[i].root) & 1u)) continue;
         for (uint32_t k = 0; k < c->depth; k++) {
             if (!((st->occupied >> k) & 1u)) continue;
@@ -514,6 +542,55 @@ static sva_node build_reject_on(sva_ir *ir) {
     return shifted;
 }
 
+/* `reject_on(kill) (req |=> (##1 ack))`. The abort is ABOVE the implication, so
+ * it covers the antecedent as well: when `kill` holds in the cycle `req`
+ * matches, the attempt is resolved right there and no obligation is ever seeded
+ * from it. That is a cycle earlier than the same abort inside the consequent,
+ * which is why a backend cannot infer this from the mask —
+ * `sva_monitor_abort_covers_trigger` is a flag it has to read. Atom 4 is the
+ * condition. */
+static sva_node build_reject_over_implication(sva_ir *ir) {
+    sva_node body = 0, consequent = 0, implication = 0, kill = 0, property = 0;
+    const sva_node req = atom_cycle(ir, 0);
+    BUILD(sva_seq_delay(ir, atom_cycle(ir, 2), 1, 1, atom_cycle(ir, 1), &body));
+    BUILD(sva_prop_sequence(ir, SVA_WEAK, body, &consequent));
+    BUILD(sva_prop_implies(ir, SVA_NONOVERLAPPING, req, consequent, &implication));
+    BUILD(sva_bool_atom(ir, 4, &kill));
+    BUILD(sva_prop_abort(ir, SVA_ABORT_REJECT, kill, implication, &property));
+    return property;
+}
+
+/* The same over `|->`, and with an accept, which discharges where the reject
+ * fails. Those are the two halves of the trigger-covering path a backend picks
+ * between, and overlapping seeds in the very cycle the abort resolves. */
+static sva_node build_accept_over_implication(sva_ir *ir) {
+    sva_node body = 0, consequent = 0, implication = 0, kill = 0, property = 0;
+    const sva_node req = atom_cycle(ir, 0);
+    BUILD(sva_seq_delay(ir, atom_cycle(ir, 2), 1, 1, atom_cycle(ir, 1), &body));
+    BUILD(sva_prop_sequence(ir, SVA_WEAK, body, &consequent));
+    BUILD(sva_prop_implies(ir, SVA_OVERLAPPING, req, consequent, &implication));
+    BUILD(sva_bool_atom(ir, 4, &kill));
+    BUILD(sva_prop_abort(ir, SVA_ABORT_ACCEPT, kill, implication, &property));
+    return property;
+}
+
+/* `accept_on(kill) (reject_on(other) (##1 ack))`, no trigger. Two aborts that
+ * resolve the same attempt, so the compiled path has to agree on WHICH one wins
+ * when both hold — the outer accept, which is the LAST entry of the list and not
+ * the first. Scanning the list forwards reports a failure here where the
+ * reference reports a pass. Atom 3 is the reject's condition, atom 4 the
+ * accept's. */
+static sva_node build_nested_aborts(sva_ir *ir) {
+    sva_node body = 0, consequent = 0, inner = 0, outer = 0, kill = 0, other = 0;
+    BUILD(sva_seq_delay(ir, atom_cycle(ir, 2), 1, 1, atom_cycle(ir, 1), &body));
+    BUILD(sva_prop_sequence(ir, SVA_WEAK, body, &consequent));
+    BUILD(sva_bool_atom(ir, 3, &other));
+    BUILD(sva_prop_abort(ir, SVA_ABORT_REJECT, other, consequent, &inner));
+    BUILD(sva_bool_atom(ir, 4, &kill));
+    BUILD(sva_prop_abort(ir, SVA_ABORT_ACCEPT, kill, inner, &outer));
+    return outer;
+}
+
 typedef struct {
     const char *name;
     Build       build;
@@ -696,6 +773,9 @@ int main(void) {
         { "accept_on(kill) ##1 ack",  build_accept_on,   false },
         { "sync_reject_on(kill) p",   build_reject_on,   false },
         { "an abort beside a reset",  build_accept_on,   true  },
+        { "reject_on(kill)(req|=>p)", build_reject_over_implication, false },
+        { "accept_on(kill)(req|->p)", build_accept_over_implication, false },
+        { "accept_on(reject_on(p))",  build_nested_aborts, false },
     };
 
     printf("compiled backend vs reference runtime:\n");

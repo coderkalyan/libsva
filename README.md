@@ -192,6 +192,24 @@ Because the scope is the obligation, an abort below an implication leaves the
 antecedent alone: matches of it keep raising fresh obligations in the very cycles
 the condition holds, which a monitor-wide reset would suppress.
 
+An abort *above* an implication is a different property from one below it, not
+another spelling of the same one, so neither can be rewritten into the other. It
+covers the antecedent as well, and `Monitor.Abort.covers_trigger` says so: when
+the condition holds in a cycle an antecedent match ends, that match is resolved
+with the abort's effect and seeds nothing. That is a cycle earlier than the
+pushed-down form can manage, since below the implication the abort only arms
+once the consequent starts — the cycle after, for `|=>`. A trigger is the union
+of every attempt's antecedent and cannot be resolved one attempt at a time, but
+it never has to be: a monitor has exactly one trigger, so an abort above it
+covers all of its attempts uniformly and one verdict says everything.
+
+When two aborts resolve one attempt in the same cycle the **outermost** wins.
+`accept_on(a) (reject_on(b) p)` with both conditions holding is a pass: the
+reject settles the inner evaluation as false, and the accept's condition is then
+true during an evaluation still under way, which LRM 16.12.14 reads as
+accepting. `monitor.aborts` runs innermost to outermost, so the winner is the
+last entry rather than the first.
+
 A reject below a `.prop_or` stops resolving the whole attempt and only clears its
 own disjunct — the other side may still hold. An accept keeps resolving the
 attempt, since one disjunct holding makes the disjunction hold.
@@ -201,13 +219,27 @@ ones from **live** values, mirroring `reset` (LRM 16.15). Nothing in the IR can
 check that: the request is recorded on `Monitor.Abort.sampled` for a backend to
 honour, and honouring it is the front-end's half of the contract.
 
-Two shapes are refused rather than mis-lowered. A property operator over an
-operand that raises a trigger of its own — a conjunction of two implications, an
-abort outside one — has nowhere to put the second trigger, since a monitor has
-one. And an abort below an operator that *renumbers* its operand's states cannot
-carry its mask through: a disjunction and a shift move an operand as a block and
-are fine, a product (`.prop_and`, `.prop_always`) and a fusion
-(`propFollowedBy`) are not.
+**Live means every time step**, not merely the ones carrying a clocking event,
+so a backend stepped only on the clock edge has to latch the condition: set a
+bit whenever it holds at any time slot, then consume and clear that bit at the
+next edge. Reading it at the edge alone is not the live valuation, and the
+failure mode is silent — it collapses the plain forms onto the `.prop_sync_*`
+ones, since a condition pulsing strictly between two ticks is precisely what
+separates them.
+
+Three shapes are refused rather than mis-lowered. A property operator over an
+operand that raises a trigger of its own — a conjunction of two implications, a
+followed-by or a disjunctive shift over one — has nowhere to put the second
+trigger, since a monitor has one. An abort below an operator that *renumbers*
+its operand's states cannot carry its mask through: a disjunction and a shift
+move an operand as a block and are fine, a product (`.prop_and`,
+`.prop_always`) and a fusion (`propFollowedBy`) are not. And an abort above an
+implication whose antecedent can match over more than one cycle is refused, for
+both kinds: an attempt caught halfway through such an antecedent owes a verdict
+of its own, and the union that represents the trigger has nothing to count it
+with. Telling those apart needs the trigger tracked per attempt, so a ring like
+the obligation's, which needs the antecedent's longest match bounded — and
+nothing else asks that of an antecedent.
 
 **Empty matches do not exist.** Every sequence matches at least one cycle:
 repetition counts are `>= 1` and nothing else can introduce an empty match, so
@@ -374,9 +406,11 @@ Everything the property layer adds above the sequences lands in those same two
 automata, so a backend gains no table and no opcode — with one exception.
 `monitor.aborts` is a small array of `Monitor.Abort`, each a root index, an
 effect (`accept` discharges the attempt, `reject` fails it), a scope (whether
-firing resolves the whole attempt or only clears the mask), a `sampled` flag, and
-a state mask read with `monitor.maskOf(i)`. Apply them after seeding a new
-attempt and before taking verdicts.
+firing resolves the whole attempt or only clears the mask), a `covers_trigger`
+flag, a `sampled` flag, and a state mask read with `monitor.maskOf(i)`. Apply
+them outermost first — the array runs the other way — after seeding a new
+attempt and before taking verdicts. One with `covers_trigger` also acts earlier,
+on the antecedent match, resolving it instead of seeding.
 
 `Monitor.State` is a reference implementation of the whole per-cycle protocol,
 which is the contract a backend reproduces rather than something it calls.

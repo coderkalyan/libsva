@@ -93,22 +93,34 @@ pub const Error = error{
     ObligationNotBounded,
     /// A property operator was applied to an operand that raises obligations of
     /// its own — the classic case being an implication as a consequent, but a
-    /// conjunction, a followed-by or an abort over an implication is the same
+    /// conjunction, a followed-by or a disjunctive shift over one is the same
     /// problem. A monitor has one trigger, tracked existentially, and there is
     /// nowhere to put a second.
+    ///
+    /// An abort is not in that list. It does not need a second trigger: it
+    /// covers the one there is, uniformly over every attempt of it. See
+    /// `UnsupportedAbortScope` for the one shape of that which is refused.
     UnsupportedConsequent,
     /// `prop_and` or `prop_or` over operands of different strength. The pair is
     /// pending until both sides resolve, and a pending pair with one weak and
     /// one strong side has no single end-of-trace disposition to carry.
     MixedStrength,
-    /// An abort below an operator that renumbers its operand's states, so the
-    /// mask naming the abort's subtree cannot be carried through it.
+    /// An abort whose scope cannot be carried, in either of two ways.
     ///
-    /// `prop_or` and a shift relocate an operand's states as a block and are
-    /// fine; a product (`prop_and`, `prop_always`) and a fusion
-    /// (`prop_followed_by_*`) are not. An accept under a product would not be a
-    /// mask operation in any case: it has to record that one side of the pair is
-    /// satisfied, which is a state remap rather than a set of states to clear.
+    /// It sits below an operator that renumbers its operand's states, so the
+    /// mask naming the abort's subtree cannot be carried through it. `prop_or`
+    /// and a shift relocate an operand's states as a block and are fine; a
+    /// product (`prop_and`, `prop_always`) and a fusion (`prop_followed_by_*`)
+    /// are not. An accept under a product would not be a mask operation in any
+    /// case: it has to record that one side of the pair is satisfied, which is a
+    /// state remap rather than a set of states to clear.
+    ///
+    /// Or it sits above an implication whose antecedent can match over more than
+    /// one cycle. Covering a trigger is sound because the abort's scope is the
+    /// whole trigger, so no attempt of it has to be told from another — but only
+    /// while no attempt can be caught halfway through its antecedent. One that
+    /// is owes a verdict of its own, and the union that represents the trigger
+    /// has nothing to count it with. See `lowerAbort`.
     UnsupportedAbortScope,
     /// The obligation is bounded but deeper than `Options.depth_limit`.
     DepthLimitExceeded,
@@ -221,6 +233,7 @@ pub fn assertion(
             .cond = root,
             .effect = abort.effect,
             .scope = abort.scope,
+            .covers_trigger = abort.covers_trigger,
             .sampled = abort.sampled,
         };
         // `materialize` rewrote the mask in place and the surviving states never
@@ -757,6 +770,7 @@ const Builder = struct {
             cond: u32,
             effect: Monitor.Abort.Effect,
             scope: Monitor.Abort.Scope,
+            covers_trigger: bool,
             sampled: bool,
             /// `obligation.words` long.
             mask: []Word,
@@ -938,6 +952,9 @@ const Builder = struct {
                 .cond = abort.cond,
                 .effect = abort.effect,
                 .scope = abort.scope,
+                // Always false here: both operands were refused above if they
+                // carried a trigger, so no abort reaching this point covers one.
+                .covers_trigger = abort.covers_trigger,
                 .sampled = abort.sampled,
                 .mask = moved,
             });
@@ -997,13 +1014,41 @@ const Builder = struct {
         var plan = try builder.lowerProperty(@enumFromInt(data.rhs));
         errdefer plan.deinit(gpa);
 
-        // An abort is scoped to one attempt, and a trigger is not: it is the
-        // union of every attempt's antecedent, so there is no way to abort the
-        // antecedent of the attempt this abort belongs to and leave the others
-        // matching. An abort *below* an implication is the supported shape, and
-        // the useful one.
-        if (plan.trigger != null) {
-            return builder.rejectProperty(node, error.UnsupportedConsequent);
+        // An abort above an implication covers the antecedent as well as the
+        // consequent, and pushing it down into the consequent is a different
+        // property: below the implication it only arms once the consequent
+        // starts, which for `|=>` is a cycle after the attempt began.
+        //
+        // Covering the trigger is expressible even though a trigger is the union
+        // of every attempt's antecedent, because the abort's scope is that whole
+        // union. A monitor has exactly one trigger — `lowerProperty`'s
+        // implication arm refuses a consequent carrying one, and
+        // `lowerPropJunction`, `lowerFollowedBy` and the disjunctive half of
+        // `lowerPropShift` all refuse a trigger-carrying operand — so an abort
+        // above a trigger is above the monitor's only trigger, and every attempt
+        // of it resolves the same way. `Monitor.State.step` does that in the
+        // cycle the antecedent match ends, instead of seeding.
+        //
+        // What the argument does not survive is a multi-cycle antecedent. Then
+        // an attempt can be halfway through matching when the condition fires,
+        // and it owes a verdict of its own that the union cannot count — nor can
+        // it be left running, because completing the antecedent later would
+        // impose an obligation on an attempt the abort already resolved. An
+        // empty `follow` is exactly "every match is one cycle long", so no
+        // partial match survives a cycle and neither case arises. Both kinds are
+        // refused rather than under-reported, and refusing both keeps one rule
+        // rather than an accept/reject split: an accept is sound for failures
+        // here but would still under-count the passes a `cover` reads.
+        //
+        // TODO: lifting this needs the trigger tracked per attempt, so a ring
+        // like the obligation's, which needs the antecedent's longest match
+        // bounded — and `propBound` deliberately does not require that of an
+        // antecedent, however long it is.
+        const covers_trigger = plan.trigger != null;
+        if (plan.trigger) |trigger| {
+            if (Nfa.bitAny(trigger.follow)) {
+                return builder.rejectProperty(node, error.UnsupportedAbortScope);
+            }
         }
 
         // Everything lowered so far is what the abort guards.
@@ -1018,6 +1063,7 @@ const Builder = struct {
                 else => .reject,
             },
             .scope = .attempt,
+            .covers_trigger = covers_trigger,
             .sampled = switch (tag) {
                 .prop_sync_accept_on, .prop_sync_reject_on => true,
                 else => false,
@@ -4102,6 +4148,116 @@ fn differentialMonitor(
     }
 }
 
+/// One trigger-covering abort, for `differentialAbortOverImplication`. Listed
+/// innermost first, the order lowering appends them in.
+const TriggerAbort = struct { cond: Ir.Node.Index, effect: Monitor.Abort.Effect };
+
+/// Check an abort *above* an implication against the semantics over every trace
+/// of `length` cycles.
+///
+/// `differentialMonitor` cannot do this shape: it peels an implication only at
+/// the very top of a property, and here the aborts sit above one. The reference
+/// is assembled from the three pieces the shape is defined out of, none of them
+/// read off the monitor — the cycles an antecedent match ends in, what an abort
+/// covering the antecedent does to a match ending there, and the fate of what is
+/// seeded when no abort intervenes.
+///
+/// `seeded` is that last piece: the same abort chain wrapped around the
+/// consequent alone, which is what an attempt owes once its antecedent has
+/// matched. The caller builds it separately, so agreeing with it is a claim
+/// about the lowering rather than a restatement of it.
+fn differentialAbortOverImplication(
+    gpa: Allocator,
+    ir: *const Ir,
+    index: Ir.Assertion.Index,
+    antecedent: Ir.Node.Index,
+    overlap: bool,
+    seeded: Ir.Node.Index,
+    aborts: []const TriggerAbort,
+    atom_count: u5,
+    length: u32,
+) !void {
+    var monitor = try assertion(gpa, ir, index, .{}, null);
+    defer monitor.deinit(gpa);
+    var state = try Monitor.State.init(gpa, &monitor);
+    defer state.deinit(gpa);
+
+    const strong = propStrength(ir, seeded) == .strong;
+    const bound: u32 = @intCast(propBound(ir, seeded).length.?);
+    const delay: u32 = @intFromBool(!overlap);
+
+    var traces: Traces = .init(atom_count, length);
+    while (traces.next()) |window| {
+        var ends: u64 = 0;
+        for (0..length) |start| {
+            ends |= bruteForceMatches(ir, antecedent, window, @intCast(start));
+        }
+
+        var want_failures = [_]u32{0} ** 8;
+        var want_matches = [_]u32{0} ** 8;
+        var want_pending: u32 = 0;
+
+        for (0..length) |cycle| {
+            if (ends & (@as(u64, 1) << @intCast(cycle)) == 0) continue;
+            const atoms = [_]Word{window[cycle]};
+
+            // The abort covers the antecedent, so a match ending here is
+            // resolved by it and seeds nothing. The outermost one that holds
+            // wins, which is the last — the same tie rule `propFate` applies
+            // when an outer abort meets an inner verdict in one cycle.
+            var verdict: ?Monitor.Abort.Effect = null;
+            for (aborts) |abort| {
+                if (Nfa.evaluateBoolean(ir, abort.cond, &atoms)) verdict = abort.effect;
+            }
+            if (verdict) |effect| {
+                switch (effect) {
+                    .accept => want_matches[cycle] += 1,
+                    .reject => want_failures[cycle] += 1,
+                }
+                continue;
+            }
+
+            // Otherwise an obligation starts, still under the same aborts. A
+            // `|=>` match ending in the last cycle seeds nothing at all.
+            const start = cycle + delay;
+            if (start >= length) continue;
+            const fate = propFate(ir, seeded, window, @intCast(start), atom_count, bound);
+            if (fate.matched_at) |at| {
+                want_matches[at] += 1;
+            } else if (fate.failed_at) |at| {
+                want_failures[at] += 1;
+            } else want_pending += 1;
+        }
+
+        state.clear();
+        for (0..length) |cycle| {
+            const atoms = [_]Word{window[cycle]};
+            const report = state.stepAtoms(ir, &atoms);
+            if (report.failures != want_failures[cycle] or report.matches != want_matches[cycle]) {
+                std.debug.print(
+                    "trace bits {b}, cycle {d}: want {d} failures / {d} matches," ++
+                        " got {d} / {d}\n",
+                    .{
+                        traces.bits,         cycle,           want_failures[cycle],
+                        want_matches[cycle], report.failures, report.matches,
+                    },
+                );
+                return error.TestUnexpectedResult;
+            }
+        }
+
+        const final = state.finish();
+        const want_final: u32 = if (strong) want_pending else 0;
+        if (final.failures != want_final) {
+            std.debug.print(
+                "trace bits {b}: {d} pending at end, want {d} failures, got {d}\n",
+                .{ traces.bits, want_pending, want_final, final.failures },
+            );
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
 fn addDirective(
     ir: *Ir,
     gpa: Allocator,
@@ -5827,30 +5983,426 @@ test "a property operator over an operand with a trigger of its own is refused" 
         );
         try testing.expectEqual(property, diagnostic.node);
     }
-    // An abort outside an implication. The trigger is the union of every
-    // attempt's antecedent, so there is no way to abort one attempt's antecedent
-    // and leave the others matching.
-    {
+}
+
+test "an abort above an implication covers the trigger" {
+    const gpa = testing.allocator;
+
+    // The shape essentially every real use writes, and the one a pushed-down
+    // abort is not equivalent to. All four forms lower, and what comes out is
+    // the ordinary obligation-masked abort with one flag set: covering the
+    // trigger costs no state, no depth, and no second abort entry.
+    const Case = struct { tag: Ir.Node.Tag, effect: Monitor.Abort.Effect, sampled: bool };
+    for ([_]Case{
+        .{ .tag = .prop_accept_on, .effect = .accept, .sampled = false },
+        .{ .tag = .prop_reject_on, .effect = .reject, .sampled = false },
+        .{ .tag = .prop_sync_accept_on, .effect = .accept, .sampled = true },
+        .{ .tag = .prop_sync_reject_on, .effect = .reject, .sampled = true },
+    }) |case| {
         var ir: Ir = .init();
         defer ir.deinit(gpa);
-        const consequent = try ir.propSeq(gpa, .prop_seq_weak, try atomCycle(&ir, gpa, 1));
         const implication = try ir.propImplies(
             gpa,
             .prop_implies_nonoverlap,
             try atomCycle(&ir, gpa, 0),
-            consequent,
+            try ir.propSeq(gpa, .prop_seq_weak, try atomCycle(&ir, gpa, 1)),
         );
         const property = try ir.propAbort(
             gpa,
-            .prop_accept_on,
+            case.tag,
             try ir.atom(gpa, @enumFromInt(2)),
             implication,
         );
         const index = try addDirective(&ir, gpa, property, null);
-        try testing.expectError(
-            error.UnsupportedConsequent,
-            assertion(gpa, &ir, index, .{}, null),
+
+        var monitor = try assertion(gpa, &ir, index, .{}, null);
+        defer monitor.deinit(gpa);
+
+        try testing.expectEqual(@as(usize, 1), monitor.aborts.len);
+        try testing.expectEqual(case.effect, monitor.aborts[0].effect);
+        try testing.expectEqual(case.sampled, monitor.aborts[0].sampled);
+        try testing.expectEqual(Monitor.Abort.Scope.attempt, monitor.aborts[0].scope);
+        try testing.expect(monitor.aborts[0].covers_trigger);
+        // The mask still names obligation states and only those. Reaching the
+        // trigger is the flag's job — there is no trigger mask, because the
+        // abort covers every state of the one trigger there is.
+        try testing.expectEqual(@as(u32, 1), @popCount(monitor.maskOf(0)[0]));
+        try testing.expect(monitor.trigger != null);
+    }
+
+    // Against the bare implication, to pin the cost at zero rather than assert
+    // three numbers and hope they are the same three. An abort only ever
+    // resolves an attempt sooner than it would have resolved itself, so it
+    // cannot lengthen the obligation, and `depth` is that longest match.
+    var bare: Ir = .init();
+    defer bare.deinit(gpa);
+    const bare_index = try addDirective(&bare, gpa, try bare.propImplies(
+        gpa,
+        .prop_implies_nonoverlap,
+        try atomCycle(&bare, gpa, 0),
+        try bare.propSeq(gpa, .prop_seq_weak, try atomCycle(&bare, gpa, 1)),
+    ), null);
+    var without = try assertion(gpa, &bare, bare_index, .{}, null);
+    defer without.deinit(gpa);
+
+    var guarded: Ir = .init();
+    defer guarded.deinit(gpa);
+    const guarded_index = try addDirective(&guarded, gpa, try guarded.propAbort(
+        gpa,
+        .prop_accept_on,
+        try guarded.atom(gpa, @enumFromInt(2)),
+        try guarded.propImplies(
+            gpa,
+            .prop_implies_nonoverlap,
+            try atomCycle(&guarded, gpa, 0),
+            try guarded.propSeq(gpa, .prop_seq_weak, try atomCycle(&guarded, gpa, 1)),
+        ),
+    ), null);
+    var with = try assertion(gpa, &guarded, guarded_index, .{}, null);
+    defer with.deinit(gpa);
+
+    try testing.expectEqual(without.obligation.state_count, with.obligation.state_count);
+    try testing.expectEqual(without.trigger.?.state_count, with.trigger.?.state_count);
+    try testing.expectEqual(without.depth, with.depth);
+}
+
+test "an abort above a multi-cycle antecedent is refused" {
+    const gpa = testing.allocator;
+
+    // The residual. Covering a trigger works because the abort's scope is the
+    // whole trigger, so no attempt of it has to be told from another — but that
+    // holds only while no attempt can be caught halfway through its antecedent.
+    // `a ##1 c` can be: a condition firing in the cycle between leaves that
+    // attempt owing a verdict of its own, and the trigger is the union of every
+    // attempt's antecedent, so there is nothing to count it with. Leaving it
+    // running is worse than not counting it — it would finish matching a cycle
+    // later and impose an obligation on an attempt already resolved.
+    //
+    // Refused for accept as well as reject. An accept is sound for failures
+    // here, since discharging early cannot invent one, but it would still
+    // under-count the passes a `cover` reads — and one rule is better than an
+    // accept/reject split for everyone downstream.
+    for ([_]Ir.Node.Tag{
+        .prop_accept_on,
+        .prop_reject_on,
+        .prop_sync_accept_on,
+        .prop_sync_reject_on,
+    }) |tag| {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const property = try ir.propAbort(
+            gpa,
+            tag,
+            try ir.atom(gpa, @enumFromInt(3)),
+            try ir.propImplies(
+                gpa,
+                .prop_implies_nonoverlap,
+                try ir.seqDelay(
+                    gpa,
+                    try atomCycle(&ir, gpa, 0),
+                    1,
+                    1,
+                    try atomCycle(&ir, gpa, 1),
+                ),
+                try ir.propSeq(gpa, .prop_seq_weak, try atomCycle(&ir, gpa, 2)),
+            ),
         );
+        const index = try addDirective(&ir, gpa, property, null);
+
+        var diagnostic: Diagnostic = undefined;
+        try testing.expectError(
+            error.UnsupportedAbortScope,
+            assertion(gpa, &ir, index, .{}, &diagnostic),
+        );
+        try testing.expectEqual(property, diagnostic.node);
+    }
+
+    // Multi-*state* is not multi-cycle, and it is the cycles that matter. `a or
+    // b` matches in one cycle however many ways it can do it, so no partial
+    // match survives a cycle and the construction is exact.
+    {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const index = try addDirective(&ir, gpa, try ir.propAbort(
+            gpa,
+            .prop_reject_on,
+            try ir.atom(gpa, @enumFromInt(2)),
+            try ir.propImplies(
+                gpa,
+                .prop_implies_nonoverlap,
+                try ir.seqOr(
+                    gpa,
+                    try atomCycle(&ir, gpa, 0),
+                    try atomCycle(&ir, gpa, 1),
+                ),
+                try ir.propSeq(gpa, .prop_seq_weak, try atomCycle(&ir, gpa, 1)),
+            ),
+        ), null);
+
+        var monitor = try assertion(gpa, &ir, index, .{}, null);
+        defer monitor.deinit(gpa);
+        try testing.expect(monitor.aborts[0].covers_trigger);
+        try testing.expectEqual(@as(u32, 2), monitor.trigger.?.state_count);
+    }
+}
+
+test "an abort above an implication resolves the antecedent match instead of seeding" {
+    const gpa = testing.allocator;
+
+    // `tests/sva/diff_abort.sv`'s stimulus, which VCS X-2025.06 and QuestaSim
+    // 2024.3_2 were both measured against. Atom 0 is `trig`, 1 is `e`, 2 is the
+    // abort condition; cycle N is that fixture's t = 5 + 10N.
+    //
+    //   cyc   trig  e  cond
+    //    0     0    1   0
+    //    1     1    1   0   seeds an obligation on `e` at cycle 2
+    //    2     0    0   0   <- it fails, with no abort anywhere near
+    //    3     1    1   0   seeds again
+    //    4     0    0   0   <- it fails too
+    //    5     0    1   0
+    //    6     0    1   0
+    //    7     1    1   1   <- a fresh real obligation meets the condition
+    //    8     0    1   0   `e` is high, so cycle 7's attempt would have PASSED
+    //    9     1    1   0   seeds an obligation the trace ends before starting
+    //
+    // Cycle 7 is the whole point. The condition is high in the cycle the
+    // antecedent matches, which for `|=>` is one cycle before anything would be
+    // seeded, and the fixture's oracle golden puts a report there for both
+    // reject forms and nothing at cycle 8. So the match has to be resolved
+    // rather than seeded: seeding it and aborting the attempt in cycle 8 would
+    // read the condition low and let it pass instead.
+    const trace = [_]u64{
+        0b010, 0b011, 0b000, 0b011, 0b000,
+        0b010, 0b010, 0b111, 0b010, 0b011,
+    };
+
+    const build = struct {
+        fn go(ir: *Ir, alloc: Allocator, tag: Ir.Node.Tag, inside: bool) !Ir.Assertion.Index {
+            const cond = try ir.atom(alloc, @enumFromInt(2));
+            var consequent = try ir.propSeq(alloc, .prop_seq_weak, try atomCycle(ir, alloc, 1));
+            if (inside) consequent = try ir.propAbort(alloc, tag, cond, consequent);
+            var property = try ir.propImplies(
+                alloc,
+                .prop_implies_nonoverlap,
+                try atomCycle(ir, alloc, 0),
+                consequent,
+            );
+            if (!inside) property = try ir.propAbort(alloc, tag, cond, property);
+            return addDirective(ir, alloc, property, null);
+        }
+    }.go;
+
+    const Case = struct {
+        tag: Ir.Node.Tag,
+        inside: bool,
+        failures: [10]u32,
+        matches: [10]u32,
+    };
+    for ([_]Case{
+        // A reject above the implication: the fixture's `rr` and `sr` column,
+        // reporting at cycles 2, 4 and 7 and nothing at 8.
+        .{
+            .tag = .prop_reject_on,
+            .inside = false,
+            .failures = .{ 0, 0, 1, 0, 1, 0, 0, 1, 0, 0 },
+            .matches = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        },
+        // An accept in the same place discharges rather than fails, so cycle 7
+        // is a pass. Counting failures alone cannot tell an accept from a reset
+        // — the match is the whole of the difference.
+        .{
+            .tag = .prop_accept_on,
+            .inside = false,
+            .failures = .{ 0, 0, 1, 0, 1, 0, 0, 0, 0, 0 },
+            .matches = .{ 0, 0, 0, 0, 0, 0, 0, 1, 0, 0 },
+        },
+        // Pushed down into the consequent: the rewrite that is not one. The
+        // abort now arms a cycle later, at the seed, where the condition has
+        // already gone low — so cycle 7 raises nothing and the attempt it should
+        // have resolved passes at cycle 8 instead. Two reports lost.
+        .{
+            .tag = .prop_reject_on,
+            .inside = true,
+            .failures = .{ 0, 0, 1, 0, 1, 0, 0, 0, 0, 0 },
+            .matches = .{ 0, 0, 0, 0, 0, 0, 0, 0, 1, 0 },
+        },
+    }) |case| {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const index = try build(&ir, gpa, case.tag, case.inside);
+
+        var monitor = try assertion(gpa, &ir, index, .{}, null);
+        defer monitor.deinit(gpa);
+        try testing.expectEqual(!case.inside, monitor.aborts[0].covers_trigger);
+
+        var state = try Monitor.State.init(gpa, &monitor);
+        defer state.deinit(gpa);
+        for (trace, 0..) |cycle, at| {
+            const atoms = [_]Word{cycle};
+            const report = state.stepAtoms(&ir, &atoms);
+            try testing.expectEqual(case.failures[at], report.failures);
+            try testing.expectEqual(case.matches[at], report.matches);
+        }
+        // Cycle 9's antecedent matched, but the trace ends before its obligation
+        // is seeded and the property is weak, so nothing is owed. This is the
+        // fixture's "nothing at 105".
+        const final = state.finish();
+        try testing.expectEqual(@as(u32, 0), final.failures);
+    }
+}
+
+test "an accept above an implication discharges where a reset abandons" {
+    const gpa = testing.allocator;
+
+    // The distinction drawn one layer up from where the obligation-scoped test
+    // draws it, on the path only a trigger-covering abort takes. All three
+    // spellings below stop the attempt from failing and no count of failures
+    // separates them; the accept reports a *match* for the attempt it resolved,
+    // and the reset reports nothing at all, because an abandoned attempt leaves
+    // no verdict.
+    //
+    // Cycle 0 has the antecedent and the condition both high, so the abort lands
+    // in the cycle the match ends. Cycle 1 has `e` low, which is what the bare
+    // property fails on.
+    const trace = [_]u64{ 0b101, 0b000 };
+
+    const Case = struct {
+        wrap: enum { none, accept, reset },
+        failures: u32,
+        matches: u32,
+        reset_at_zero: bool,
+    };
+    for ([_]Case{
+        .{ .wrap = .none, .failures = 1, .matches = 0, .reset_at_zero = false },
+        .{ .wrap = .accept, .failures = 0, .matches = 1, .reset_at_zero = false },
+        .{ .wrap = .reset, .failures = 0, .matches = 0, .reset_at_zero = true },
+    }) |case| {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const cond = try ir.atom(gpa, @enumFromInt(2));
+        var property = try ir.propImplies(
+            gpa,
+            .prop_implies_nonoverlap,
+            try atomCycle(&ir, gpa, 0),
+            try ir.propSeq(gpa, .prop_seq_weak, try atomCycle(&ir, gpa, 1)),
+        );
+        if (case.wrap == .accept) {
+            property = try ir.propAbort(gpa, .prop_accept_on, cond, property);
+        }
+        const index = try addDirective(
+            &ir,
+            gpa,
+            property,
+            if (case.wrap == .reset) cond else null,
+        );
+
+        var monitor = try assertion(gpa, &ir, index, .{}, null);
+        defer monitor.deinit(gpa);
+        var state = try Monitor.State.init(gpa, &monitor);
+        defer state.deinit(gpa);
+
+        var failures: u32 = 0;
+        var matches: u32 = 0;
+        for (trace, 0..) |cycle, at| {
+            const atoms = [_]Word{cycle};
+            const report = state.stepAtoms(&ir, &atoms);
+            failures += report.failures;
+            matches += report.matches;
+            if (at == 0) try testing.expectEqual(case.reset_at_zero, report.reset);
+        }
+        try testing.expectEqual(case.failures, failures);
+        try testing.expectEqual(case.matches, matches);
+    }
+}
+
+test "differential: an abort above an implication" {
+    const gpa = testing.allocator;
+
+    // Atom 0 is the antecedent, 1 the consequent's term, 2 the condition. The
+    // consequent takes two cycles, so an attempt is pending in a cycle the
+    // condition can catch it in as well as in the cycle its antecedent matched
+    // — the two paths an abort above an implication takes are both exercised on
+    // the same property.
+    for ([_]Ir.Node.Tag{
+        .prop_accept_on,
+        .prop_reject_on,
+        .prop_sync_accept_on,
+        .prop_sync_reject_on,
+    }) |tag| {
+        for ([_]Ir.Node.Tag{ .prop_implies_overlap, .prop_implies_nonoverlap }) |implies| {
+            for ([_]Ir.Node.Tag{ .prop_seq_weak, .prop_seq_strong }) |strength| {
+                var ir: Ir = .init();
+                defer ir.deinit(gpa);
+
+                const cond = try ir.atom(gpa, @enumFromInt(2));
+                const antecedent = try atomCycle(&ir, gpa, 0);
+                const consequent = try ir.propSeq(gpa, strength, try ir.seqDelay(
+                    gpa,
+                    try atomCycle(&ir, gpa, 1),
+                    1,
+                    1,
+                    try atomCycle(&ir, gpa, 1),
+                ));
+                const index = try addDirective(&ir, gpa, try ir.propAbort(
+                    gpa,
+                    tag,
+                    cond,
+                    try ir.propImplies(gpa, implies, antecedent, consequent),
+                ), null);
+
+                // The same abort around the consequent alone: what an attempt
+                // owes once its antecedent has matched and no abort intervened.
+                const seeded = try ir.propAbort(gpa, tag, cond, consequent);
+                const effect: Monitor.Abort.Effect = switch (tag) {
+                    .prop_accept_on, .prop_sync_accept_on => .accept,
+                    else => .reject,
+                };
+
+                try differentialAbortOverImplication(
+                    gpa,
+                    &ir,
+                    index,
+                    antecedent,
+                    implies == .prop_implies_overlap,
+                    seeded,
+                    &.{.{ .cond = cond, .effect = effect }},
+                    3,
+                    4,
+                );
+            }
+        }
+    }
+}
+
+test "differential: nested aborts of opposite effect" {
+    const gpa = testing.allocator;
+
+    // Which abort wins when two of them resolve the same attempt in the same
+    // cycle. LRM 16.12.14 reads outward: the inner `reject_on` makes the inner
+    // evaluation FALSE, and the outer `accept_on` then sees its condition true
+    // during an evaluation that is still its own, so the overall result is TRUE.
+    // The outermost abort wins, and lowering appends outward, so that is the
+    // LAST entry of `monitor.aborts` rather than the first.
+    //
+    // Both orders exist here, so this fails if the runtime scans the list in
+    // either direction unconditionally rather than resolving outward.
+    for ([_][2]Ir.Node.Tag{
+        .{ .prop_reject_on, .prop_accept_on },
+        .{ .prop_accept_on, .prop_reject_on },
+    }) |order| {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const body = try ir.propSeq(gpa, .prop_seq_weak, try ir.seqDelay(
+            gpa,
+            try atomCycle(&ir, gpa, 0),
+            1,
+            1,
+            try atomCycle(&ir, gpa, 0),
+        ));
+        const inner = try ir.propAbort(gpa, order[0], try ir.atom(gpa, @enumFromInt(1)), body);
+        const outer = try ir.propAbort(gpa, order[1], try ir.atom(gpa, @enumFromInt(2)), inner);
+        const index = try addDirective(&ir, gpa, outer, null);
+        try differentialMonitor(gpa, &ir, index, 3, 4);
     }
 }
 
@@ -6006,6 +6558,11 @@ const Spelling = enum {
     abort_over_shift,
     reject_in_or,
     reject_over_or,
+    trigger_accept_over,
+    trigger_reject_over,
+    trigger_accept_under,
+    trigger_reject_under,
+    trigger_reset,
 
     /// Atom 0 is the body's term, atom 1 the abort condition, atom 2 a second
     /// body term, so every spelling here is comparable against every other.
@@ -6083,6 +6640,40 @@ const Spelling = enum {
                 .prop_reject_on,
                 cond,
                 try ir.propJunction(gpa, .prop_or, next, later),
+            ),
+            // An abort above an implication, and the same abort inside its
+            // consequent. Atom 2 is the antecedent here rather than a second
+            // body term, which is what makes these five a family of their own.
+            .trigger_accept_over => try ir.propAbort(
+                gpa,
+                .prop_accept_on,
+                cond,
+                try ir.propImplies(gpa, .prop_implies_nonoverlap, try atomCycle(ir, gpa, 2), now),
+            ),
+            .trigger_reject_over => try ir.propAbort(
+                gpa,
+                .prop_reject_on,
+                cond,
+                try ir.propImplies(gpa, .prop_implies_nonoverlap, try atomCycle(ir, gpa, 2), now),
+            ),
+            .trigger_accept_under => try ir.propImplies(
+                gpa,
+                .prop_implies_nonoverlap,
+                try atomCycle(ir, gpa, 2),
+                try ir.propAbort(gpa, .prop_accept_on, cond, now),
+            ),
+            .trigger_reject_under => try ir.propImplies(
+                gpa,
+                .prop_implies_nonoverlap,
+                try atomCycle(ir, gpa, 2),
+                try ir.propAbort(gpa, .prop_reject_on, cond, now),
+            ),
+            // The trigger-covering abort lowered as a monitor-wide reset.
+            .trigger_reset => return addDirective(
+                ir,
+                gpa,
+                try ir.propImplies(gpa, .prop_implies_nonoverlap, try atomCycle(ir, gpa, 2), now),
+                cond,
             ),
         };
         return addDirective(ir, gpa, property, null);
@@ -6169,6 +6760,32 @@ test "mutation sweep: every wrong spelling is reachable by a test" {
             .right = .reject_in_or,
             .wrong = .reject_over_or,
             .killed_by = "a reject under a disjunction kills only its own disjunct",
+        },
+        // An abort above an implication lowered as one inside its consequent:
+        // the same abort armed a cycle late, from the seed rather than from the
+        // antecedent match. This is the rewrite that looks like a rewrite and is
+        // not, and the reject row is the one `diff_abort.sv` is built on.
+        .{
+            .right = .trigger_accept_over,
+            .wrong = .trigger_accept_under,
+            .killed_by = "an abort above an implication resolves the antecedent match instead of seeding",
+        },
+        .{
+            .right = .trigger_reject_over,
+            .wrong = .trigger_reject_under,
+            .killed_by = "an abort above an implication resolves the antecedent match instead of seeding",
+        },
+        // The discharge/abandon confusion again, at the trigger this time. Both
+        // suppress the same failure and only the accept reports the pass.
+        .{
+            .right = .trigger_accept_over,
+            .wrong = .trigger_reset,
+            .killed_by = "an accept above an implication discharges where a reset abandons",
+        },
+        .{
+            .right = .trigger_accept_over,
+            .wrong = .trigger_reject_over,
+            .killed_by = "differential: an abort above an implication",
         },
     }) |mutation| {
         var right: Ir = .init();

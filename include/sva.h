@@ -105,9 +105,11 @@ typedef enum sva_status {
        implemented. */
     SVA_ERROR_UNBOUNDED_OBLIGATION = 4,
     /* A property operator's operand raises obligations of its own: an
-       implication as a consequent, or under a conjunction, a followed-by, a
-       shift or an abort. A monitor has one trigger and there is nowhere to put
-       a second. */
+       implication as a consequent, or under a conjunction, a followed-by or a
+       disjunctive shift. A monitor has one trigger and there is nowhere to put
+       a second. An abort is no longer in that list — it covers the one trigger
+       instead of needing a second, subject to the second half of
+       SVA_ERROR_UNSUPPORTED_ABORT_SCOPE. */
     SVA_ERROR_UNSUPPORTED_CONSEQUENT = 5,
     /* Goto or non-consecutive repetition over an operand that is not a single
        boolean. */
@@ -116,10 +118,19 @@ typedef enum sva_status {
        until both sides resolve, and a pending pair with one weak and one strong
        side has no single end-of-trace disposition. */
     SVA_ERROR_MIXED_STRENGTH = 7,
-    /* An abort below an operator that renumbers its operand's states, so the
+    /* An abort whose scope libsva cannot carry, in either of two ways.
+
+       It sits below an operator that renumbers its operand's states, so the
        mask naming the abort's subtree cannot be carried through: a conjunction,
        an SVA_SHIFT_EVERY range, or a followed-by. A disjunction and an
-       SVA_SHIFT_SOME range are fine. */
+       SVA_SHIFT_SOME range are fine.
+
+       Or it sits above an implication whose antecedent can match over more than
+       one cycle. Covering a trigger works because the abort's scope is the whole
+       trigger, which is the union of every attempt's antecedent — but only while
+       no attempt can be caught halfway through matching one. An attempt that is
+       owes a verdict of its own, and the union has nothing to count it with. A
+       single-cycle antecedent cannot be caught halfway, and is accepted. */
     SVA_ERROR_UNSUPPORTED_ABORT_SCOPE = 8,
 } sva_status;
 
@@ -439,7 +450,9 @@ uint32_t sva_monitor_reset(const sva_monitor *monitor);
    (reject_on(b) p)` cannot reject during the two cycles it spends getting to p,
    and nothing has to track a window to arrange it.
 
-   Apply them after seeding a new attempt and before taking verdicts. */
+   Apply them after seeding a new attempt and before taking verdicts — except an
+   abort with sva_monitor_abort_covers_trigger, which also acts earlier, on the
+   trigger. */
 uint32_t sva_monitor_abort_count(const sva_monitor *monitor);
 uint32_t sva_monitor_abort_root(const sva_monitor *monitor, uint32_t abort);
 /* SVA_ABORT_ACCEPT discharges the attempt, which is a pass a cover counts;
@@ -451,8 +464,31 @@ sva_abort sva_monitor_abort_effect(const sva_monitor *monitor, uint32_t abort);
    disjunction kills its own disjunct and no more. */
 bool sva_monitor_abort_resolves_attempt(const sva_monitor *monitor, uint32_t abort);
 /* Whether the condition wants the sampled valuation rather than the live one.
-   Nothing in this library can check that you honour it. */
+   Nothing in this library can check that you honour it.
+
+   False — the plain accept_on/reject_on — means the condition is live, and live
+   means EVERY time step, not just the ones carrying a clocking event. A backend
+   that steps only on the clock edge therefore has to LATCH it: set a bit
+   whenever the condition holds at any time slot, then consume and clear that bit
+   at the next edge. Reading the condition at the edge alone is not the live
+   valuation, and the failure is silent — it collapses the plain forms onto the
+   sync_ ones, since a condition that pulses strictly between two ticks is
+   exactly what separates them. */
 bool sva_monitor_abort_sampled(const sva_monitor *monitor, uint32_t abort);
+/* Whether the abort covers the trigger as well as the obligation: it was written
+   above the implication rather than inside its consequent, so it also covers the
+   cycles the antecedent is being matched in. Always false without a trigger.
+
+   When it holds in a cycle an antecedent match ends, resolve that match with the
+   abort's effect and seed no attempt from it. This is not the same property as
+   the abort written inside the consequent, which arms only once the consequent
+   starts — a cycle later, for |=>. So an abort above an implication cannot be
+   pushed down into it.
+
+   If several of these hold at once, the LAST in the list wins: the list runs
+   innermost to outermost, and an outer abort beats an inner verdict landing in
+   the same cycle. */
+bool sva_monitor_abort_covers_trigger(const sva_monitor *monitor, uint32_t abort);
 /* sva_automaton_words(sva_monitor_obligation(monitor)) words. */
 const uint64_t *sva_monitor_abort_mask(const sva_monitor *monitor, uint32_t abort);
 

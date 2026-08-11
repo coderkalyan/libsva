@@ -1057,7 +1057,7 @@ pub const magic: [4]u8 = .{ 'S', 'V', 'A', 'B' };
 /// On-disk format version. The IR reserves no space for future operators, so
 /// this is bumped on any layout *or* `Node.Tag` change; readers reject a
 /// mismatch and the caller recompiles from source.
-pub const format_version: u32 = 7;
+pub const format_version: u32 = 8;
 
 const checksum_len = Blake3.digest_length;
 /// Bytes preceding the first payload word: `magic` + `format_version`.

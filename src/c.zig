@@ -387,7 +387,8 @@ export fn sva_monitor_reset(monitor: *const Monitor) u32 {
     return monitor.reset;
 }
 
-/// Aborts scoped to part of the obligation. Zero for a property with none.
+/// Aborts scoped to part of the obligation, and to the trigger when
+/// `sva_monitor_abort_covers_trigger`. Zero for a property with none.
 export fn sva_monitor_abort_count(monitor: *const Monitor) u32 {
     return @intCast(monitor.aborts.len);
 }
@@ -410,6 +411,19 @@ export fn sva_monitor_abort_effect(monitor: *const Monitor, abort: u32) Abort {
 /// abort's mask and leaves the rest of the attempt running.
 export fn sva_monitor_abort_resolves_attempt(monitor: *const Monitor, abort: u32) bool {
     return monitor.aborts[abort].scope == .attempt;
+}
+
+/// Whether the abort covers the trigger as well as the obligation: it was
+/// written *above* the implication rather than inside its consequent, so it also
+/// covers the cycles the antecedent is being matched in. Always false for a
+/// property with no trigger.
+///
+/// When it holds in a cycle an antecedent match ends, resolve that match with
+/// the abort's effect and seed no attempt from it. That is a verdict the same
+/// abort written inside the consequent never produces, because there it arms
+/// only once the consequent starts — a cycle later, for `|=>`.
+export fn sva_monitor_abort_covers_trigger(monitor: *const Monitor, abort: u32) bool {
+    return monitor.aborts[abort].covers_trigger;
 }
 
 /// Whether the condition wants the *sampled* valuation rather than the live one:

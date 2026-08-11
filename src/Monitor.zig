@@ -34,14 +34,16 @@
 //!  3. Turn the root bits into a satisfied-state mask per automaton.
 //!  4. Advance the trigger, then seed it — it starts an attempt every cycle,
 //!     like any assertion. Note whether a match now ends.
-//!  5. Advance every pending obligation attempt.
-//!  6. Seed a new attempt: every cycle when there is no trigger, in the cycle
+//!  5. If a match ends now and an `Abort` with `covers_trigger` holds, resolve
+//!     it with that abort's verdict and let it seed nothing.
+//!  6. Advance every pending obligation attempt.
+//!  7. Seed a new attempt: every cycle when there is no trigger, in the cycle
 //!     the trigger fires for `|->`, and the cycle after for `|=>`.
-//!  7. Apply every armed `Abort` whose condition holds. An abort is armed for
+//!  8. Apply every armed `Abort` whose condition holds. An abort is armed for
 //!     an attempt when that attempt has a live state in the abort's mask.
-//!  8. Take verdicts. An attempt that reached an accepting state is discharged;
+//!  9. Take verdicts. An attempt that reached an accepting state is discharged;
 //!     one with no live states failed. Both leave the ring.
-//!  9. When a finite trace ends, a still-pending attempt holds if the property
+//! 10. When a finite trace ends, a still-pending attempt holds if the property
 //!     is weak and fails if it is strong.
 //!
 //! Seeding before taking verdicts is not incidental: under `|->` the obligation
@@ -50,7 +52,14 @@
 //! same argument — an `accept_on` whose condition holds in the cycle an attempt
 //! starts discharges that attempt.
 //!
-//! Note what step 2 and step 7 do differently, because it is the difference
+//! Step 5 is that argument one cycle earlier again, and it is why an abort above
+//! an implication is a different property from one inside its consequent. Above
+//! it, the abort covers the cycles the antecedent is being matched in; below it,
+//! it arms only once the consequent starts, which for `|=>` is the cycle after.
+//! An abort firing in the cycle the antecedent matches is a verdict the
+//! pushed-down spelling never produces, so pushing one down is not a rewrite.
+//!
+//! Note what step 2 and step 8 do differently, because it is the difference
 //! between `disable iff` and `accept_on`: a reset *abandons*, so the attempt
 //! leaves no verdict behind, while an accept *discharges*, which is a pass.
 
@@ -117,9 +126,31 @@ pub const Abort = struct {
     effect: Effect,
     /// How far up the property that effect reaches.
     scope: Scope,
+    /// Whether the abort covers the trigger as well as the obligation: an abort
+    /// written *above* the implication rather than inside its consequent.
+    ///
+    /// A trigger is the union of every attempt's antecedent, so resolving one
+    /// attempt of it and leaving the others matching is not expressible. It
+    /// never has to be. A monitor has exactly one trigger — every operator that
+    /// could put an abort beside a second one refuses first — so an abort above
+    /// it covers all of its attempts uniformly, and one verdict says everything
+    /// there is to say. `step` resolves the antecedent match ending this cycle
+    /// with `effect` instead of seeding an obligation from it.
+    ///
+    /// Only ever set on a trigger whose every antecedent match is one cycle
+    /// long; `lowerAbort` refuses the rest, because an attempt halfway through a
+    /// longer antecedent owes a verdict of its own that the union cannot count.
+    covers_trigger: bool,
     /// Which valuation of `cond` a backend must supply: the sampled one for
     /// `sync_accept_on`/`sync_reject_on`, the live one for the plain forms
     /// (LRM 16.15, exactly as for `reset`).
+    ///
+    /// Live means *every* time step, not merely the ones carrying a clocking
+    /// event, so a backend stepped only on the clock edge has to latch it: set a
+    /// bit whenever the condition holds at any time slot, consume and clear it
+    /// at the next edge. Reading the condition at the edge alone silently
+    /// collapses the plain forms onto the `sync_` ones, because a pulse landing
+    /// strictly between two ticks is the only thing that separates them.
     ///
     /// Metadata. This runtime reads every root out of one array it is handed,
     /// so nothing here can enforce it; it is a contract on whoever evaluates
@@ -300,6 +331,32 @@ pub const State = struct {
             fires = trigger.matched(state.trigger_current);
         }
 
+        // An abort above the implication covers the antecedent too, so a match
+        // ending now is resolved by it rather than seeding an obligation. This
+        // is the cycle the pushed-down spelling cannot see at all.
+        //
+        // Nothing here tells one attempt from another, and nothing needs to:
+        // the trigger is the union of every attempt's antecedent, but the abort
+        // covers all of them, so one verdict discharges what the union stands
+        // for. It is also why the trigger vector is left alone rather than
+        // cleared. `lowerAbort` only sets `covers_trigger` when every follow row
+        // of the trigger is empty, so no partially matched antecedent survives
+        // this cycle to complete later and impose an obligation on an attempt
+        // the abort has already resolved. Lift that restriction and this is the
+        // first thing that has to change.
+        var trigger_verdict: ?Abort.Effect = null;
+        if (fires) {
+            for (monitor.aborts) |abort| {
+                if (!abort.covers_trigger) continue;
+                if (!Nfa.bitIsSet(root_bits, abort.cond)) continue;
+                // Last wins. Lowering appends outward, so the last entry is the
+                // outermost abort, and an outer abort beats an inner verdict
+                // landing in the same cycle.
+                trigger_verdict = abort.effect;
+            }
+            if (trigger_verdict != null) fires = false;
+        }
+
         // Which aborts each attempt is inside for this cycle, guards aside.
         //
         // An abort covers every cycle its subtree could hold a thread in, which
@@ -361,17 +418,34 @@ pub const State = struct {
         state.fired = fires;
 
         var report: Report = .{};
+        if (trigger_verdict) |effect| {
+            switch (effect) {
+                .accept => report.matches += 1,
+                .reject => report.failures += 1,
+            }
+        }
 
         // Aborts resolve an attempt before it would have resolved itself. Each
         // is checked against every attempt separately, because being armed is a
         // per-attempt question: the subtree the abort guards has to still be
         // under evaluation *in this attempt* for aborting it to mean anything.
         //
-        // This runs after seeding for the same reason step 6 does — an abort
+        // This runs after seeding for the same reason step 7 does — an abort
         // whose condition holds in the cycle an attempt starts applies to that
         // attempt — and before verdicts, because resolving early is the whole
         // point.
-        for (monitor.aborts, 0..) |abort, index| {
+        //
+        // Outward, so the scan runs backwards: lowering appends aborts from the
+        // inside out, and when two of them resolve one attempt in one cycle the
+        // OUTER one wins. `accept_on(a) (reject_on(b) p)` with both holding is
+        // TRUE, not FALSE — the reject settles the inner evaluation as false,
+        // and the accept's condition is then true during an evaluation that is
+        // still under way, which LRM 16.12.14 reads as accepting. Step 5 takes
+        // the same rule the same way round.
+        var index = monitor.aborts.len;
+        while (index > 0) {
+            index -= 1;
+            const abort = monitor.aborts[index];
             if (!Nfa.bitIsSet(root_bits, abort.cond)) continue;
             const mask = monitor.maskOf(index);
             for (state.occupied, 0..) |busy, slot| {
