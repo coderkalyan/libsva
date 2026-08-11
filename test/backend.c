@@ -40,6 +40,7 @@ static int failures = 0;
 #define MAX_GUARDS 32
 #define MAX_DEPTH  64
 #define MAX_LITS   8
+#define MAX_ABORTS 4
 
 /* ---- What a code generator bakes in as constants ------------------------ */
 
@@ -56,11 +57,24 @@ typedef struct {
     sva_literal lit[MAX_GUARDS][MAX_LITS];
 } Cubes;
 
+/* One abort scoped to part of the obligation. `mask` is the states it guards;
+ * `resolves` says whether firing settles the whole attempt or only clears those
+ * states. `sampled` is metadata a real backend would use to pick which
+ * valuation of the root to compute, and is unused here because this test
+ * supplies root bits directly. */
+typedef struct {
+    uint32_t root;
+    sva_word mask;
+    bool     accept, resolves, sampled;
+} Abort;
+
 typedef struct {
     Cubes    cubes;
     Tables   obligation, trigger;
     bool     has_trigger, overlap, strong;
     uint32_t depth, reset_root, roots;
+    uint32_t aborts;
+    Abort    abort[MAX_ABORTS];
 } Compiled;
 
 /* The per-instance mutable state a backend allocates. `occupied` is not
@@ -107,6 +121,16 @@ static void compile(const sva_monitor *m, Compiled *c) {
     }
     read_tables(m, sva_monitor_obligation(m), &c->obligation);
     if (c->has_trigger) read_tables(m, sva_monitor_trigger(m), &c->trigger);
+
+    c->aborts = sva_monitor_abort_count(m);
+    CHECK(c->aborts <= MAX_ABORTS);
+    for (uint32_t i = 0; i < c->aborts; i++) {
+        c->abort[i].root     = sva_monitor_abort_root(m, i);
+        c->abort[i].mask     = sva_monitor_abort_mask(m, i)[0];
+        c->abort[i].accept   = sva_monitor_abort_effect(m, i) == SVA_ABORT_ACCEPT;
+        c->abort[i].resolves = sva_monitor_abort_resolves_attempt(m, i);
+        c->abort[i].sampled  = sva_monitor_abort_sampled(m, i);
+    }
 }
 
 /* ---- The emitted code -------------------------------------------------- */
@@ -167,6 +191,19 @@ static sva_report emitted_step(const Compiled *c, Emitted *st, sva_word roots) {
         fires       = (next & c->trigger.last) != 0;
     }
 
+    /* Which aborts each attempt is inside for this cycle, guards aside: the
+     * states it could reach, not the ones it ends up live in. An abort covers
+     * the cycle its subtree is entered in and the cycle its last thread dies
+     * in, and the live set has the subtree empty in both. */
+    uint64_t armed[MAX_ABORTS] = { 0 };
+    for (uint32_t i = 0; i < c->aborts; i++) {
+        for (uint32_t k = 0; k < c->depth; k++) {
+            if (!((st->occupied >> k) & 1u)) continue;
+            const sva_word reach = advance(&c->obligation, st->pending[k], ~(sva_word)0);
+            if ((reach & c->abort[i].mask) != 0) armed[i] |= (uint64_t)1 << k;
+        }
+    }
+
     for (uint32_t k = 0; k < c->depth; k++) { /* unrolled at compile time */
         if (!((st->occupied >> k) & 1u)) continue;
         st->pending[k] = advance(&c->obligation, st->pending[k], sat);
@@ -181,8 +218,32 @@ static sva_report emitted_step(const Compiled *c, Emitted *st, sva_word roots) {
         CHECK(slot < c->depth);
         st->pending[slot] = c->obligation.first & sat;
         st->occupied |= (uint64_t)1 << slot;
+        for (uint32_t i = 0; i < c->aborts; i++) {
+            if ((c->obligation.first & c->abort[i].mask) != 0)
+                armed[i] |= (uint64_t)1 << slot;
+        }
     }
     st->fired = fires;
+
+    /* Aborts resolve an attempt early: an accept discharges it, which is a pass,
+     * and a reject fails it. After seeding, so an abort firing in the cycle an
+     * attempt starts applies to that attempt, and before verdicts, because
+     * resolving early is the point. */
+    for (uint32_t i = 0; i < c->aborts; i++) {
+        if (!((roots >> c->abort[i].root) & 1u)) continue;
+        for (uint32_t k = 0; k < c->depth; k++) {
+            if (!((st->occupied >> k) & 1u)) continue;
+            if (!((armed[i] >> k) & 1u)) continue;
+            if (c->abort[i].resolves) {
+                if (c->abort[i].accept) report.matches++;
+                else report.failures++;
+                st->pending[k] = 0;
+                st->occupied &= ~((uint64_t)1 << k);
+            } else {
+                st->pending[k] &= ~c->abort[i].mask;
+            }
+        }
+    }
 
     /* Seeding before taking verdicts is not incidental: under `|->` a one-cycle
      * consequent has to be able to discharge in the cycle it was created. */
@@ -358,6 +419,101 @@ static sva_node build_first_match(sva_ir *ir) {
     return property;
 }
 
+/* The property layer above a sequence. None of it needs a new table or a new
+ * opcode: a shift, a conjunction and a followed-by all land in the obligation
+ * automaton, and only an abort adds anything a backend reads — a root, a mask
+ * and two flags. */
+
+static sva_node build_prop_and(sva_ir *ir) { /* req |=> (ack and (##1 done)) */
+    sva_node left = 0, delayed = 0, right = 0, pair = 0, property = 0;
+    const sva_node req = atom_cycle(ir, 0);
+    BUILD(sva_prop_sequence(ir, SVA_WEAK, atom_cycle(ir, 1), &left));
+    BUILD(sva_seq_delay(ir, atom_cycle(ir, 3), 1, 1, atom_cycle(ir, 2), &delayed));
+    BUILD(sva_prop_sequence(ir, SVA_WEAK, delayed, &right));
+    BUILD(sva_prop_junction(ir, SVA_CONJUNCTION, left, right, &pair));
+    BUILD(sva_prop_implies(ir, SVA_NONOVERLAPPING, req, pair, &property));
+    return property;
+}
+
+static sva_node build_prop_or(sva_ir *ir) { /* req |=> (ack or (##1 done)) */
+    sva_node left = 0, delayed = 0, right = 0, pair = 0, property = 0;
+    const sva_node req = atom_cycle(ir, 0);
+    BUILD(sva_prop_sequence(ir, SVA_WEAK, atom_cycle(ir, 1), &left));
+    BUILD(sva_seq_delay(ir, atom_cycle(ir, 3), 1, 1, atom_cycle(ir, 2), &delayed));
+    BUILD(sva_prop_sequence(ir, SVA_WEAK, delayed, &right));
+    BUILD(sva_prop_junction(ir, SVA_DISJUNCTION, left, right, &pair));
+    BUILD(sva_prop_implies(ir, SVA_NONOVERLAPPING, req, pair, &property));
+    return property;
+}
+
+static sva_node build_nexttime(sva_ir *ir) { /* req |=> nexttime[2] ack */
+    sva_node consequent = 0, shifted = 0, property = 0;
+    const sva_node req = atom_cycle(ir, 0);
+    BUILD(sva_prop_sequence(ir, SVA_WEAK, atom_cycle(ir, 1), &consequent));
+    BUILD(sva_prop_shift(ir, SVA_SHIFT_SOME, 2, 2, consequent, &shifted));
+    BUILD(sva_prop_implies(ir, SVA_NONOVERLAPPING, req, shifted, &property));
+    return property;
+}
+
+static sva_node build_eventually(sva_ir *ir) { /* req |=> eventually [1:3] ack */
+    sva_node consequent = 0, shifted = 0, property = 0;
+    const sva_node req = atom_cycle(ir, 0);
+    BUILD(sva_prop_sequence(ir, SVA_WEAK, atom_cycle(ir, 1), &consequent));
+    BUILD(sva_prop_shift(ir, SVA_SHIFT_SOME, 1, 3, consequent, &shifted));
+    BUILD(sva_prop_implies(ir, SVA_NONOVERLAPPING, req, shifted, &property));
+    return property;
+}
+
+/* `req |=> always [1:3] ack`. The conjunctive reading of the same range: the
+ * obligation is a product of the operand shifted to each offset, which for a
+ * one-cycle operand prunes to a chain. */
+static sva_node build_always(sva_ir *ir) {
+    sva_node consequent = 0, shifted = 0, property = 0;
+    const sva_node req = atom_cycle(ir, 0);
+    BUILD(sva_prop_sequence(ir, SVA_WEAK, atom_cycle(ir, 1), &consequent));
+    BUILD(sva_prop_shift(ir, SVA_SHIFT_EVERY, 1, 3, consequent, &shifted));
+    BUILD(sva_prop_implies(ir, SVA_NONOVERLAPPING, req, shifted, &property));
+    return property;
+}
+
+/* `(a ##[0:1] b) #-# c`, with no trigger at all: a followed-by never becomes
+ * one, because it is a concatenation rather than an implication. An antecedent
+ * that never matches fails it, where it would make an implication hold. */
+static sva_node build_followed_by(sva_ir *ir) {
+    sva_node antecedent = 0, consequent = 0, property = 0;
+    BUILD(sva_seq_delay(ir, atom_cycle(ir, 0), 0, 1, atom_cycle(ir, 1), &antecedent));
+    BUILD(sva_prop_sequence(ir, SVA_WEAK, atom_cycle(ir, 2), &consequent));
+    BUILD(sva_prop_followed_by(ir, SVA_OVERLAPPING, antecedent, consequent, &property));
+    return property;
+}
+
+/* `req |=> accept_on(kill) (##1 ack)`. The abort is scoped to the obligation, so
+ * a backend reads one mask and applies it per attempt; the antecedent keeps
+ * matching in cycles `kill` holds, which is what a monitor-wide reset would not
+ * do. Atom 4 is the condition. */
+static sva_node build_accept_on(sva_ir *ir) {
+    sva_node body = 0, consequent = 0, guarded = 0, kill = 0, property = 0;
+    const sva_node req = atom_cycle(ir, 0);
+    BUILD(sva_seq_delay(ir, atom_cycle(ir, 2), 1, 1, atom_cycle(ir, 1), &body));
+    BUILD(sva_prop_sequence(ir, SVA_WEAK, body, &consequent));
+    BUILD(sva_bool_atom(ir, 4, &kill));
+    BUILD(sva_prop_abort(ir, SVA_ABORT_ACCEPT, kill, consequent, &guarded));
+    BUILD(sva_prop_implies(ir, SVA_NONOVERLAPPING, req, guarded, &property));
+    return property;
+}
+
+/* `sync_reject_on(kill) nexttime[2] ack`, strong. The abort sits under the
+ * shift, so its mask is a proper subset of the obligation's states and the two
+ * filler cycles are cycles it cannot fire in. */
+static sva_node build_reject_on(sva_ir *ir) {
+    sva_node consequent = 0, guarded = 0, shifted = 0, kill = 0;
+    BUILD(sva_prop_sequence(ir, SVA_STRONG, atom_cycle(ir, 1), &consequent));
+    BUILD(sva_bool_atom(ir, 4, &kill));
+    BUILD(sva_prop_abort(ir, SVA_ABORT_SYNC_REJECT, kill, consequent, &guarded));
+    BUILD(sva_prop_shift(ir, SVA_SHIFT_SOME, 2, 2, guarded, &shifted));
+    return shifted;
+}
+
 typedef struct {
     const char *name;
     Build       build;
@@ -531,6 +687,15 @@ int main(void) {
         { "(a ##1 b) and c",          build_and,         false },
         { "(a ##1 b) within c[*1:3]", build_within,      false },
         { "first_match(a ##[1:3] b)", build_first_match, false },
+        { "req |=> ack and ##1 done", build_prop_and,    false },
+        { "req |=> ack or ##1 done",  build_prop_or,     false },
+        { "req |=> nexttime[2] ack",  build_nexttime,    false },
+        { "req |=> eventually[1:3]",  build_eventually,  false },
+        { "req |=> always[1:3] ack",  build_always,      false },
+        { "(a ##[0:1] b) #-# c",      build_followed_by, false },
+        { "accept_on(kill) ##1 ack",  build_accept_on,   false },
+        { "sync_reject_on(kill) p",   build_reject_on,   false },
+        { "an abort beside a reset",  build_accept_on,   true  },
     };
 
     printf("compiled backend vs reference runtime:\n");

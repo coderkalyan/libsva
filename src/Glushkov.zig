@@ -91,9 +91,25 @@ pub const Error = error{
     /// vectors tracks them. Sound tracking needs the obligation determinised,
     /// which is not implemented.
     ObligationNotBounded,
-    /// The consequent of an implication is itself an implication, so the
-    /// obligation would have to spawn obligations of its own.
+    /// A property operator was applied to an operand that raises obligations of
+    /// its own — the classic case being an implication as a consequent, but a
+    /// conjunction, a followed-by or an abort over an implication is the same
+    /// problem. A monitor has one trigger, tracked existentially, and there is
+    /// nowhere to put a second.
     UnsupportedConsequent,
+    /// `prop_and` or `prop_or` over operands of different strength. The pair is
+    /// pending until both sides resolve, and a pending pair with one weak and
+    /// one strong side has no single end-of-trace disposition to carry.
+    MixedStrength,
+    /// An abort below an operator that renumbers its operand's states, so the
+    /// mask naming the abort's subtree cannot be carried through it.
+    ///
+    /// `prop_or` and a shift relocate an operand's states as a block and are
+    /// fine; a product (`prop_and`, `prop_always`) and a fusion
+    /// (`prop_followed_by_*`) are not. An accept under a product would not be a
+    /// mask operation in any case: it has to record that one side of the pair is
+    /// satisfied, which is a state remap rather than a set of states to clear.
+    UnsupportedAbortScope,
     /// The obligation is bounded but deeper than `Options.depth_limit`.
     DepthLimitExceeded,
 } || Allocator.Error;
@@ -127,14 +143,15 @@ pub fn sequence(
     defer fragment.deinit(gpa);
 
     var automata: [1]Nfa = undefined;
-    const alphabet = try builder.materialize(&.{&fragment}, &.{}, &automata);
+    const alphabet = try builder.materialize(&.{&fragment}, &.{}, &.{}, &automata);
     return .{ .alphabet = alphabet, .nfa = automata[0] };
 }
 
 /// Lower a directive to a `Monitor`.
 ///
-/// The property layer is thin: an implication contributes a trigger automaton,
-/// and the sequence underneath contributes the obligation. Both are built
+/// The property layer is thin, and stays thin: an implication contributes a
+/// trigger automaton, everything above the sequences folds into the obligation,
+/// and the aborts come out as conditions over slices of it. All of it is built
 /// against one alphabet, so a term the antecedent and the consequent share is
 /// evaluated once per cycle rather than once each.
 pub fn assertion(
@@ -146,67 +163,70 @@ pub fn assertion(
 ) Error!Monitor {
     const directive = ir.assertions.get(@intFromEnum(index));
 
-    // Peel the implication, if there is one. What is left is the property whose
-    // sequence becomes the obligation.
-    var property = directive.prop;
-    var trigger_node: ?Ir.Node.Index = null;
-    var overlap = false;
-    switch (ir.tagOf(property)) {
-        .prop_implies_overlap, .prop_implies_nonoverlap => {
-            const data = ir.dataOf(property);
-            trigger_node = @as(Ir.Node.Index, @enumFromInt(data.lhs));
-            overlap = ir.tagOf(property) == .prop_implies_overlap;
-            property = @enumFromInt(data.rhs);
-        },
-        else => {},
-    }
-    const strength: Monitor.Strength = switch (ir.tagOf(property)) {
-        .prop_seq_weak => .weak,
-        .prop_seq_strong => .strong,
-        else => {
-            if (diagnostic) |into| into.* = .{ .node = property };
-            return error.UnsupportedConsequent;
-        },
-    };
-    const obligation_node: Ir.Node.Index = @enumFromInt(ir.dataOf(property).lhs);
-
     var builder: Builder = .{ .gpa = gpa, .ir = ir, .options = options, .diagnostic = diagnostic };
     defer builder.deinit();
     try builder.reserveCubes();
 
     // How many attempts can be in flight at once is the obligation's longest
     // match, so an obligation without one cannot be tracked by a fixed ring.
-    const longest = maxLength(ir, obligation_node) orelse {
-        if (diagnostic) |into| into.* = .{ .node = obligation_node };
+    // Read off the tree before anything is built, both so an unbounded
+    // obligation is refused rather than half-lowered and because a shift with an
+    // open range has no filler chain to build in the first place.
+    const bound = propBound(ir, directive.prop);
+    const longest = bound.length orelse {
+        if (diagnostic) |into| into.* = .{ .node = bound.culprit };
         return error.ObligationNotBounded;
     };
-    const depth = try builder.checkDepth(obligation_node, longest);
+    const depth = try builder.checkDepth(bound.culprit, longest);
 
-    var obligation = try builder.lower(obligation_node);
-    defer obligation.deinit(gpa);
-
-    var trigger: ?Fragment = null;
-    defer if (trigger) |*fragment| fragment.deinit(gpa);
-    if (trigger_node) |node| trigger = try builder.lower(node);
+    var plan = try builder.lowerProperty(directive.prop);
+    defer plan.deinit(gpa);
 
     // The reset condition is a root in its own right: a backend evaluates it
     // alongside the guards. It is interned last, so it lands past every root a
     // guard mentions, and pinned so materialisation keeps it there even though
     // no guard mentions it. An assertion that never resets has a constant false
-    // here, which folds to nothing in any backend.
-    var pinned = [_]u32{try builder.rootOf(directive.reset)};
+    // here, which folds to nothing in any backend. Every abort condition is a
+    // root on the same footing.
+    const pinned = try gpa.alloc(u32, 1 + plan.aborts.items.len);
+    defer gpa.free(pinned);
+    pinned[0] = try builder.rootOf(directive.reset);
+    for (plan.aborts.items, pinned[1..]) |abort, *into| into.* = abort.cond;
 
     var fragments: [2]*const Fragment = undefined;
     var count: usize = 1;
-    fragments[0] = &obligation;
-    if (trigger) |*fragment| {
+    fragments[0] = &plan.obligation;
+    if (plan.trigger) |*fragment| {
         fragments[1] = fragment;
         count = 2;
     }
 
+    // Pruning renumbers the obligation's states, so the abort masks are carried
+    // through it along with everything else that indexes them.
+    const masks = try gpa.alloc([]Word, plan.aborts.items.len);
+    defer gpa.free(masks);
+    for (plan.aborts.items, masks) |abort, *into| into.* = abort.mask;
+
     var automata: [2]Nfa = undefined;
-    var alphabet = try builder.materialize(fragments[0..count], &pinned, automata[0..count]);
+    var alphabet = try builder.materialize(fragments[0..count], pinned, masks, automata[0..count]);
     errdefer alphabet.deinit(gpa);
+    errdefer for (automata[0..count]) |*nfa| nfa.deinit(gpa);
+
+    const aborts = try gpa.alloc(Monitor.Abort, plan.aborts.items.len);
+    errdefer gpa.free(aborts);
+    const words = automata[0].words;
+    const abort_masks = try gpa.alloc(Word, @as(usize, words) * aborts.len);
+    for (plan.aborts.items, aborts, pinned[1..], 0..) |abort, *into, root, slot| {
+        into.* = .{
+            .cond = root,
+            .effect = abort.effect,
+            .scope = abort.scope,
+            .sampled = abort.sampled,
+        };
+        // `materialize` rewrote the mask in place and the surviving states never
+        // outnumber the originals, so the final mask is its leading words.
+        @memcpy(abort_masks[slot * words ..][0..words], abort.mask[0..words]);
+    }
 
     return .{
         .id = directive.id,
@@ -214,11 +234,13 @@ pub fn assertion(
         .clock = directive.clock,
         .alphabet = alphabet,
         .trigger = if (count == 2) automata[1] else null,
-        .overlap = overlap,
+        .overlap = plan.overlap,
         .obligation = automata[0],
         .depth = depth,
-        .strength = strength,
+        .strength = plan.strength,
         .reset = pinned[0],
+        .aborts = aborts,
+        .abort_masks = abort_masks,
     };
 }
 
@@ -276,6 +298,103 @@ fn maxLength(ir: *const Ir, node: Ir.Node.Index) ?u64 {
         // unbounded.
         .seq_repeat_goto, .seq_repeat_nonconsec => return null,
         else => unreachable, // not a sequence-layer tag
+    }
+}
+
+/// What a property's obligation costs the ring, read off the tree.
+///
+/// `Monitor.depth` is the obligation's longest match, and it has to be known
+/// before a fragment is built so that an unbounded obligation is refused rather
+/// than half-lowered. That means this mirrors `Builder.lowerProperty`, and the
+/// two agree on the one question that is not local: whether a shift lengthens
+/// the obligation or the antecedent.
+const Bound = struct {
+    /// The obligation's longest match in cycles, or null when it has none.
+    length: ?u64,
+    /// The node a diagnostic names when `length` is null.
+    culprit: Ir.Node.Index,
+    /// Whether an implication above the obligation contributes a trigger.
+    ///
+    /// A trigger is tracked existentially, as one state vector shared by every
+    /// attempt, so lengthening it costs the ring nothing — which is why a shift
+    /// over an implication lands there and leaves `length` alone.
+    triggered: bool = false,
+};
+
+fn propBound(ir: *const Ir, node: Ir.Node.Index) Bound {
+    const data = ir.dataOf(node);
+    switch (ir.tagOf(node)) {
+        .prop_seq_weak, .prop_seq_strong => {
+            const seq: Ir.Node.Index = @enumFromInt(data.lhs);
+            return .{ .length = maxLength(ir, seq), .culprit = seq };
+        },
+        // The antecedent is the trigger and never joins the obligation, so its
+        // own length is irrelevant here however long it is.
+        .prop_implies_overlap, .prop_implies_nonoverlap => {
+            var bound = propBound(ir, @enumFromInt(data.rhs));
+            bound.triggered = true;
+            return bound;
+        },
+        .prop_delay, .prop_always => {
+            const range = ir.propRangeOf(node);
+            var bound = propBound(ir, range.prop);
+            // An open range is the unbounded `always p` / `s_eventually p`.
+            if (range.hi == Ir.unbounded) return .{
+                .length = null,
+                .culprit = node,
+                .triggered = bound.triggered,
+            };
+            const length = bound.length orelse return bound;
+            if (bound.triggered) return bound;
+            bound.length = length +| range.hi;
+            return bound;
+        },
+        // Each side keeps its own schedule and the pair is pending until both
+        // have resolved, so the longer side's bound is the pair's — the same
+        // reading as `seq_and`, which is what this lowers onto.
+        .prop_and, .prop_or => {
+            const left = propBound(ir, @enumFromInt(data.lhs));
+            const right = propBound(ir, @enumFromInt(data.rhs));
+            const triggered = left.triggered or right.triggered;
+            const first = left.length orelse return .{
+                .length = null,
+                .culprit = left.culprit,
+                .triggered = triggered,
+            };
+            const second = right.length orelse return .{
+                .length = null,
+                .culprit = right.culprit,
+                .triggered = triggered,
+            };
+            return .{
+                .length = @max(first, second),
+                .culprit = node,
+                .triggered = triggered,
+            };
+        },
+        // A concatenation: the antecedent joins the obligation here rather than
+        // becoming a trigger, so its length counts. Overlapping shares a cycle.
+        .prop_followed_by_overlap, .prop_followed_by_nonoverlap => {
+            const seq: Ir.Node.Index = @enumFromInt(data.lhs);
+            var bound = propBound(ir, @enumFromInt(data.rhs));
+            const length = bound.length orelse return bound;
+            const antecedent = maxLength(ir, seq) orelse return .{
+                .length = null,
+                .culprit = seq,
+                .triggered = bound.triggered,
+            };
+            const gap: u64 = if (ir.tagOf(node) == .prop_followed_by_overlap) 0 else 1;
+            bound.length = antecedent +| gap +| length -| 1;
+            return bound;
+        },
+        // An abort only ever resolves an attempt sooner than it would have
+        // resolved itself, so it cannot lengthen the obligation.
+        .prop_accept_on,
+        .prop_reject_on,
+        .prop_sync_accept_on,
+        .prop_sync_reject_on,
+        => return propBound(ir, @enumFromInt(data.rhs)),
+        else => unreachable, // not a property-layer tag
     }
 }
 // -- Fragments ---------------------------------------------------------------
@@ -601,6 +720,361 @@ const Builder = struct {
             at += 1;
         }
         return true;
+    }
+
+    // -- Property lowering ---------------------------------------------------
+
+    /// What a property contributes to a monitor, under construction.
+    ///
+    /// The property layer does not get automaton machinery of its own. Every
+    /// operator here is a *verdict* combinator, and a verdict combinator over
+    /// sequence properties collapses onto the sequence layer, because a
+    /// sequence property holds exactly when its sequence has a match:
+    ///
+    ///   - `p and q` holds when both hold, on independent schedules — which is
+    ///     `seq_and`, whose match ends at the later of the two ends.
+    ///   - `p or q` is `seq_or`.
+    ///   - `nexttime[n] p` and `eventually [m:n] p` are a filler chain in front
+    ///     of `p`, entered at one offset in the range: `shift`.
+    ///   - `always [m:n] p` is the conjunction of `p` shifted to each offset.
+    ///   - `s #-# p` is `s` concatenated with `p` — see `lowerFollowedBy`.
+    ///
+    /// So a `Plan` is what a monitor already holds, and lowering a property is
+    /// folding the tree into it.
+    const Plan = struct {
+        /// The obligation, one attempt of which the ring tracks per seeding.
+        obligation: Fragment,
+        /// The antecedent of the implication this property is, if any.
+        trigger: ?Fragment = null,
+        /// Whether the obligation starts on the trigger's last cycle.
+        overlap: bool = false,
+        strength: Monitor.Strength,
+        /// Aborts scoped to part of `obligation`, their masks indexed by its
+        /// states and rewritten whenever those states move.
+        aborts: std.ArrayListUnmanaged(Abort) = .empty,
+
+        const Abort = struct {
+            cond: u32,
+            effect: Monitor.Abort.Effect,
+            scope: Monitor.Abort.Scope,
+            sampled: bool,
+            /// `obligation.words` long.
+            mask: []Word,
+        };
+
+        fn deinit(plan: *Plan, gpa: Allocator) void {
+            plan.obligation.deinit(gpa);
+            if (plan.trigger) |*trigger| trigger.deinit(gpa);
+            for (plan.aborts.items) |abort| gpa.free(abort.mask);
+            plan.aborts.deinit(gpa);
+        }
+
+        /// Replace the obligation, having moved its states to `base` inside
+        /// `replacement`, and carry every abort mask across.
+        fn rebase(
+            plan: *Plan,
+            gpa: Allocator,
+            replacement: Fragment,
+            base: u32,
+        ) Allocator.Error!void {
+            for (plan.aborts.items) |*abort| {
+                const moved = try maskAlloc(gpa, replacement.words);
+                blitMask(moved, abort.mask, base);
+                gpa.free(abort.mask);
+                abort.mask = moved;
+            }
+            plan.obligation.deinit(gpa);
+            plan.obligation = replacement;
+        }
+    };
+
+    fn rejectProperty(builder: *Builder, node: Ir.Node.Index, err: Error) Error {
+        if (builder.diagnostic) |into| into.* = .{ .node = node };
+        return err;
+    }
+
+    fn lowerProperty(builder: *Builder, node: Ir.Node.Index) Error!Plan {
+        const ir = builder.ir;
+        const gpa = builder.gpa;
+        const data = ir.dataOf(node);
+        switch (ir.tagOf(node)) {
+            .prop_seq_weak, .prop_seq_strong => {
+                const obligation = try builder.lower(@enumFromInt(data.lhs));
+                return .{
+                    .obligation = obligation,
+                    .strength = if (ir.tagOf(node) == .prop_seq_weak) .weak else .strong,
+                };
+            },
+            .prop_implies_overlap, .prop_implies_nonoverlap => {
+                var plan = try builder.lowerProperty(@enumFromInt(data.rhs));
+                errdefer plan.deinit(gpa);
+                if (plan.trigger != null) {
+                    return builder.rejectProperty(@enumFromInt(data.rhs), error.UnsupportedConsequent);
+                }
+                plan.trigger = try builder.lower(@enumFromInt(data.lhs));
+                plan.overlap = ir.tagOf(node) == .prop_implies_overlap;
+                return plan;
+            },
+            .prop_delay, .prop_always => return builder.lowerPropShift(node),
+            .prop_and, .prop_or => return builder.lowerPropJunction(node),
+            .prop_followed_by_overlap, .prop_followed_by_nonoverlap => {
+                return builder.lowerFollowedBy(node);
+            },
+            .prop_accept_on,
+            .prop_reject_on,
+            .prop_sync_accept_on,
+            .prop_sync_reject_on,
+            => return builder.lowerAbort(node),
+            else => unreachable, // not a property-layer tag
+        }
+    }
+
+    /// `nexttime[n] p`, `eventually [m:n] p` and `always [m:n] p`.
+    ///
+    /// Over an implication the shift lands on the *antecedent* rather than the
+    /// obligation, and that is not an optimisation but the only correct place
+    /// for it. `nexttime[n] (s |-> p)` obliges `p` for exactly those matches of
+    /// `s` that start `n` cycles into the attempt; a trigger is seeded every
+    /// cycle, so growing an `n`-cycle filler prefix selects exactly those and
+    /// costs the ring nothing.
+    ///
+    /// A *range* only survives that move for `always`: a conjunction of
+    /// universals is a universal over the union of their triggers, which one
+    /// trigger expresses. `eventually [m:n] (s |-> p)` is a *disjunction* of
+    /// implications, each vacuously true on its own, and no single trigger says
+    /// that.
+    fn lowerPropShift(builder: *Builder, node: Ir.Node.Index) Error!Plan {
+        const gpa = builder.gpa;
+        const range = builder.ir.propRangeOf(node);
+        const conjunctive = builder.ir.tagOf(node) == .prop_always;
+
+        var plan = try builder.lowerProperty(range.prop);
+        errdefer plan.deinit(gpa);
+
+        // `propBound` refuses an open range before anything is built.
+        std.debug.assert(range.hi != Ir.unbounded);
+
+        if (plan.trigger) |*trigger| {
+            if (range.lo != range.hi and !conjunctive) {
+                return builder.rejectProperty(node, error.UnsupportedConsequent);
+            }
+            const shifted = try builder.shift(node, trigger, range.lo, range.hi);
+            trigger.deinit(gpa);
+            plan.trigger = shifted;
+            return plan;
+        }
+
+        if (!conjunctive) {
+            const shifted = try builder.shift(node, &plan.obligation, range.lo, range.hi);
+            // `shift` puts the operand's states above the filler chain, so the
+            // filler count is the base the abort masks move to.
+            try plan.rebase(gpa, shifted, range.hi);
+            return plan;
+        }
+
+        // A conjunction over the range. Every conjunct is the same property at a
+        // different offset, so a product is what "all of them match" means and
+        // the state count is the price of the operator rather than of spelling
+        // it this way — see the tests below for the measurement.
+        if (plan.aborts.items.len != 0) {
+            return builder.rejectProperty(node, error.UnsupportedAbortScope);
+        }
+        var conjunction: ?Fragment = null;
+        errdefer if (conjunction) |*fragment| fragment.deinit(gpa);
+        var offset = range.lo;
+        while (offset <= range.hi) : (offset += 1) {
+            var conjunct = try builder.shift(node, &plan.obligation, offset, offset);
+            defer conjunct.deinit(gpa);
+            if (conjunction) |*accumulated| {
+                const combined = try builder.lowerAnd(node, accumulated, &conjunct);
+                accumulated.deinit(gpa);
+                conjunction = combined;
+            } else {
+                conjunction = try builder.copyFragment(&conjunct);
+            }
+        }
+        try plan.rebase(gpa, conjunction.?, 0);
+        conjunction = null;
+        return plan;
+    }
+
+    /// `p and q` / `p or q`.
+    fn lowerPropJunction(builder: *Builder, node: Ir.Node.Index) Error!Plan {
+        const gpa = builder.gpa;
+        const data = builder.ir.dataOf(node);
+        const conjunction = builder.ir.tagOf(node) == .prop_and;
+
+        var left = try builder.lowerProperty(@enumFromInt(data.lhs));
+        errdefer left.deinit(gpa);
+        var right = try builder.lowerProperty(@enumFromInt(data.rhs));
+        errdefer right.deinit(gpa);
+
+        if (left.trigger != null) return builder.rejectProperty(@enumFromInt(data.lhs), error.UnsupportedConsequent);
+        if (right.trigger != null) return builder.rejectProperty(@enumFromInt(data.rhs), error.UnsupportedConsequent);
+        if (left.strength != right.strength) return builder.rejectProperty(node, error.MixedStrength);
+
+        if (conjunction) {
+            // A product renumbers both sides, so neither may carry an abort.
+            if (left.aborts.items.len != 0 or right.aborts.items.len != 0) {
+                return builder.rejectProperty(node, error.UnsupportedAbortScope);
+            }
+            const combined = try builder.lowerAnd(node, &left.obligation, &right.obligation);
+            try left.rebase(gpa, combined, 0);
+            right.deinit(gpa);
+            return left;
+        }
+
+        // A disjoint union: the left operand keeps its state numbering and the
+        // right one is offset by it, so both sides' abort masks survive.
+        const base = left.obligation.state_count;
+        const combined = try builder.lowerOr(node, &left.obligation, &right.obligation);
+        try left.rebase(gpa, combined, 0);
+
+        try left.aborts.ensureUnusedCapacity(gpa, right.aborts.items.len);
+        for (right.aborts.items) |abort| {
+            const moved = try maskAlloc(gpa, left.obligation.words);
+            blitMask(moved, abort.mask, base);
+            left.aborts.appendAssumeCapacity(.{
+                .cond = abort.cond,
+                .effect = abort.effect,
+                .scope = abort.scope,
+                .sampled = abort.sampled,
+                .mask = moved,
+            });
+        }
+        right.deinit(gpa);
+
+        // A reject below a disjunction only kills its own disjunct: the other
+        // one may still hold, so the attempt is not resolved. An accept is the
+        // other way round — one disjunct holding makes the disjunction hold —
+        // and keeps resolving the whole attempt.
+        for (left.aborts.items) |*abort| {
+            if (abort.effect == .reject) abort.scope = .branch;
+        }
+        return left;
+    }
+
+    /// `s #-# p` and `s #=# p`.
+    ///
+    /// LRM 16.12.9 defines followed-by as `not (seq |-> not prop)`, and reading
+    /// that as an automaton is what makes it cheap. Negating the implication
+    /// turns its universal over antecedent matches into an existential *and*
+    /// turns vacuity from a pass into a failure, and an existential over
+    /// "`s` matches, then `p` holds from there" is exactly a match of the two
+    /// concatenated. So this is not the implication construction with a flipped
+    /// verdict — it never becomes a trigger at all, and the antecedent joins the
+    /// obligation instead.
+    fn lowerFollowedBy(builder: *Builder, node: Ir.Node.Index) Error!Plan {
+        const gpa = builder.gpa;
+        const data = builder.ir.dataOf(node);
+        const gap: u32 = if (builder.ir.tagOf(node) == .prop_followed_by_overlap) 0 else 1;
+
+        var plan = try builder.lowerProperty(@enumFromInt(data.rhs));
+        errdefer plan.deinit(gpa);
+        if (plan.trigger != null) {
+            return builder.rejectProperty(@enumFromInt(data.rhs), error.UnsupportedConsequent);
+        }
+        // A fusion manufactures a state per exit/entry pair, so the consequent's
+        // states do not survive as a block and an abort mask over them cannot be
+        // carried through.
+        if (plan.aborts.items.len != 0) {
+            return builder.rejectProperty(node, error.UnsupportedAbortScope);
+        }
+
+        var antecedent = try builder.lower(@enumFromInt(data.lhs));
+        defer antecedent.deinit(gpa);
+        const combined = try builder.lowerDelay(node, &antecedent, gap, gap, &plan.obligation);
+        try plan.rebase(gpa, combined, 0);
+        return plan;
+    }
+
+    /// `accept_on`, `reject_on`, and their `sync_` forms.
+    fn lowerAbort(builder: *Builder, node: Ir.Node.Index) Error!Plan {
+        const gpa = builder.gpa;
+        const tag = builder.ir.tagOf(node);
+        const data = builder.ir.dataOf(node);
+
+        var plan = try builder.lowerProperty(@enumFromInt(data.rhs));
+        errdefer plan.deinit(gpa);
+
+        // An abort is scoped to one attempt, and a trigger is not: it is the
+        // union of every attempt's antecedent, so there is no way to abort the
+        // antecedent of the attempt this abort belongs to and leave the others
+        // matching. An abort *below* an implication is the supported shape, and
+        // the useful one.
+        if (plan.trigger != null) {
+            return builder.rejectProperty(node, error.UnsupportedConsequent);
+        }
+
+        // Everything lowered so far is what the abort guards.
+        const mask = try maskAlloc(gpa, plan.obligation.words);
+        errdefer gpa.free(mask);
+        for (0..plan.obligation.state_count) |state| Nfa.bitSet(mask, @intCast(state));
+
+        try plan.aborts.append(gpa, .{
+            .cond = try builder.rootOf(@enumFromInt(data.lhs)),
+            .effect = switch (tag) {
+                .prop_accept_on, .prop_sync_accept_on => .accept,
+                else => .reject,
+            },
+            .scope = .attempt,
+            .sampled = switch (tag) {
+                .prop_sync_accept_on, .prop_sync_reject_on => true,
+                else => false,
+            },
+            .mask = mask,
+        });
+        return plan;
+    }
+
+    /// A copy of `source` that the caller owns.
+    fn copyFragment(builder: *Builder, source: *const Fragment) Allocator.Error!Fragment {
+        var fragment = try Fragment.init(builder.gpa, source.state_count);
+        fragment.blit(source, 0);
+        @memcpy(fragment.first, source.first);
+        @memcpy(fragment.last, source.last);
+        return fragment;
+    }
+
+    /// `operand`, entered `lo..hi` cycles into the attempt.
+    ///
+    /// A chain of `hi` unguarded filler states the attempt spends its first
+    /// cycles in, with `operand` blitted above them and entered from every
+    /// offset in the range. Close to `lowerDelay` against a one-cycle `true`,
+    /// with two differences that matter: offset 0 enters `operand` directly
+    /// rather than fusing a pair state onto a left match there is none of, and
+    /// `operand`'s states stay contiguous at a known base, which is what lets an
+    /// abort mask below the shift survive it.
+    fn shift(
+        builder: *Builder,
+        node: Ir.Node.Index,
+        operand: *const Fragment,
+        lo: u32,
+        hi: u32,
+    ) Error!Fragment {
+        std.debug.assert(lo <= hi);
+        std.debug.assert(hi != Ir.unbounded);
+        if (hi == 0) return builder.copyFragment(operand);
+
+        const total = try builder.checkLimit(node, @as(u64, hi) + operand.state_count);
+        var fragment = try Fragment.init(builder.gpa, total);
+        errdefer fragment.deinit(builder.gpa);
+
+        // The filler chain. `Fragment.init` guards every state with `always`,
+        // which is what a filler cycle is.
+        for (0..hi - 1) |index| {
+            Nfa.bitSet(fragment.row(@intCast(index)), @intCast(index + 1));
+        }
+        fragment.blit(operand, hi);
+
+        Nfa.bitSet(fragment.first, 0);
+        if (lo == 0) blitMask(fragment.first, operand.first, hi);
+        var offset = @max(lo, 1);
+        while (offset <= hi) : (offset += 1) {
+            blitMask(fragment.row(offset - 1), operand.first, hi);
+        }
+        blitMask(fragment.last, operand.last, hi);
+        return fragment;
     }
 
     // -- Lowering ------------------------------------------------------------
@@ -1616,21 +2090,42 @@ const Builder = struct {
     /// term by the same index, or a backend evaluates it twice. `pinned` names
     /// root indices to keep even if no surviving guard mentions them, and is
     /// rewritten in place with their new indices.
+    ///
+    /// `masks` names state masks over `fragments[0]` — the abort scopes — and is
+    /// likewise rewritten in place. Pruning only ever removes states and keeps
+    /// the survivors in order, so the rewritten mask is never wider than the one
+    /// it replaces and the caller reads it back at the narrower width.
     fn materialize(
         builder: *Builder,
         fragments: []const *const Fragment,
         pinned: []u32,
+        masks: []const []Word,
         out: []Nfa,
     ) Error!Nfa.Alphabet {
         const gpa = builder.gpa;
         std.debug.assert(fragments.len == out.len);
         std.debug.assert(fragments.len <= 2);
+        std.debug.assert(masks.len == 0 or fragments.len >= 1);
 
         var surviving: [2]Surviving = undefined;
         var pruned: usize = 0;
         defer for (surviving[0..pruned]) |*entry| entry.deinit(gpa);
         while (pruned < fragments.len) : (pruned += 1) {
             surviving[pruned] = try builder.prune(fragments[pruned]);
+        }
+
+        if (masks.len != 0) {
+            const scratch = try gpa.alloc(Word, fragments[0].words);
+            defer gpa.free(scratch);
+            for (masks) |mask| {
+                @memset(scratch, 0);
+                var bits: BitIterator = .init(mask);
+                while (bits.next()) |state| {
+                    const mapped = surviving[0].map[state];
+                    if (mapped != dropped) Nfa.bitSet(scratch, mapped);
+                }
+                @memcpy(mask, scratch);
+            }
         }
 
         // Guards, keeping the two reserved slots, over every fragment.
@@ -3277,16 +3772,22 @@ const Fate = struct {
     failed_at: ?u32 = null,
 };
 
-/// Whether a match of `pattern` starting at `start` can still end in `cycle` or
-/// later, over the trace so far plus some continuation. This is the definition
-/// the automaton's "state set is non-empty" is supposed to implement, arrived at
-/// by enumerating continuations instead.
+/// Whether a match of `pattern` starting at `start` can still end in `earliest`
+/// or later, given the trace observed through `cycle` plus some continuation.
+/// This is the definition the automaton's "state set is non-empty" is supposed to
+/// implement, arrived at by enumerating continuations instead.
+///
+/// `earliest` is separate from `cycle` because two different questions want this
+/// machinery: an obligation is alive while a match can still end in `cycle` or
+/// later, and a followed-by is still owed a witness while its antecedent can
+/// match ending *after* `cycle`.
 fn canStillMatch(
     ir: *const Ir,
     pattern: Ir.Node.Index,
     trace: []const u64,
     start: u32,
     cycle: u32,
+    earliest: u32,
     atom_count: u5,
     bound: u32,
 ) bool {
@@ -3303,9 +3804,7 @@ fn canStillMatch(
                 (assignment >> @intCast(offset * atom_count)) & per_cycle;
         }
         var ends = bruteForceMatches(ir, pattern, extended[0 .. prefix + bound], start);
-        // A match ending before `cycle` discharged the attempt already; only an
-        // end in `cycle` or later keeps it alive.
-        ends &= ~((@as(u64, 1) << @intCast(cycle)) - 1);
+        ends &= ~((@as(u64, 1) << @intCast(earliest)) - 1);
         if (ends != 0) return true;
     }
     return false;
@@ -3324,11 +3823,189 @@ fn bruteForceFate(
 
     var cycle = start;
     while (cycle < trace.len) : (cycle += 1) {
-        if (!canStillMatch(ir, pattern, trace, start, cycle, atom_count, bound)) {
+        if (!canStillMatch(ir, pattern, trace, start, cycle, cycle, atom_count, bound)) {
             return .{ .failed_at = cycle };
         }
     }
     return .{}; // still pending when the trace ran out
+}
+
+fn minOpt(left: ?u32, right: ?u32) ?u32 {
+    const a = left orelse return right;
+    const b = right orelse return a;
+    return @min(a, b);
+}
+
+fn maxOpt(left: ?u32, right: ?u32) ?u32 {
+    const a = left orelse return null;
+    const b = right orelse return null;
+    return @max(a, b);
+}
+
+/// Both operands must hold, on independent schedules: the pair is decided false
+/// by the first side to fail, and true when the later side finally holds.
+fn fateAnd(left: Fate, right: Fate) Fate {
+    if (minOpt(left.failed_at, right.failed_at)) |at| return .{ .failed_at = at };
+    if (maxOpt(left.matched_at, right.matched_at)) |at| return .{ .matched_at = at };
+    return .{};
+}
+
+/// Either operand holding is enough, so the first to hold decides it true and it
+/// takes both failing to decide it false.
+fn fateOr(left: Fate, right: Fate) Fate {
+    if (minOpt(left.matched_at, right.matched_at)) |at| return .{ .matched_at = at };
+    if (maxOpt(left.failed_at, right.failed_at)) |at| return .{ .failed_at = at };
+    return .{};
+}
+
+/// What became of one attempt of a *property*, by direct recursion over the
+/// definitions in `Ir`'s header.
+///
+/// Compositional, and deliberately: at the leaves it defers to `bruteForceFate`,
+/// which is the reference the sequence layer is already tied to, and above them
+/// it only ever combines verdicts. Nothing here knows that a conjunction lowers
+/// onto `seq_and` or that a followed-by lowers onto a concatenation, which is
+/// what makes it an independent opinion on those identities rather than a
+/// restatement of them.
+fn propFate(
+    ir: *const Ir,
+    property: Ir.Node.Index,
+    trace: []const u64,
+    start: u32,
+    atom_count: u5,
+    bound: u32,
+) Fate {
+    const data = ir.dataOf(property);
+    switch (ir.tagOf(property)) {
+        .prop_seq_weak, .prop_seq_strong => {
+            return bruteForceFate(ir, @enumFromInt(data.lhs), trace, start, atom_count, bound);
+        },
+        .prop_and, .prop_or => {
+            const left = propFate(ir, @enumFromInt(data.lhs), trace, start, atom_count, bound);
+            const right = propFate(ir, @enumFromInt(data.rhs), trace, start, atom_count, bound);
+            return if (ir.tagOf(property) == .prop_and)
+                fateAnd(left, right)
+            else
+                fateOr(left, right);
+        },
+        // The property at each offset in the range, folded disjunctively for
+        // `prop_delay` and conjunctively for `prop_always`.
+        .prop_delay, .prop_always => {
+            const range = ir.propRangeOf(property);
+            const conjunctive = ir.tagOf(property) == .prop_always;
+            var folded: ?Fate = null;
+            var offset = range.lo;
+            while (offset <= range.hi) : (offset += 1) {
+                const at = propFate(ir, range.prop, trace, start + offset, atom_count, bound);
+                folded = if (folded) |sofar|
+                    (if (conjunctive) fateAnd(sofar, at) else fateOr(sofar, at))
+                else
+                    at;
+            }
+            return folded.?;
+        },
+        // Existential over the antecedent's matches: some match, with the
+        // consequent holding from its end. It stays pending while the antecedent
+        // could still produce a new match, and fails once it cannot and every
+        // witness it did produce has failed — which is where it parts company
+        // with implication, for which no match at all is a pass.
+        .prop_followed_by_overlap, .prop_followed_by_nonoverlap => {
+            const antecedent: Ir.Node.Index = @enumFromInt(data.lhs);
+            const gap: u32 = @intFromBool(ir.tagOf(property) == .prop_followed_by_nonoverlap);
+
+            const ends = bruteForceMatches(ir, antecedent, trace, start);
+
+            var matched: ?u32 = null;
+            var last_hope: ?u32 = null;
+            var pending = false;
+            var remaining = ends;
+            while (remaining != 0) {
+                const end: u32 = @ctz(remaining);
+                remaining &= remaining - 1;
+                const witness = propFate(ir, @enumFromInt(data.rhs), trace, end + gap, atom_count, bound);
+                if (witness.matched_at) |at| {
+                    matched = minOpt(matched, at);
+                } else if (witness.failed_at) |at| {
+                    last_hope = @max(last_hope orelse at, at);
+                } else pending = true;
+            }
+            if (matched) |at| return .{ .matched_at = at };
+            if (pending) return .{};
+
+            // Every witness so far has failed. The verdict is settled in the
+            // first cycle from which the antecedent can no longer match at all —
+            // a later match would be a fresh witness — provided the witnesses
+            // already raised have finished failing by then.
+            var cycle = start;
+            while (cycle < trace.len) : (cycle += 1) {
+                if (canStillMatch(ir, antecedent, trace, start, cycle, cycle + 1, atom_count, bound)) {
+                    continue;
+                }
+                if (last_hope) |at| if (at > cycle) continue;
+                return .{ .failed_at = cycle };
+            }
+            return .{};
+        },
+        .prop_accept_on,
+        .prop_reject_on,
+        .prop_sync_accept_on,
+        .prop_sync_reject_on,
+        => {
+            const inner = propFate(ir, @enumFromInt(data.rhs), trace, start, atom_count, bound);
+            const accepts = switch (ir.tagOf(property)) {
+                .prop_accept_on, .prop_sync_accept_on => true,
+                else => false,
+            };
+
+            // The first cycle the condition holds while the attempt is still
+            // undecided. LRM 16.12.7 arms an abort at any point *during* the
+            // evaluation attempt, and the cycle the attempt resolves in is one
+            // of those — hence `>=` rather than `>`, and hence an abort winning
+            // a tie against the property's own verdict.
+            var fired: ?u32 = null;
+            var cycle = start;
+            while (cycle < trace.len) : (cycle += 1) {
+                const atoms = [_]Word{trace[cycle]};
+                if (!Nfa.evaluateBoolean(ir, @enumFromInt(data.lhs), &atoms)) continue;
+                if (inner.matched_at) |at| if (at < cycle) break;
+                if (inner.failed_at) |at| if (at < cycle) break;
+                fired = cycle;
+                break;
+            }
+
+            const at = fired orelse return inner;
+            if (accepts) {
+                if (inner.matched_at) |held| if (held < at) return inner;
+                return .{ .matched_at = at };
+            }
+            if (inner.matched_at) |held| if (held < at) return inner;
+            return .{ .failed_at = at };
+        },
+        else => unreachable, // an implication is peeled off before this
+    }
+}
+
+/// The strength a property carries, which is its leaves' — every operator above
+/// them passes it through, and `prop_and`/`prop_or` require their sides to agree.
+fn propStrength(ir: *const Ir, property: Ir.Node.Index) Monitor.Strength {
+    const data = ir.dataOf(property);
+    return switch (ir.tagOf(property)) {
+        .prop_seq_weak => .weak,
+        .prop_seq_strong => .strong,
+        .prop_delay, .prop_always => propStrength(ir, ir.propRangeOf(property).prop),
+        .prop_and,
+        .prop_or,
+        .prop_followed_by_overlap,
+        .prop_followed_by_nonoverlap,
+        .prop_accept_on,
+        .prop_reject_on,
+        .prop_sync_accept_on,
+        .prop_sync_reject_on,
+        .prop_implies_overlap,
+        .prop_implies_nonoverlap,
+        => propStrength(ir, @enumFromInt(data.rhs)),
+        else => unreachable, // not a property-layer tag
+    };
 }
 
 /// Check a monitor against the semantics over every trace of `length` cycles.
@@ -3356,9 +4033,10 @@ fn differentialMonitor(
         },
         else => {},
     }
-    const obligation: Ir.Node.Index = @enumFromInt(ir.dataOf(property).lhs);
-    const strong = ir.tagOf(property) == .prop_seq_strong;
-    const bound: u32 = @intCast(maxLength(ir, obligation).?);
+    const strong = propStrength(ir, property) == .strong;
+    // The continuation length `bruteForceFate` enumerates at the leaves. The
+    // whole property's bound covers every leaf's, so it is safe if generous.
+    const bound: u32 = @intCast(propBound(ir, property).length.?);
 
     var state = try Monitor.State.init(gpa, &monitor);
     defer state.deinit(gpa);
@@ -3387,7 +4065,7 @@ fn differentialMonitor(
         while (remaining != 0) {
             const start: u32 = @ctz(remaining);
             remaining &= remaining - 1;
-            const fate = bruteForceFate(ir, obligation, window, start, atom_count, bound);
+            const fate = propFate(ir, property, window, start, atom_count, bound);
             if (fate.matched_at) |at| {
                 want_matches[at] += 1;
             } else if (fate.failed_at) |at| {
@@ -4300,6 +4978,1222 @@ test "the depth cap reports the obligation that tripped it" {
     try testing.expectEqual(body, diagnostic.node);
     // A leading delay of up to 400 puts the match's last cycle at 401 at worst.
     try testing.expectEqual(@as(u64, 401), diagnostic.size);
+}
+
+// -- The property layer above a sequence -------------------------------------
+//
+// Every operator here is checked against `propFate`, which reads the verdict
+// definitions and knows nothing about the constructions below. The continuation
+// enumeration in `bruteForceFate` is exponential in the obligation's bound, so
+// the shapes stay small on purpose: a bound of 3 over 2 atoms is 64
+// continuations per cycle per start, and that is the budget.
+
+test "differential: property conjunction and disjunction" {
+    const gpa = testing.allocator;
+
+    for ([_]Ir.Node.Tag{ .prop_and, .prop_or }) |junction| {
+        for ([_]Ir.Node.Tag{ .prop_seq_weak, .prop_seq_strong }) |strength| {
+            // Two sides that resolve in *different* cycles and can each fail on
+            // their own: `a` is decided in the attempt's first cycle and
+            // `##1 b` in its second, so a conjunction has to wait for the later
+            // one and a disjunction has to take the earlier.
+            {
+                var ir: Ir = .init();
+                defer ir.deinit(gpa);
+                const left = try ir.propSeq(gpa, strength, try atomCycle(&ir, gpa, 0));
+                const right = try ir.propSeq(gpa, strength, try leadingDelay(
+                    &ir,
+                    gpa,
+                    1,
+                    1,
+                    try atomCycle(&ir, gpa, 1),
+                ));
+                const property = try ir.propJunction(gpa, junction, left, right);
+                const index = try addDirective(&ir, gpa, property, null);
+                try differentialMonitor(gpa, &ir, index, 2, 4);
+            }
+            // The same pair as an obligation under a trigger, and with a side
+            // whose match length varies so an attempt can be pending with both
+            // sides still alive.
+            {
+                var ir: Ir = .init();
+                defer ir.deinit(gpa);
+                const left = try ir.propSeq(gpa, strength, try atomCycle(&ir, gpa, 1));
+                const right = try ir.propSeq(gpa, strength, try leadingDelay(
+                    &ir,
+                    gpa,
+                    1,
+                    2,
+                    try atomCycle(&ir, gpa, 1),
+                ));
+                const pair = try ir.propJunction(gpa, junction, left, right);
+                const property = try ir.propImplies(
+                    gpa,
+                    .prop_implies_nonoverlap,
+                    try atomCycle(&ir, gpa, 0),
+                    pair,
+                );
+                const index = try addDirective(&ir, gpa, property, null);
+                try differentialMonitor(gpa, &ir, index, 2, 4);
+            }
+        }
+    }
+}
+
+test "differential: nexttime, bounded eventually and bounded always" {
+    const gpa = testing.allocator;
+
+    const Case = struct { tag: Ir.Node.Tag, lo: u32, hi: u32 };
+    for ([_]Case{
+        // `nexttime[0] p` is `p`: no filler at all, which is the one shape
+        // where the shift has to add nothing rather than one cycle.
+        .{ .tag = .prop_delay, .lo = 0, .hi = 0 },
+        .{ .tag = .prop_delay, .lo = 1, .hi = 1 },
+        .{ .tag = .prop_delay, .lo = 2, .hi = 2 },
+        // `eventually [m:n]`: the range read disjunctively.
+        .{ .tag = .prop_delay, .lo = 0, .hi = 2 },
+        .{ .tag = .prop_delay, .lo = 1, .hi = 3 },
+        // `always [m:n]`: the same range read conjunctively. At `lo == hi` the
+        // two coincide, which is worth checking rather than assuming.
+        .{ .tag = .prop_always, .lo = 0, .hi = 1 },
+        .{ .tag = .prop_always, .lo = 1, .hi = 3 },
+        .{ .tag = .prop_always, .lo = 2, .hi = 2 },
+    }) |case| {
+        for ([_]Ir.Node.Tag{ .prop_seq_weak, .prop_seq_strong }) |strength| {
+            // A one-cycle body over one atom, so the operator is all there is to
+            // see and the range can be wide without the bound growing.
+            {
+                var ir: Ir = .init();
+                defer ir.deinit(gpa);
+                const body = try ir.propSeq(gpa, strength, try atomCycle(&ir, gpa, 0));
+                const property = try ir.propRange(gpa, case.tag, case.lo, case.hi, body);
+                const index = try addDirective(&ir, gpa, property, null);
+                try differentialMonitor(gpa, &ir, index, 1, 5);
+            }
+        }
+    }
+
+    // A body that takes a cycle of its own to resolve, under a trigger, so the
+    // shift composes with an obligation rather than replacing it.
+    for ([_]Ir.Node.Tag{ .prop_delay, .prop_always }) |tag| {
+        for ([_]Ir.Node.Tag{ .prop_seq_weak, .prop_seq_strong }) |strength| {
+            var ir: Ir = .init();
+            defer ir.deinit(gpa);
+            const body = try ir.propSeq(gpa, strength, try leadingDelay(
+                &ir,
+                gpa,
+                1,
+                1,
+                try atomCycle(&ir, gpa, 1),
+            ));
+            const shifted = try ir.propRange(gpa, tag, 0, 1, body);
+            const property = try ir.propImplies(
+                gpa,
+                .prop_implies_overlap,
+                try atomCycle(&ir, gpa, 0),
+                shifted,
+            );
+            const index = try addDirective(&ir, gpa, property, null);
+            try differentialMonitor(gpa, &ir, index, 2, 4);
+        }
+    }
+}
+
+test "differential: followed-by" {
+    const gpa = testing.allocator;
+
+    for ([_]Ir.Node.Tag{ .prop_followed_by_overlap, .prop_followed_by_nonoverlap }) |tag| {
+        for ([_]Ir.Node.Tag{ .prop_seq_weak, .prop_seq_strong }) |strength| {
+            // A one-cycle antecedent: the witness is unique, so the existential
+            // is visible without being tangled up in which witness won.
+            {
+                var ir: Ir = .init();
+                defer ir.deinit(gpa);
+                const consequent = try ir.propSeq(gpa, strength, try atomCycle(&ir, gpa, 1));
+                const property = try ir.propFollowedBy(
+                    gpa,
+                    tag,
+                    try atomCycle(&ir, gpa, 0),
+                    consequent,
+                );
+                const index = try addDirective(&ir, gpa, property, null);
+                try differentialMonitor(gpa, &ir, index, 2, 4);
+            }
+            // An antecedent with *several* possible ends, so the existential has
+            // a choice and one failing witness must not settle it.
+            {
+                var ir: Ir = .init();
+                defer ir.deinit(gpa);
+                const consequent = try ir.propSeq(gpa, strength, try atomCycle(&ir, gpa, 1));
+                const property = try ir.propFollowedBy(
+                    gpa,
+                    tag,
+                    try leadingDelay(&ir, gpa, 0, 1, try atomCycle(&ir, gpa, 0)),
+                    consequent,
+                );
+                const index = try addDirective(&ir, gpa, property, null);
+                try differentialMonitor(gpa, &ir, index, 2, 4);
+            }
+        }
+    }
+}
+
+test "differential: an accept abort and a reject abort" {
+    const gpa = testing.allocator;
+
+    for ([_]Ir.Node.Tag{ .prop_accept_on, .prop_reject_on }) |tag| {
+        for ([_]Ir.Node.Tag{ .prop_seq_weak, .prop_seq_strong }) |strength| {
+            // A two-cycle body, so there is a cycle in which the attempt is
+            // pending and the condition can catch it mid-flight rather than only
+            // ever agreeing with a verdict already reached.
+            {
+                var ir: Ir = .init();
+                defer ir.deinit(gpa);
+                const body = try ir.propSeq(gpa, strength, try leadingDelay(
+                    &ir,
+                    gpa,
+                    1,
+                    1,
+                    try atomCycle(&ir, gpa, 0),
+                ));
+                const property = try ir.propAbort(gpa, tag, try ir.atom(gpa, @enumFromInt(1)), body);
+                const index = try addDirective(&ir, gpa, property, null);
+                try differentialMonitor(gpa, &ir, index, 2, 4);
+            }
+            // Below an implication. The abort is scoped to the obligation, so
+            // the antecedent keeps matching and keeps raising obligations in the
+            // very cycles the condition holds — which a monitor-wide reset would
+            // not do.
+            {
+                var ir: Ir = .init();
+                defer ir.deinit(gpa);
+                const body = try ir.propSeq(gpa, strength, try leadingDelay(
+                    &ir,
+                    gpa,
+                    1,
+                    1,
+                    try atomCycle(&ir, gpa, 0),
+                ));
+                const guarded = try ir.propAbort(gpa, tag, try ir.atom(gpa, @enumFromInt(1)), body);
+                const property = try ir.propImplies(
+                    gpa,
+                    .prop_implies_nonoverlap,
+                    try atomCycle(&ir, gpa, 0),
+                    guarded,
+                );
+                const index = try addDirective(&ir, gpa, property, null);
+                try differentialMonitor(gpa, &ir, index, 2, 4);
+            }
+            // An abort under a shift: the filler cycles are not part of the
+            // abort's subtree, so the condition holding there must do nothing.
+            {
+                var ir: Ir = .init();
+                defer ir.deinit(gpa);
+                const body = try ir.propSeq(gpa, strength, try atomCycle(&ir, gpa, 0));
+                const guarded = try ir.propAbort(gpa, tag, try ir.atom(gpa, @enumFromInt(1)), body);
+                const property = try ir.propRange(gpa, .prop_delay, 2, 2, guarded);
+                const index = try addDirective(&ir, gpa, property, null);
+                try differentialMonitor(gpa, &ir, index, 2, 4);
+            }
+            // An abort under a disjunction, which is where a reject stops
+            // resolving the whole attempt and only kills its own disjunct.
+            {
+                var ir: Ir = .init();
+                defer ir.deinit(gpa);
+                const guarded = try ir.propAbort(
+                    gpa,
+                    tag,
+                    try ir.atom(gpa, @enumFromInt(1)),
+                    try ir.propSeq(gpa, strength, try leadingDelay(
+                        &ir,
+                        gpa,
+                        1,
+                        1,
+                        try atomCycle(&ir, gpa, 0),
+                    )),
+                );
+                const other = try ir.propSeq(gpa, strength, try atomCycle(&ir, gpa, 0));
+                const property = try ir.propJunction(gpa, .prop_or, guarded, other);
+                const index = try addDirective(&ir, gpa, property, null);
+                try differentialMonitor(gpa, &ir, index, 2, 4);
+            }
+        }
+    }
+}
+
+/// Everything a monitor does over every trace of `length` cycles, as one flat
+/// fingerprint: failures and matches per cycle, then what the end of the trace
+/// makes of whatever is still pending.
+///
+/// Two spellings of the same property have equal fingerprints; two spellings
+/// that differ anywhere at all do not. That makes this both the way an identity
+/// is checked and the way a mutant is shown to be reachable by a test.
+fn behaviour(
+    gpa: Allocator,
+    ir: *const Ir,
+    index: Ir.Assertion.Index,
+    atom_count: u5,
+    length: u32,
+    into: *std.ArrayListUnmanaged(u32),
+) !void {
+    var monitor = try assertion(gpa, ir, index, .{}, null);
+    defer monitor.deinit(gpa);
+    var state = try Monitor.State.init(gpa, &monitor);
+    defer state.deinit(gpa);
+
+    var traces: Traces = .init(atom_count, length);
+    while (traces.next()) |window| {
+        state.clear();
+        for (0..length) |cycle| {
+            const atoms = [_]Word{window[cycle]};
+            const report = state.stepAtoms(ir, &atoms);
+            try into.append(gpa, report.failures);
+            try into.append(gpa, report.matches);
+        }
+        const final = state.finish();
+        try into.append(gpa, final.failures);
+        try into.append(gpa, final.matches);
+    }
+}
+
+fn sameBehaviour(
+    gpa: Allocator,
+    left: *const Ir,
+    left_index: Ir.Assertion.Index,
+    right: *const Ir,
+    right_index: Ir.Assertion.Index,
+    atom_count: u5,
+    length: u32,
+) !void {
+    var a: std.ArrayListUnmanaged(u32) = .empty;
+    defer a.deinit(gpa);
+    var b: std.ArrayListUnmanaged(u32) = .empty;
+    defer b.deinit(gpa);
+    try behaviour(gpa, left, left_index, atom_count, length, &a);
+    try behaviour(gpa, right, right_index, atom_count, length, &b);
+    try testing.expectEqualSlices(u32, a.items, b.items);
+}
+
+test "followed-by fails where implication holds vacuously" {
+    const gpa = testing.allocator;
+
+    // The whole difference between the two operators, on the trace that shows
+    // it: `a` never holds, so there is no antecedent match at all. An
+    // implication is vacuously true and reports nothing; a followed-by asserted
+    // a witness exists and there is none, so every attempt fails.
+    //
+    // `first_match` taught us that an operator can be a no-op in the position a
+    // test naturally puts it in. This is the position where followed-by is not.
+    const trace = [_]u64{ 0, 0, 0, 0 };
+
+    var vacuous: Ir = .init();
+    defer vacuous.deinit(gpa);
+    {
+        const consequent = try vacuous.propSeq(gpa, .prop_seq_weak, try atomCycle(&vacuous, gpa, 1));
+        const property = try vacuous.propImplies(
+            gpa,
+            .prop_implies_overlap,
+            try atomCycle(&vacuous, gpa, 0),
+            consequent,
+        );
+        const index = try addDirective(&vacuous, gpa, property, null);
+        try testing.expectEqual(@as(u32, 0), try failuresOver(gpa, &vacuous, index, &trace));
+    }
+
+    var witnessed: Ir = .init();
+    defer witnessed.deinit(gpa);
+    {
+        const consequent = try witnessed.propSeq(gpa, .prop_seq_weak, try atomCycle(&witnessed, gpa, 1));
+        const property = try witnessed.propFollowedBy(
+            gpa,
+            .prop_followed_by_overlap,
+            try atomCycle(&witnessed, gpa, 0),
+            consequent,
+        );
+        const index = try addDirective(&witnessed, gpa, property, null);
+        // One attempt per cycle, each failing in the cycle it starts: the
+        // antecedent is one cycle long, so a match is impossible from the start.
+        try testing.expectEqual(@as(u32, 4), try failuresOver(gpa, &witnessed, index, &trace));
+    }
+}
+
+test "an accept discharges where a reset abandons" {
+    const gpa = testing.allocator;
+
+    // The distinction §6 says the reset path does not draw, drawn. Both spellings
+    // stop the obligation the moment `b` holds; they differ in what is left
+    // behind. `b` at cycle 1, and `ack` never, so every attempt is pending when
+    // `b` arrives and would otherwise have failed.
+    const trace = [_]u64{ 0, 0b10, 0, 0 };
+
+    // Abandoned: no verdict at all, from a *strong* property that would
+    // otherwise fail every pending attempt at the end of the trace.
+    var abandoned: Ir = .init();
+    defer abandoned.deinit(gpa);
+    const reset_failures = blk: {
+        const body = try abandoned.propSeq(gpa, .prop_seq_strong, try leadingDelay(
+            &abandoned,
+            gpa,
+            1,
+            1,
+            try atomCycle(&abandoned, gpa, 0),
+        ));
+        const index = try addDirective(
+            &abandoned,
+            gpa,
+            body,
+            try abandoned.atom(gpa, @enumFromInt(1)),
+        );
+        break :blk try failuresOver(gpa, &abandoned, index, &trace);
+    };
+
+    // Discharged: a pass, and a pass is what a `cover` counts.
+    var discharged: Ir = .init();
+    defer discharged.deinit(gpa);
+    const accept_failures = blk: {
+        const body = try discharged.propSeq(gpa, .prop_seq_strong, try leadingDelay(
+            &discharged,
+            gpa,
+            1,
+            1,
+            try atomCycle(&discharged, gpa, 0),
+        ));
+        const property = try discharged.propAbort(
+            gpa,
+            .prop_accept_on,
+            try discharged.atom(gpa, @enumFromInt(1)),
+            body,
+        );
+        const index = try addDirective(&discharged, gpa, property, null);
+
+        var monitor = try assertion(gpa, &discharged, index, .{}, null);
+        defer monitor.deinit(gpa);
+        var state = try Monitor.State.init(gpa, &monitor);
+        defer state.deinit(gpa);
+        state.clear();
+        var matches: u32 = 0;
+        var failures: u32 = 0;
+        for (trace) |cycle| {
+            const atoms = [_]Word{cycle};
+            const report = state.stepAtoms(&discharged, &atoms);
+            matches += report.matches;
+            failures += report.failures;
+        }
+        const final = state.finish();
+
+        // The accept turned pending attempts into passes, which a reset would
+        // have left as nothing. This is the assertion that dies if `accept_on`
+        // is lowered as a reset.
+        try testing.expect(matches > 0);
+        break :blk failures + final.failures;
+    };
+
+    // Both suppress the failures the obligation would otherwise have produced,
+    // so counting failures alone cannot tell them apart — which is exactly why
+    // the match count above is the load-bearing check.
+    try testing.expectEqual(reset_failures, accept_failures);
+}
+
+test "a reject under a disjunction kills only its own disjunct" {
+    const gpa = testing.allocator;
+
+    // Where a reject stops propagating. `(reject_on(b) ##1 x) or (##2 y)`
+    // against `reject_on(b) ((##1 x) or (##2 y))`: the same two operators nested
+    // the other way round, and the trace that separates them is one where the
+    // reject fires while the *other* disjunct is still alive and about to
+    // succeed. `b` in cycle 0 kills the left disjunct there; `y` in cycle 2 then
+    // discharges the right one.
+    //
+    // Under the disjunction the attempt survives to be discharged. Over it, the
+    // reject resolves the whole attempt and the surviving disjunct never gets to
+    // finish. Atom 0 is `x`, atom 1 is `b`, atom 2 is `y`.
+    const trace = [_]u64{ 0b010, 0, 0b100, 0 };
+
+    const build = struct {
+        fn go(ir: *Ir, alloc: Allocator, inside: bool) !Ir.Assertion.Index {
+            const cond = try ir.atom(alloc, @enumFromInt(1));
+            var left = try ir.propSeq(alloc, .prop_seq_weak, try leadingDelay(
+                ir,
+                alloc,
+                1,
+                1,
+                try atomCycle(ir, alloc, 0),
+            ));
+            const right = try ir.propSeq(alloc, .prop_seq_weak, try leadingDelay(
+                ir,
+                alloc,
+                2,
+                2,
+                try atomCycle(ir, alloc, 2),
+            ));
+            if (inside) left = try ir.propAbort(alloc, .prop_reject_on, cond, left);
+            var property = try ir.propJunction(alloc, .prop_or, left, right);
+            if (!inside) property = try ir.propAbort(alloc, .prop_reject_on, cond, property);
+            return addDirective(ir, alloc, property, null);
+        }
+    }.go;
+
+    var under: Ir = .init();
+    defer under.deinit(gpa);
+    const under_index = try build(&under, gpa, true);
+
+    var over: Ir = .init();
+    defer over.deinit(gpa);
+    const over_index = try build(&over, gpa, false);
+
+    {
+        var monitor = try assertion(gpa, &under, under_index, .{}, null);
+        defer monitor.deinit(gpa);
+        // The disjunction demoted it: it clears its own states rather than
+        // resolving the attempt, and its mask is the left disjunct alone.
+        try testing.expectEqual(@as(usize, 1), monitor.aborts.len);
+        try testing.expectEqual(Monitor.Abort.Scope.branch, monitor.aborts[0].scope);
+        try testing.expectEqual(Monitor.Abort.Effect.reject, monitor.aborts[0].effect);
+        try testing.expectEqual(@as(u32, 2), @popCount(monitor.maskOf(0)[0]));
+    }
+    {
+        var monitor = try assertion(gpa, &over, over_index, .{}, null);
+        defer monitor.deinit(gpa);
+        try testing.expectEqual(Monitor.Abort.Scope.attempt, monitor.aborts[0].scope);
+        // Over the disjunction the mask is the whole obligation: two states for
+        // the left disjunct and three for the right.
+        try testing.expectEqual(@as(u32, 5), @popCount(monitor.maskOf(0)[0]));
+    }
+
+    // The attempt starting in cycle 0 is discharged under the disjunction and
+    // failed over it, so the totals differ by exactly that attempt.
+    const under_failures = try failuresOver(gpa, &under, under_index, &trace);
+    const over_failures = try failuresOver(gpa, &over, over_index, &trace);
+    try testing.expectEqual(under_failures + 1, over_failures);
+}
+
+test "an abort covers its own subtree and not the cycles before it" {
+    const gpa = testing.allocator;
+
+    // `nexttime[2] (accept_on(b) a)` against `accept_on(b) (nexttime[2] a)`. The
+    // same two operators, nested the other way: inside, the abort covers only
+    // the cycle `a` is evaluated in, and outside it covers the two filler cycles
+    // as well. `b` in cycle 0 and `a` never, so the outer spelling accepts
+    // immediately and the inner one cannot.
+    const trace = [_]u64{ 0b10, 0, 0, 0 };
+
+    var inside: Ir = .init();
+    defer inside.deinit(gpa);
+    const inside_index = blk: {
+        const body = try inside.propSeq(gpa, .prop_seq_weak, try atomCycle(&inside, gpa, 0));
+        const guarded = try inside.propAbort(
+            gpa,
+            .prop_accept_on,
+            try inside.atom(gpa, @enumFromInt(1)),
+            body,
+        );
+        const property = try inside.propRange(gpa, .prop_delay, 2, 2, guarded);
+        break :blk try addDirective(&inside, gpa, property, null);
+    };
+
+    var outside: Ir = .init();
+    defer outside.deinit(gpa);
+    const outside_index = blk: {
+        const body = try outside.propSeq(gpa, .prop_seq_weak, try atomCycle(&outside, gpa, 0));
+        const shifted = try outside.propRange(gpa, .prop_delay, 2, 2, body);
+        const property = try outside.propAbort(
+            gpa,
+            .prop_accept_on,
+            try outside.atom(gpa, @enumFromInt(1)),
+            shifted,
+        );
+        break :blk try addDirective(&outside, gpa, property, null);
+    };
+
+    // The mask is what encodes the difference: one state of three inside, all
+    // three outside.
+    {
+        var monitor = try assertion(gpa, &inside, inside_index, .{}, null);
+        defer monitor.deinit(gpa);
+        try testing.expectEqual(@as(u32, 3), monitor.obligation.state_count);
+        try testing.expectEqual(@as(u32, 1), @popCount(monitor.maskOf(0)[0]));
+    }
+    {
+        var monitor = try assertion(gpa, &outside, outside_index, .{}, null);
+        defer monitor.deinit(gpa);
+        try testing.expectEqual(@as(u32, 3), monitor.obligation.state_count);
+        try testing.expectEqual(@as(u32, 3), @popCount(monitor.maskOf(0)[0]));
+    }
+
+    // Cycle 0 is a filler cycle for the attempt starting there, so the inner
+    // spelling fails it and the outer one accepts it.
+    try testing.expect(
+        try failuresOver(gpa, &inside, inside_index, &trace) !=
+            try failuresOver(gpa, &outside, outside_index, &trace),
+    );
+}
+
+test "a shift over an implication moves the antecedent, not the obligation" {
+    const gpa = testing.allocator;
+
+    // `nexttime[n] (a |-> b)` obliges `b` for exactly the matches of `a` that
+    // start `n` cycles into the attempt. A trigger is seeded every cycle, so
+    // growing an `n`-cycle filler prefix in front of it selects exactly those —
+    // which is a claim about the lowering, checked here against the spelling it
+    // claims to equal. `always [m:n]` survives the same move because a
+    // conjunction of universals is a universal over the union of their triggers;
+    // `eventually [m:n]` does not, and is refused below.
+    for ([_]u32{ 1, 2 }) |offset| {
+        var shifted: Ir = .init();
+        defer shifted.deinit(gpa);
+        const shifted_index = blk: {
+            const consequent = try shifted.propSeq(gpa, .prop_seq_weak, try atomCycle(&shifted, gpa, 1));
+            const implication = try shifted.propImplies(
+                gpa,
+                .prop_implies_nonoverlap,
+                try atomCycle(&shifted, gpa, 0),
+                consequent,
+            );
+            const property = try shifted.propRange(gpa, .prop_delay, offset, offset, implication);
+            break :blk try addDirective(&shifted, gpa, property, null);
+        };
+
+        var spelled: Ir = .init();
+        defer spelled.deinit(gpa);
+        const spelled_index = blk: {
+            const consequent = try spelled.propSeq(gpa, .prop_seq_weak, try atomCycle(&spelled, gpa, 1));
+            const antecedent = try leadingDelay(
+                &spelled,
+                gpa,
+                offset,
+                offset,
+                try atomCycle(&spelled, gpa, 0),
+            );
+            const property = try spelled.propImplies(
+                gpa,
+                .prop_implies_nonoverlap,
+                antecedent,
+                consequent,
+            );
+            break :blk try addDirective(&spelled, gpa, property, null);
+        };
+
+        try sameBehaviour(gpa, &shifted, shifted_index, &spelled, spelled_index, 2, 5);
+    }
+
+    // The conjunctive range over an implication, against the union of its
+    // triggers.
+    var ranged: Ir = .init();
+    defer ranged.deinit(gpa);
+    const ranged_index = blk: {
+        const consequent = try ranged.propSeq(gpa, .prop_seq_weak, try atomCycle(&ranged, gpa, 1));
+        const implication = try ranged.propImplies(
+            gpa,
+            .prop_implies_nonoverlap,
+            try atomCycle(&ranged, gpa, 0),
+            consequent,
+        );
+        const property = try ranged.propRange(gpa, .prop_always, 1, 2, implication);
+        break :blk try addDirective(&ranged, gpa, property, null);
+    };
+
+    var union_of: Ir = .init();
+    defer union_of.deinit(gpa);
+    const union_index = blk: {
+        const consequent = try union_of.propSeq(gpa, .prop_seq_weak, try atomCycle(&union_of, gpa, 1));
+        const antecedent = try leadingDelay(&union_of, gpa, 1, 2, try atomCycle(&union_of, gpa, 0));
+        const property = try union_of.propImplies(
+            gpa,
+            .prop_implies_nonoverlap,
+            antecedent,
+            consequent,
+        );
+        break :blk try addDirective(&union_of, gpa, property, null);
+    };
+
+    try sameBehaviour(gpa, &ranged, ranged_index, &union_of, union_index, 2, 5);
+}
+
+test "the conditional and case forms are a disjunction of followed-bys" {
+    const gpa = testing.allocator;
+
+    // `if (c) p else q` needs no operator of its own. Exactly one guard holds,
+    // so `(c #-# p) or (!c #-# q)` is it: the disjunct whose guard fails has no
+    // antecedent match, and a followed-by without a witness *fails* rather than
+    // holding vacuously, so it contributes nothing and the taken branch decides
+    // the verdict. An implication there would hold vacuously and the disjunction
+    // would always pass.
+    //
+    // The `case` form is the same shape with one disjunct per item.
+    var ir: Ir = .init();
+    defer ir.deinit(gpa);
+
+    const guard = try ir.atom(gpa, @enumFromInt(0));
+    const taken = try ir.propFollowedBy(
+        gpa,
+        .prop_followed_by_overlap,
+        try ir.seqBoolean(gpa, guard),
+        try ir.propSeq(gpa, .prop_seq_weak, try atomCycle(&ir, gpa, 1)),
+    );
+    const otherwise = try ir.propFollowedBy(
+        gpa,
+        .prop_followed_by_overlap,
+        try ir.seqBoolean(gpa, try ir.addNode(gpa, .{
+            .tag = .bnot,
+            .data = .{ .lhs = @intFromEnum(guard) },
+        })),
+        try ir.propSeq(gpa, .prop_seq_weak, try atomCycle(&ir, gpa, 2)),
+    );
+    const property = try ir.propJunction(gpa, .prop_or, taken, otherwise);
+    const index = try addDirective(&ir, gpa, property, null);
+
+    // `c` selects which of the two atoms has to hold in the same cycle, and the
+    // reference semantics agrees over every trace of all three.
+    try differentialMonitor(gpa, &ir, index, 3, 3);
+}
+
+/// The obligation's state count, with the caps lifted so a shape can be measured
+/// rather than rejected.
+fn obligationStates(gpa: Allocator, ir: *const Ir, index: Ir.Assertion.Index) !u32 {
+    var monitor = try assertion(gpa, ir, index, .{
+        .limit = 1 << 22,
+        .depth_limit = 1 << 22,
+    }, null);
+    defer monitor.deinit(gpa);
+    return monitor.obligation.state_count;
+}
+
+test "a bounded always costs the copies that overlap, not the width of the range" {
+    const gpa = testing.allocator;
+
+    // The measurement §4 and §10 of the scoping document asked for. The worry was
+    // that `always [1:100] p` is a hundred-way conjunction and so the case that
+    // justifies a dedicated construction over a desugaring. It is not: the cost
+    // is *linear* in the width of the range either way.
+    //
+    // Why: a conjunct is `p` shifted to one offset, and two conjuncts only have a
+    // reachable product where their copies of `p` are live at the same time. That
+    // window is |p| cycles wide however wide the range is, so the product prunes
+    // to a band rather than a hypercube and the slope is set by `p` alone.
+    //
+    // The consequence for the library is that there is nothing to win here. This
+    // lowering *is* the desugaring — a shift per offset, folded with the same
+    // `lowerAnd` a front-end would have reached for — and it produces exactly the
+    // state counts the sequence-layer spelling produces. The operator earns its
+    // place by keeping the semantics and the refusals in one place, not by
+    // beating the desugaring on size.
+    const Shape = enum { one_cycle, two_cycle, short_range, wide_range };
+    const build = struct {
+        fn go(ir: *Ir, alloc: Allocator, shape: Shape) !Ir.Node.Index {
+            const a = try atomCycle(ir, alloc, 0);
+            const b = try atomCycle(ir, alloc, 1);
+            return switch (shape) {
+                .one_cycle => a,
+                .two_cycle => try ir.seqDelay(alloc, a, 1, 1, b),
+                .short_range => try ir.seqDelay(alloc, a, 1, 2, b),
+                .wide_range => try ir.seqDelay(alloc, a, 1, 4, b),
+            };
+        }
+    }.go;
+
+    const Case = struct {
+        shape: Shape,
+        /// States `p` alone lowers to.
+        body: u32,
+        /// `always [1:100] p`, and `eventually [1:100] p` for comparison.
+        conjunctive: u32,
+        disjunctive: u32,
+    };
+    for ([_]Case{
+        // A deterministic body has one copy live at a time, so the conjunction
+        // is a chain and costs exactly what the disjunction does.
+        .{ .shape = .one_cycle, .body = 1, .conjunctive = 101, .disjunctive = 101 },
+        .{ .shape = .two_cycle, .body = 2, .conjunctive = 102, .disjunctive = 102 },
+        // A body whose match length varies has several copies live at once, and
+        // *that* is what the product pays for: still linear in the range, with a
+        // slope of a few states per offset.
+        .{ .shape = .short_range, .body = 3, .conjunctive = 400, .disjunctive = 103 },
+        .{ .shape = .wide_range, .body = 5, .conjunctive = 3535, .disjunctive = 105 },
+    }) |case| {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const inner = try ir.propSeq(gpa, .prop_seq_weak, try build(&ir, gpa, case.shape));
+
+        const alone = try ir.propRange(gpa, .prop_delay, 0, 0, inner);
+        const conjunctive = try ir.propRange(gpa, .prop_always, 1, 100, inner);
+        const disjunctive = try ir.propRange(gpa, .prop_delay, 1, 100, inner);
+
+        try testing.expectEqual(case.body, try obligationStates(
+            gpa,
+            &ir,
+            try addDirective(&ir, gpa, alone, null),
+        ));
+        try testing.expectEqual(case.conjunctive, try obligationStates(
+            gpa,
+            &ir,
+            try addDirective(&ir, gpa, conjunctive, null),
+        ));
+        try testing.expectEqual(case.disjunctive, try obligationStates(
+            gpa,
+            &ir,
+            try addDirective(&ir, gpa, disjunctive, null),
+        ));
+    }
+
+    // Linear, so the default cap is a ceiling on `n · slope` rather than
+    // something a range of 100 trips on its own. The widest body above is 36
+    // states per offset, which reaches 4096 at around n = 113.
+    {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const inner = try ir.propSeq(gpa, .prop_seq_weak, try build(&ir, gpa, .wide_range));
+        const property = try ir.propRange(gpa, .prop_always, 1, 200, inner);
+        const index = try addDirective(&ir, gpa, property, null);
+        try testing.expectError(
+            error.StateLimitExceeded,
+            assertion(gpa, &ir, index, .{ .depth_limit = 1 << 22 }, null),
+        );
+    }
+}
+
+test "an unbounded always or eventually is refused, not silently bounded" {
+    const gpa = testing.allocator;
+
+    // `always p` and `s_eventually p` are an open range, and an open range leaves
+    // the obligation without a longest match — the same refusal an unbounded
+    // delay gets, for the same reason. Phase 3 of the property layer is the
+    // single-state tracking discipline that would take them; until then this is a
+    // loud refusal naming the node rather than a range quietly clamped to
+    // something finite.
+    for ([_]Ir.Node.Tag{ .prop_delay, .prop_always }) |tag| {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const inner = try ir.propSeq(gpa, .prop_seq_weak, try atomCycle(&ir, gpa, 0));
+        const property = try ir.propRange(gpa, tag, 0, Ir.unbounded, inner);
+        const index = try addDirective(&ir, gpa, property, null);
+
+        var diagnostic: Diagnostic = undefined;
+        try testing.expectError(
+            error.ObligationNotBounded,
+            assertion(gpa, &ir, index, .{}, &diagnostic),
+        );
+        try testing.expectEqual(property, diagnostic.node);
+    }
+}
+
+test "a property operator over an operand with a trigger of its own is refused" {
+    const gpa = testing.allocator;
+
+    // One monitor, one trigger. A conjunction of two implications wants two, and
+    // a disjunctive range over one implication wants a disjunction of vacuities
+    // that no single trigger expresses. Both are legal SVA and both are refused
+    // here rather than mis-lowered.
+    {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const consequent = try ir.propSeq(gpa, .prop_seq_weak, try atomCycle(&ir, gpa, 1));
+        const implication = try ir.propImplies(
+            gpa,
+            .prop_implies_nonoverlap,
+            try atomCycle(&ir, gpa, 0),
+            consequent,
+        );
+        const property = try ir.propJunction(gpa, .prop_and, implication, implication);
+        const index = try addDirective(&ir, gpa, property, null);
+
+        var diagnostic: Diagnostic = undefined;
+        try testing.expectError(
+            error.UnsupportedConsequent,
+            assertion(gpa, &ir, index, .{}, &diagnostic),
+        );
+        try testing.expectEqual(implication, diagnostic.node);
+    }
+    // `eventually [1:2] (a |=> b)`. `always [1:2]` of the same is *not* refused —
+    // see the identity test above — because a conjunction of universals is a
+    // universal over the union of their triggers and a disjunction of them is
+    // not.
+    {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const consequent = try ir.propSeq(gpa, .prop_seq_weak, try atomCycle(&ir, gpa, 1));
+        const implication = try ir.propImplies(
+            gpa,
+            .prop_implies_nonoverlap,
+            try atomCycle(&ir, gpa, 0),
+            consequent,
+        );
+        const property = try ir.propRange(gpa, .prop_delay, 1, 2, implication);
+        const index = try addDirective(&ir, gpa, property, null);
+
+        var diagnostic: Diagnostic = undefined;
+        try testing.expectError(
+            error.UnsupportedConsequent,
+            assertion(gpa, &ir, index, .{}, &diagnostic),
+        );
+        try testing.expectEqual(property, diagnostic.node);
+    }
+    // An abort outside an implication. The trigger is the union of every
+    // attempt's antecedent, so there is no way to abort one attempt's antecedent
+    // and leave the others matching.
+    {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const consequent = try ir.propSeq(gpa, .prop_seq_weak, try atomCycle(&ir, gpa, 1));
+        const implication = try ir.propImplies(
+            gpa,
+            .prop_implies_nonoverlap,
+            try atomCycle(&ir, gpa, 0),
+            consequent,
+        );
+        const property = try ir.propAbort(
+            gpa,
+            .prop_accept_on,
+            try ir.atom(gpa, @enumFromInt(2)),
+            implication,
+        );
+        const index = try addDirective(&ir, gpa, property, null);
+        try testing.expectError(
+            error.UnsupportedConsequent,
+            assertion(gpa, &ir, index, .{}, null),
+        );
+    }
+}
+
+test "a junction of operands with different strength is refused" {
+    const gpa = testing.allocator;
+
+    // The pair is pending until both sides resolve, and a pending pair with one
+    // weak and one strong side has no single disposition to carry to the end of
+    // the trace. Refusing beats picking one.
+    for ([_]Ir.Node.Tag{ .prop_and, .prop_or }) |junction| {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const weak = try ir.propSeq(gpa, .prop_seq_weak, try atomCycle(&ir, gpa, 0));
+        const strong = try ir.propSeq(gpa, .prop_seq_strong, try atomCycle(&ir, gpa, 1));
+        const property = try ir.propJunction(gpa, junction, weak, strong);
+        const index = try addDirective(&ir, gpa, property, null);
+
+        var diagnostic: Diagnostic = undefined;
+        try testing.expectError(
+            error.MixedStrength,
+            assertion(gpa, &ir, index, .{}, &diagnostic),
+        );
+        try testing.expectEqual(property, diagnostic.node);
+    }
+}
+
+test "an abort below an operator that renumbers its operand is refused" {
+    const gpa = testing.allocator;
+
+    // An abort is a mask over obligation states. A shift and a disjunction move
+    // an operand's states as a block, so the mask survives; a product and a
+    // fusion do not, and an accept under a product would not be a mask operation
+    // at all — it has to record that one side of a pair is satisfied, which is a
+    // state remap.
+    //
+    // TODO: carrying a mask through a product needs the position mapping every
+    // combinator would have to publish. Until then these are refused.
+    const build = struct {
+        fn go(ir: *Ir, alloc: Allocator, over: Ir.Node.Tag) !Ir.Assertion.Index {
+            const guarded = try ir.propAbort(
+                alloc,
+                .prop_reject_on,
+                try ir.atom(alloc, @enumFromInt(1)),
+                try ir.propSeq(alloc, .prop_seq_weak, try atomCycle(ir, alloc, 0)),
+            );
+            const property = switch (over) {
+                .prop_and => try ir.propJunction(
+                    alloc,
+                    .prop_and,
+                    guarded,
+                    try ir.propSeq(alloc, .prop_seq_weak, try atomCycle(ir, alloc, 2)),
+                ),
+                .prop_always => try ir.propRange(alloc, .prop_always, 1, 2, guarded),
+                .prop_followed_by_overlap => try ir.propFollowedBy(
+                    alloc,
+                    .prop_followed_by_overlap,
+                    try atomCycle(ir, alloc, 2),
+                    guarded,
+                ),
+                else => unreachable,
+            };
+            return addDirective(ir, alloc, property, null);
+        }
+    }.go;
+
+    for ([_]Ir.Node.Tag{ .prop_and, .prop_always, .prop_followed_by_overlap }) |over| {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const index = try build(&ir, gpa, over);
+        try testing.expectError(
+            error.UnsupportedAbortScope,
+            assertion(gpa, &ir, index, .{}, null),
+        );
+    }
+
+    // The two that do carry it, for contrast: a disjunction and a shift.
+    {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const guarded = try ir.propAbort(
+            gpa,
+            .prop_reject_on,
+            try ir.atom(gpa, @enumFromInt(1)),
+            try ir.propSeq(gpa, .prop_seq_weak, try atomCycle(&ir, gpa, 0)),
+        );
+        const disjunction = try ir.propJunction(
+            gpa,
+            .prop_or,
+            guarded,
+            try ir.propSeq(gpa, .prop_seq_weak, try atomCycle(&ir, gpa, 2)),
+        );
+        const property = try ir.propRange(gpa, .prop_delay, 1, 2, disjunction);
+        const index = try addDirective(&ir, gpa, property, null);
+
+        var monitor = try assertion(gpa, &ir, index, .{}, null);
+        defer monitor.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), monitor.aborts.len);
+        // Still exactly the one state it started as, two operators later.
+        try testing.expectEqual(@as(u32, 1), @popCount(monitor.maskOf(0)[0]));
+    }
+}
+
+test "the sync forms differ from the plain ones only in which valuation they ask for" {
+    const gpa = testing.allocator;
+
+    // libsva is handed root bits already evaluated, so it cannot tell a sampled
+    // valuation from a live one and neither can any test here. What it *can* do
+    // is carry the request to the backend, which is the whole of the `sync_`
+    // distinction at this layer — exactly as `Assertion.reset` carries it.
+    //
+    // Anything past this is a front-end obligation and unverifiable from inside
+    // the library.
+    const Case = struct { tag: Ir.Node.Tag, effect: Monitor.Abort.Effect, sampled: bool };
+    for ([_]Case{
+        .{ .tag = .prop_accept_on, .effect = .accept, .sampled = false },
+        .{ .tag = .prop_reject_on, .effect = .reject, .sampled = false },
+        .{ .tag = .prop_sync_accept_on, .effect = .accept, .sampled = true },
+        .{ .tag = .prop_sync_reject_on, .effect = .reject, .sampled = true },
+    }) |case| {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const body = try ir.propSeq(gpa, .prop_seq_weak, try atomCycle(&ir, gpa, 0));
+        const property = try ir.propAbort(gpa, case.tag, try ir.atom(gpa, @enumFromInt(1)), body);
+        const index = try addDirective(&ir, gpa, property, null);
+
+        var monitor = try assertion(gpa, &ir, index, .{}, null);
+        defer monitor.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), monitor.aborts.len);
+        try testing.expectEqual(case.effect, monitor.aborts[0].effect);
+        try testing.expectEqual(case.sampled, monitor.aborts[0].sampled);
+        // The condition is a root of its own, kept whether or not a guard
+        // mentions it, exactly like the reset.
+        try testing.expect(monitor.aborts[0].cond < monitor.alphabet.roots.len);
+    }
+}
+
+/// One way of spelling a property, for the mutation sweep below.
+const Spelling = enum {
+    conjunction,
+    disjunction,
+    nexttime_1,
+    nexttime_2,
+    nexttime_3,
+    always_1_2,
+    eventually_1_2,
+    followed_by_overlap,
+    followed_by_nonoverlap,
+    implies_overlap,
+    accept_on,
+    reject_on,
+    reset_wide,
+    abort_in_shift,
+    abort_over_shift,
+    reject_in_or,
+    reject_over_or,
+
+    /// Atom 0 is the body's term, atom 1 the abort condition, atom 2 a second
+    /// body term, so every spelling here is comparable against every other.
+    fn build(spelling: Spelling, ir: *Ir, gpa: Allocator) !Ir.Assertion.Index {
+        const cond = try ir.atom(gpa, @enumFromInt(1));
+        const now = try ir.propSeq(gpa, .prop_seq_weak, try atomCycle(ir, gpa, 0));
+        const next = try ir.propSeq(gpa, .prop_seq_weak, try leadingDelay(
+            ir,
+            gpa,
+            1,
+            1,
+            try atomCycle(ir, gpa, 0),
+        ));
+        const later = try ir.propSeq(gpa, .prop_seq_weak, try leadingDelay(
+            ir,
+            gpa,
+            2,
+            2,
+            try atomCycle(ir, gpa, 2),
+        ));
+        const other = try ir.propSeq(gpa, .prop_seq_weak, try atomCycle(ir, gpa, 2));
+
+        const property = switch (spelling) {
+            .conjunction => try ir.propJunction(gpa, .prop_and, now, later),
+            .disjunction => try ir.propJunction(gpa, .prop_or, now, later),
+            .nexttime_1 => try ir.propRange(gpa, .prop_delay, 1, 1, now),
+            .nexttime_2 => try ir.propRange(gpa, .prop_delay, 2, 2, now),
+            .nexttime_3 => try ir.propRange(gpa, .prop_delay, 3, 3, now),
+            .always_1_2 => try ir.propRange(gpa, .prop_always, 1, 2, now),
+            .eventually_1_2 => try ir.propRange(gpa, .prop_delay, 1, 2, now),
+            .followed_by_overlap => try ir.propFollowedBy(
+                gpa,
+                .prop_followed_by_overlap,
+                try atomCycle(ir, gpa, 0),
+                other,
+            ),
+            .followed_by_nonoverlap => try ir.propFollowedBy(
+                gpa,
+                .prop_followed_by_nonoverlap,
+                try atomCycle(ir, gpa, 0),
+                other,
+            ),
+            .implies_overlap => try ir.propImplies(
+                gpa,
+                .prop_implies_overlap,
+                try atomCycle(ir, gpa, 0),
+                other,
+            ),
+            .accept_on => try ir.propAbort(gpa, .prop_accept_on, cond, next),
+            .reject_on => try ir.propAbort(gpa, .prop_reject_on, cond, next),
+            // The same obligation with the condition as the directive's reset:
+            // `disable iff` rather than an abort.
+            .reset_wide => return addDirective(ir, gpa, next, cond),
+            .abort_in_shift => try ir.propRange(
+                gpa,
+                .prop_delay,
+                2,
+                2,
+                try ir.propAbort(gpa, .prop_accept_on, cond, now),
+            ),
+            .abort_over_shift => try ir.propAbort(
+                gpa,
+                .prop_accept_on,
+                cond,
+                try ir.propRange(gpa, .prop_delay, 2, 2, now),
+            ),
+            .reject_in_or => try ir.propJunction(
+                gpa,
+                .prop_or,
+                try ir.propAbort(gpa, .prop_reject_on, cond, next),
+                later,
+            ),
+            .reject_over_or => try ir.propAbort(
+                gpa,
+                .prop_reject_on,
+                cond,
+                try ir.propJunction(gpa, .prop_or, next, later),
+            ),
+        };
+        return addDirective(ir, gpa, property, null);
+    }
+};
+
+test "mutation sweep: every wrong spelling is reachable by a test" {
+    const gpa = testing.allocator;
+
+    // A mutation sweep with no compiler to mutate. Each row is a way of getting
+    // one of these operators wrong that the *lowering* could plausibly implement
+    // — a swapped tag, an off-by-one offset, a mask that is too wide, an abort
+    // lowered as a reset — spelled out as the IR it would have produced. If the
+    // right and wrong spellings are indistinguishable over every short trace,
+    // then no test can be failing on that mutation and the operator is untested
+    // however green the suite is.
+    //
+    // `killed_by` names the test that does the failing. That test and this row
+    // are a pair: this one shows the mutation is observable, that one shows the
+    // observation is checked against the semantics.
+    const Mutation = struct {
+        right: Spelling,
+        wrong: Spelling,
+        killed_by: []const u8,
+    };
+    for ([_]Mutation{
+        .{
+            .right = .conjunction,
+            .wrong = .disjunction,
+            .killed_by = "differential: property conjunction and disjunction",
+        },
+        .{
+            .right = .nexttime_2,
+            .wrong = .nexttime_1,
+            .killed_by = "differential: nexttime, bounded eventually and bounded always",
+        },
+        .{
+            .right = .nexttime_2,
+            .wrong = .nexttime_3,
+            .killed_by = "differential: nexttime, bounded eventually and bounded always",
+        },
+        // The conjunctive and disjunctive readings of one range. This is the
+        // mutation a shared delay spine would have made invisible.
+        .{
+            .right = .always_1_2,
+            .wrong = .eventually_1_2,
+            .killed_by = "differential: nexttime, bounded eventually and bounded always",
+        },
+        .{
+            .right = .followed_by_overlap,
+            .wrong = .followed_by_nonoverlap,
+            .killed_by = "differential: followed-by",
+        },
+        // Followed-by lowered as though it were implication: the same automaton
+        // with vacuity the right way up instead of inverted.
+        .{
+            .right = .followed_by_overlap,
+            .wrong = .implies_overlap,
+            .killed_by = "followed-by fails where implication holds vacuously",
+        },
+        .{
+            .right = .accept_on,
+            .wrong = .reject_on,
+            .killed_by = "differential: an accept abort and a reject abort",
+        },
+        // The one the scoping document called out: an accept *discharges* and a
+        // reset *abandons*, and lowering the first as the second suppresses the
+        // same failures while producing none of the passes.
+        .{
+            .right = .accept_on,
+            .wrong = .reset_wide,
+            .killed_by = "an accept discharges where a reset abandons",
+        },
+        // A mask covering the whole obligation instead of the abort's subtree,
+        // which arms the abort during the cycles before its property starts.
+        .{
+            .right = .abort_in_shift,
+            .wrong = .abort_over_shift,
+            .killed_by = "an abort covers its own subtree and not the cycles before it",
+        },
+        // A reject under a disjunction left resolving the whole attempt instead
+        // of being demoted to its own branch.
+        .{
+            .right = .reject_in_or,
+            .wrong = .reject_over_or,
+            .killed_by = "a reject under a disjunction kills only its own disjunct",
+        },
+    }) |mutation| {
+        var right: Ir = .init();
+        defer right.deinit(gpa);
+        const right_index = try mutation.right.build(&right, gpa);
+
+        var wrong: Ir = .init();
+        defer wrong.deinit(gpa);
+        const wrong_index = try mutation.wrong.build(&wrong, gpa);
+
+        var a: std.ArrayListUnmanaged(u32) = .empty;
+        defer a.deinit(gpa);
+        var b: std.ArrayListUnmanaged(u32) = .empty;
+        defer b.deinit(gpa);
+        try behaviour(gpa, &right, right_index, 3, 4, &a);
+        try behaviour(gpa, &wrong, wrong_index, 3, 4, &b);
+
+        if (std.mem.eql(u32, a.items, b.items)) {
+            std.debug.print(
+                "mutant {s} -> {s} is indistinguishable; '{s}' cannot be failing on it\n",
+                .{ @tagName(mutation.right), @tagName(mutation.wrong), mutation.killed_by },
+            );
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test {

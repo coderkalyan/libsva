@@ -97,6 +97,14 @@
 //! An implication attempt holds vacuously if its antecedent never completes a
 //! match; otherwise every antecedent match obliges the consequent property,
 //! and the attempt fails if any of those consequent attempts fails.
+//! Followed-by is the same shape read existentially: it needs *some* match of
+//! the antecedent with the consequent holding after it, so an antecedent that
+//! never matches makes it fail where it would make an implication hold.
+//!
+//! `prop_and` and `prop_or` combine verdicts rather than matches — each
+//! operand keeps its own schedule, and the conjunction is pending until both
+//! have resolved. `prop_delay` and `prop_always` shift a property by a range of
+//! cycles, disjunctively and conjunctively respectively.
 //!
 //! A finite trace ends with attempts still pending, and their disposition is
 //! the property's **strength**:
@@ -105,11 +113,27 @@
 //!   - A *strong* property requires the obligation to have been met within the
 //!     trace: it fails.
 //!
-//! Strength is carried by `prop_seq_weak`/`prop_seq_strong`; implication takes
-//! its strength from its consequent, and a never-completed antecedent is
-//! vacuous under either — strength governs the consequent, not the trigger. On
-//! an infinite trace the distinction is only observable for obligations that
-//! are never resolved.
+//! Strength is carried by `prop_seq_weak`/`prop_seq_strong`; every operator
+//! above them takes its strength from its operands. Implication takes it from
+//! the consequent, and a never-completed antecedent is vacuous under either —
+//! strength governs the consequent, not the trigger. `prop_and` and `prop_or`
+//! require their two operands to agree, because a pending conjunction of a
+//! weak and a strong operand has no single end-of-trace disposition. On an
+//! infinite trace the distinction is only observable for obligations that are
+//! never resolved.
+//!
+//! ## Aborts
+//!
+//! An abort (`prop_accept_on`, `prop_reject_on`, and their `sync_` forms)
+//! resolves the property beneath it the moment its condition holds, while that
+//! property is still being evaluated: an accept resolves it as holding, a
+//! reject as failing. It is scoped to that subtree, so an abort below an
+//! implication leaves the antecedent alone and later matches of it still raise
+//! obligations.
+//!
+//! This is the distinction against `reset` below, and it is not a shade of
+//! meaning: a reset **abandons**, leaving no verdict at all, while an accept
+//! **discharges**, which is a pass a `cover` counts.
 //!
 //! ## Empty matches
 //!
@@ -333,6 +357,78 @@ pub const Node = struct {
         /// sequence, `rhs` = consequent property.
         prop_implies_nonoverlap,
 
+        /// Property conjunction: both operands must hold, each on its own
+        /// schedule. `lhs`, `rhs` = property nodes.
+        ///
+        /// Not the same shape as `seq_and` one layer down even though it
+        /// lowers onto it: this is a conjunction of *verdicts*, and it is only
+        /// `seq_and` because a sequence property holds exactly when its
+        /// sequence has a match, so "both hold" is "both have a match" is a
+        /// match of `seq_and`. Both operands must carry the same strength —
+        /// a pending conjunction of a weak and a strong operand has no single
+        /// end-of-trace disposition, and the lowering rejects it.
+        prop_and,
+        /// Property disjunction: either operand holding is enough. `lhs`,
+        /// `rhs` = property nodes. Same strength requirement as `prop_and`.
+        prop_or,
+        /// The operand property, evaluated `lo..hi` cycles later than this
+        /// node. `lhs` = property node, `rhs` = `extra` index of `[lo, hi]`.
+        ///
+        /// The range is *disjunctive*: the property need only hold at some one
+        /// offset in it. So `nexttime[n] p` is `lo == hi == n`, and
+        /// `eventually [m:n] p` is `lo = m, hi = n`. `always [m:n] p` is the
+        /// conjunctive reading and is `prop_always`.
+        ///
+        /// `hi == unbounded` spells the unbounded `s_eventually p`, which the
+        /// lowering rejects: it leaves the obligation without a longest match.
+        prop_delay,
+        /// The operand property, holding at *every* offset in `lo..hi`. `lhs` =
+        /// property node, `rhs` = `extra` index of `[lo, hi]`.
+        ///
+        /// The conjunctive counterpart of `prop_delay`; the two coincide when
+        /// `lo == hi`. `hi == unbounded` spells the unbounded `always p`, which
+        /// the lowering rejects for the same reason.
+        prop_always,
+        /// Overlapping followed-by: *some* match of the antecedent sequence is
+        /// followed by the consequent property holding from that match's last
+        /// cycle. `lhs` = antecedent sequence, `rhs` = consequent property.
+        ///
+        /// The existential dual of `prop_implies_overlap`, and not a verdict
+        /// inversion of it: where implication is vacuously true when the
+        /// antecedent never matches, followed-by *fails* there, because it
+        /// asserts a witness exists. LRM 16.12.9 defines it as
+        /// `not (seq |-> not prop)`, and negating both quantifier and vacuity
+        /// is what turns it into a plain concatenation — see `Glushkov`.
+        prop_followed_by_overlap,
+        /// Non-overlapping followed-by: as `prop_followed_by_overlap`, but the
+        /// consequent starts at the cycle after the match. `lhs` = antecedent
+        /// sequence, `rhs` = consequent property.
+        prop_followed_by_nonoverlap,
+        /// `accept_on`: the operand property is *discharged* — it holds — from
+        /// the moment the condition holds, whatever the operand was going to
+        /// do. `lhs` = condition boolean, `rhs` = property node.
+        ///
+        /// This is what distinguishes an abort from `Assertion.reset`: a reset
+        /// *abandons* an attempt, which neither holds nor fails, while an
+        /// accept resolves it in favour of holding.
+        ///
+        /// The condition is read from **live** values, like a reset and unlike
+        /// every other boolean in the tree (LRM 16.15). The `sync_` form below
+        /// is the sampled one. Which of the two a root wants is recorded on
+        /// `Monitor.Abort` for a backend to honour; nothing in this IR can
+        /// check it.
+        prop_accept_on,
+        /// `reject_on`: the operand property *fails* from the moment the
+        /// condition holds. `lhs` = condition boolean, `rhs` = property node.
+        /// Live-valued, as `prop_accept_on`.
+        prop_reject_on,
+        /// `sync_accept_on`: `prop_accept_on` with the condition read from
+        /// **sampled** values. `lhs` = condition boolean, `rhs` = property.
+        prop_sync_accept_on,
+        /// `sync_reject_on`: `prop_reject_on` with the condition read from
+        /// **sampled** values. `lhs` = condition boolean, `rhs` = property.
+        prop_sync_reject_on,
+
         /// Which of the three layers a tag belongs to. Operands are checked
         /// against this when a node is built.
         pub const Layer = enum(u8) { boolean, sequence, property };
@@ -355,6 +451,16 @@ pub const Node = struct {
                 .prop_seq_strong,
                 .prop_implies_overlap,
                 .prop_implies_nonoverlap,
+                .prop_and,
+                .prop_or,
+                .prop_delay,
+                .prop_always,
+                .prop_followed_by_overlap,
+                .prop_followed_by_nonoverlap,
+                .prop_accept_on,
+                .prop_reject_on,
+                .prop_sync_accept_on,
+                .prop_sync_reject_on,
                 => .property,
             };
         }
@@ -665,6 +771,101 @@ pub fn propImplies(
     } });
 }
 
+/// Property conjunction or disjunction per `tag` (`prop_and` or `prop_or`).
+///
+/// Both operands must end up carrying the same strength; that is a property of
+/// their subtrees rather than of the operands' own tags, so it is the lowering
+/// that checks it, not this constructor.
+pub fn propJunction(
+    ir: *Ir,
+    gpa: Allocator,
+    tag: Node.Tag,
+    lhs: Node.Index,
+    rhs: Node.Index,
+) Allocator.Error!Node.Index {
+    std.debug.assert(tag == .prop_and or tag == .prop_or);
+    ir.assertOperand(lhs, .property);
+    ir.assertOperand(rhs, .property);
+    return ir.addNode(gpa, .{ .tag = tag, .data = .{
+        .lhs = @intFromEnum(lhs),
+        .rhs = @intFromEnum(rhs),
+    } });
+}
+
+/// A property shifted by a range of cycles, per `tag`.
+///
+///   - `prop_delay` reads `lo..hi` disjunctively: `prop` need hold at only one
+///     offset in it. `nexttime[n]` is `lo == hi == n`; `eventually [m:n]` is
+///     the wider range.
+///   - `prop_always` reads it conjunctively: `prop` must hold at every offset.
+///
+/// `hi == unbounded` is accepted here and rejected by the lowering, which is
+/// where a missing longest match is diagnosed for every other operator too.
+pub fn propRange(
+    ir: *Ir,
+    gpa: Allocator,
+    tag: Node.Tag,
+    lo: u32,
+    hi: u32,
+    prop: Node.Index,
+) Allocator.Error!Node.Index {
+    std.debug.assert(tag == .prop_delay or tag == .prop_always);
+    ir.assertOperand(prop, .property);
+    std.debug.assert(lo <= hi);
+
+    const start = try ir.addExtra(gpa, &.{ lo, hi });
+    return ir.addNode(gpa, .{ .tag = tag, .data = .{
+        .lhs = @intFromEnum(prop),
+        .rhs = @intFromEnum(start),
+    } });
+}
+
+/// Followed-by, overlapping or not per `tag` (`prop_followed_by_overlap` or
+/// `prop_followed_by_nonoverlap`): *some* match of `antecedent` is followed by
+/// `consequent` holding, from that match's last cycle or the one after it.
+///
+/// The existential dual of `propImplies`. An antecedent that never matches
+/// makes an implication hold vacuously and makes this fail.
+pub fn propFollowedBy(
+    ir: *Ir,
+    gpa: Allocator,
+    tag: Node.Tag,
+    antecedent: Node.Index,
+    consequent: Node.Index,
+) Allocator.Error!Node.Index {
+    std.debug.assert(tag == .prop_followed_by_overlap or tag == .prop_followed_by_nonoverlap);
+    ir.assertOperand(antecedent, .sequence);
+    ir.assertOperand(consequent, .property);
+    return ir.addNode(gpa, .{ .tag = tag, .data = .{
+        .lhs = @intFromEnum(antecedent),
+        .rhs = @intFromEnum(consequent),
+    } });
+}
+
+/// An abort scoped to `prop`: `accept_on`, `reject_on`, or either one's `sync_`
+/// form, per `tag`. While `prop` is being evaluated, `cond` holding resolves it
+/// immediately — as holding for an accept, as failing for a reject.
+///
+/// The `sync_` tags read `cond` from sampled values and the plain ones from
+/// live values, exactly as `Assertion.reset` does. Supplying a term that
+/// matches the tag is the front-end's job; see `Monitor.Abort.sampled`.
+pub fn propAbort(
+    ir: *Ir,
+    gpa: Allocator,
+    tag: Node.Tag,
+    cond: Node.Index,
+    prop: Node.Index,
+) Allocator.Error!Node.Index {
+    std.debug.assert(tag == .prop_accept_on or tag == .prop_reject_on or
+        tag == .prop_sync_accept_on or tag == .prop_sync_reject_on);
+    ir.assertOperand(cond, .boolean);
+    ir.assertOperand(prop, .property);
+    return ir.addNode(gpa, .{ .tag = tag, .data = .{
+        .lhs = @intFromEnum(cond),
+        .rhs = @intFromEnum(prop),
+    } });
+}
+
 // -- Accessors ---------------------------------------------------------------
 
 pub fn tagOf(ir: *const Ir, node: Node.Index) Node.Tag {
@@ -690,7 +891,8 @@ pub fn operandsOf(ir: *const Ir, node: Node.Index, buf: *[max_operands]Node.Inde
     switch (ir.tagOf(node)) {
         // Payload in `lhs`, no edges.
         .bool_const, .atom => return buf[0..0],
-        // One operand in `lhs`; for the repetitions `rhs` is an `extra` offset.
+        // One operand in `lhs`; `rhs` is an `extra` offset for the repetitions
+        // and for the ranged property operators.
         .bnot,
         .seq_boolean,
         .seq_first_match,
@@ -699,6 +901,8 @@ pub fn operandsOf(ir: *const Ir, node: Node.Index, buf: *[max_operands]Node.Inde
         .seq_repeat_nonconsec,
         .prop_seq_weak,
         .prop_seq_strong,
+        .prop_delay,
+        .prop_always,
         => {
             buf[0] = @enumFromInt(d.lhs);
             return buf[0..1];
@@ -712,6 +916,14 @@ pub fn operandsOf(ir: *const Ir, node: Node.Index, buf: *[max_operands]Node.Inde
         .seq_throughout,
         .prop_implies_overlap,
         .prop_implies_nonoverlap,
+        .prop_and,
+        .prop_or,
+        .prop_followed_by_overlap,
+        .prop_followed_by_nonoverlap,
+        .prop_accept_on,
+        .prop_reject_on,
+        .prop_sync_accept_on,
+        .prop_sync_reject_on,
         => {
             buf[0] = @enumFromInt(d.lhs);
             buf[1] = @enumFromInt(d.rhs);
@@ -767,6 +979,25 @@ pub fn repeatOf(ir: *const Ir, node: Node.Index) Repeat {
     const d = ir.dataOf(node);
     const p = ir.extra.items[d.rhs..][0..2];
     return .{ .seq = @enumFromInt(d.lhs), .lo = p[0], .hi = p[1] };
+}
+
+/// Decoded payload of a `prop_delay` or `prop_always` node. Which of the two
+/// reads the range disjunctively is the node's tag.
+pub const PropRange = struct {
+    /// The shifted property.
+    prop: Node.Index,
+    /// Minimum offset in cycles. `0` is the property at this very cycle.
+    lo: u32,
+    /// Maximum offset in cycles, or `unbounded`.
+    hi: u32,
+};
+
+pub fn propRangeOf(ir: *const Ir, node: Node.Index) PropRange {
+    const tag = ir.tagOf(node);
+    std.debug.assert(tag == .prop_delay or tag == .prop_always);
+    const d = ir.dataOf(node);
+    const p = ir.extra.items[d.rhs..][0..2];
+    return .{ .prop = @enumFromInt(d.lhs), .lo = p[0], .hi = p[1] };
 }
 
 // -- Hashing -----------------------------------------------------------------
@@ -826,7 +1057,7 @@ pub const magic: [4]u8 = .{ 'S', 'V', 'A', 'B' };
 /// On-disk format version. The IR reserves no space for future operators, so
 /// this is bumped on any layout *or* `Node.Tag` change; readers reject a
 /// mismatch and the caller recompiles from source.
-pub const format_version: u32 = 6;
+pub const format_version: u32 = 7;
 
 const checksum_len = Blake3.digest_length;
 /// Bytes preceding the first payload word: `magic` + `format_version`.
@@ -1043,6 +1274,14 @@ test "operandsOf is the exhaustive walk" {
         soonest,
         try ir.propSeq(gpa, .prop_seq_strong, sx),
     );
+    // The property layer above it. `propRange` is the second shape that keeps an
+    // operand outside `data`: its range lives in `extra`, so `rhs` is an offset
+    // and a naive walk would follow it as an edge.
+    const shifted = try ir.propRange(gpa, .prop_delay, 1, 2, prop);
+    const bounded = try ir.propRange(gpa, .prop_always, 0, 3, shifted);
+    const pair = try ir.propJunction(gpa, .prop_or, bounded, shifted);
+    const witnessed = try ir.propFollowedBy(gpa, .prop_followed_by_overlap, sx, pair);
+    const guarded = try ir.propAbort(gpa, .prop_sync_reject_on, y, witnessed);
 
     // The whole graph is reachable from the root, every edge points backwards,
     // and no leaf payload is mistaken for an edge.
@@ -1052,7 +1291,7 @@ test "operandsOf is the exhaustive walk" {
 
     var stack: std.ArrayListUnmanaged(Node.Index) = .empty;
     defer stack.deinit(gpa);
-    try stack.append(gpa, prop);
+    try stack.append(gpa, guarded);
     while (stack.pop()) |node| {
         seen.set(@intFromEnum(node));
         for (ir.operandsOf(node, &buf)) |operand| {
@@ -1068,6 +1307,17 @@ test "operandsOf is the exhaustive walk" {
     try std.testing.expectEqualSlices(Node.Index, &.{ always, rep }, ir.operandsOf(lead, &buf));
     try std.testing.expectEqualSlices(Node.Index, &.{ sx, lead }, ir.operandsOf(cat, &buf));
     try std.testing.expectEqualSlices(Node.Index, &.{alt}, ir.operandsOf(soonest, &buf));
+    try std.testing.expectEqualSlices(Node.Index, &.{prop}, ir.operandsOf(shifted, &buf));
+    try std.testing.expectEqualSlices(Node.Index, &.{shifted}, ir.operandsOf(bounded, &buf));
+    try std.testing.expectEqualSlices(Node.Index, &.{ sx, pair }, ir.operandsOf(witnessed, &buf));
+    try std.testing.expectEqualSlices(Node.Index, &.{ y, witnessed }, ir.operandsOf(guarded, &buf));
+
+    // The range survives the round trip through `extra`.
+    try std.testing.expectEqual(PropRange{ .prop = prop, .lo = 1, .hi = 2 }, ir.propRangeOf(shifted));
+    try std.testing.expectEqual(
+        PropRange{ .prop = shifted, .lo = 0, .hi = 3 },
+        ir.propRangeOf(bounded),
+    );
 }
 
 test "sequence properties carry strength" {

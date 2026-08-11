@@ -37,14 +37,22 @@
 //!  5. Advance every pending obligation attempt.
 //!  6. Seed a new attempt: every cycle when there is no trigger, in the cycle
 //!     the trigger fires for `|->`, and the cycle after for `|=>`.
-//!  7. Take verdicts. An attempt that reached an accepting state is discharged;
+//!  7. Apply every armed `Abort` whose condition holds. An abort is armed for
+//!     an attempt when that attempt has a live state in the abort's mask.
+//!  8. Take verdicts. An attempt that reached an accepting state is discharged;
 //!     one with no live states failed. Both leave the ring.
-//!  8. When a finite trace ends, a still-pending attempt holds if the property
+//!  9. When a finite trace ends, a still-pending attempt holds if the property
 //!     is weak and fails if it is strong.
 //!
 //! Seeding before taking verdicts is not incidental: under `|->` the obligation
 //! starts on the trigger's last cycle, so a one-cycle consequent has to be able
-//! to discharge in the cycle it was created.
+//! to discharge in the cycle it was created. Aborting between the two is the
+//! same argument — an `accept_on` whose condition holds in the cycle an attempt
+//! starts discharges that attempt.
+//!
+//! Note what step 2 and step 7 do differently, because it is the difference
+//! between `disable iff` and `accept_on`: a reset *abandons*, so the attempt
+//! leaves no verdict behind, while an accept *discharges*, which is a pass.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -80,6 +88,12 @@ strength: Strength,
 /// assertion that never resets carries a constant false there, which costs a
 /// backend nothing to fold away and costs this one branch fewer.
 reset: u32,
+/// Aborts scoped to part of the obligation, in no particular order. Empty for
+/// a property that has none, which is the common case.
+aborts: []Abort,
+/// One obligation-state mask per entry of `aborts`, in that order and each
+/// `obligation.words` long. Read it with `maskOf`.
+abort_masks: []Word,
 
 pub const Strength = enum(u8) {
     /// A pending attempt holds when the trace ends.
@@ -88,10 +102,62 @@ pub const Strength = enum(u8) {
     strong,
 };
 
+/// An abort scoped to a subtree of the obligation: `accept_on` and friends.
+///
+/// Where `reset` abandons every attempt of the whole monitor, an abort resolves
+/// one attempt and only while the subtree it guards is still being evaluated.
+/// Which states those are is `maskOf`, and an abort is *armed* for an attempt
+/// exactly when that attempt has a live state in the mask — so the two cycles
+/// `nexttime[2] (reject_on(b) p)` spends in its filler chain are cycles the
+/// abort cannot fire in, without anything having to track a window.
+pub const Abort = struct {
+    /// Index into `alphabet.roots` of the condition.
+    cond: u32,
+    /// What firing does to the attempt.
+    effect: Effect,
+    /// How far up the property that effect reaches.
+    scope: Scope,
+    /// Which valuation of `cond` a backend must supply: the sampled one for
+    /// `sync_accept_on`/`sync_reject_on`, the live one for the plain forms
+    /// (LRM 16.15, exactly as for `reset`).
+    ///
+    /// Metadata. This runtime reads every root out of one array it is handed,
+    /// so nothing here can enforce it; it is a contract on whoever evaluates
+    /// the roots, and the only reason it rides on the monitor is that a backend
+    /// has no other way to learn it.
+    sampled: bool,
+
+    pub const Effect = enum(u8) {
+        /// The attempt is discharged: it holds, and a `cover` counts it.
+        accept,
+        /// The attempt fails.
+        reject,
+    };
+
+    pub const Scope = enum(u8) {
+        /// Firing resolves the whole attempt. An accept always does — a
+        /// disjunct holding makes the disjunction hold — and so does a reject
+        /// with nothing but conjunctions and shifts above it.
+        attempt,
+        /// Firing only kills the threads in the mask, leaving the rest of the
+        /// attempt to run on. A reject under a disjunction: that disjunct is
+        /// dead, the other may still hold.
+        branch,
+    };
+};
+
 pub fn deinit(monitor: *Monitor, gpa: Allocator) void {
     monitor.alphabet.deinit(gpa);
     if (monitor.trigger) |*trigger| trigger.deinit(gpa);
     monitor.obligation.deinit(gpa);
+    gpa.free(monitor.aborts);
+    gpa.free(monitor.abort_masks);
+}
+
+/// The obligation states the abort at `index` guards.
+pub fn maskOf(monitor: *const Monitor, index: usize) []const Word {
+    const words = monitor.obligation.words;
+    return monitor.abort_masks[index * words ..][0..words];
 }
 
 /// What one cycle did. A `cover` counts `matches`; an `assert` reports
@@ -126,6 +192,13 @@ pub const State = struct {
     occupied: []bool,
     /// Whether the trigger matched in the previous cycle, for `|=>`.
     fired: bool,
+    /// `aborts.len * depth` flags: whether an abort's subtree could hold a
+    /// thread of that attempt this cycle. Set before the advance from the
+    /// reachable set rather than the live one — see `step`. Empty when there are
+    /// no aborts.
+    abort_entered: []bool,
+    /// One obligation mask of scratch for computing that reachable set.
+    abort_reach: []Word,
     scratch: []Word,
 
     pub fn init(gpa: Allocator, monitor: *const Monitor) Allocator.Error!State {
@@ -144,6 +217,10 @@ pub const State = struct {
         errdefer gpa.free(pending);
         const occupied = try gpa.alloc(bool, monitor.depth);
         errdefer gpa.free(occupied);
+        const abort_entered = try gpa.alloc(bool, monitor.aborts.len * monitor.depth);
+        errdefer gpa.free(abort_entered);
+        const abort_reach = try gpa.alloc(Word, obligation_words);
+        errdefer gpa.free(abort_reach);
         const scratch = try gpa.alloc(Word, @max(trigger_words, obligation_words));
 
         var state: State = .{
@@ -155,6 +232,8 @@ pub const State = struct {
             .pending = pending,
             .occupied = occupied,
             .fired = false,
+            .abort_entered = abort_entered,
+            .abort_reach = abort_reach,
             .scratch = scratch,
         };
         state.clear();
@@ -168,6 +247,8 @@ pub const State = struct {
         gpa.free(state.trigger_current);
         gpa.free(state.pending);
         gpa.free(state.occupied);
+        gpa.free(state.abort_entered);
+        gpa.free(state.abort_reach);
         gpa.free(state.scratch);
     }
 
@@ -176,6 +257,7 @@ pub const State = struct {
         @memset(state.trigger_current, 0);
         @memset(state.pending, 0);
         @memset(state.occupied, false);
+        @memset(state.abort_entered, false);
         state.fired = false;
     }
 
@@ -218,6 +300,34 @@ pub const State = struct {
             fires = trigger.matched(state.trigger_current);
         }
 
+        // Which aborts each attempt is inside for this cycle, guards aside.
+        //
+        // An abort covers every cycle its subtree could hold a thread in, which
+        // is the reachable set rather than the live one. Both ends of that
+        // matter and neither is the live set: the cycle a subtree is *entered*
+        // in is one its guard may already fail in, and the cycle its last thread
+        // dies in is one it was still being evaluated in. LRM 16.12.7 arms an
+        // abort at any point during the evaluation attempt, and both are such a
+        // point — `nexttime[2] (accept_on(b) p)` over a `p` that fails
+        // immediately is the case where they coincide and the live set is empty
+        // either side of the advance.
+        const depth = monitor.depth;
+        @memset(state.abort_entered, false);
+        if (monitor.aborts.len != 0) {
+            for (state.occupied, 0..) |busy, slot| {
+                if (!busy) continue;
+                @memset(state.abort_reach, 0);
+                var live: Nfa.BitIterator = .init(state.slotOf(@intCast(slot)));
+                while (live.next()) |from| {
+                    Nfa.bitUnion(state.abort_reach, monitor.obligation.followOf(from));
+                }
+                for (monitor.aborts, 0..) |_, index| {
+                    state.abort_entered[index * depth + slot] =
+                        Nfa.bitOverlaps(state.abort_reach, monitor.maskOf(index));
+                }
+            }
+        }
+
         const next = state.scratch[0..monitor.obligation.words];
         for (state.occupied, 0..) |busy, slot| {
             if (!busy) continue;
@@ -241,10 +351,54 @@ pub const State = struct {
             @memset(current, 0);
             monitor.obligation.seed(state.obligation_satisfied, current);
             state.occupied[slot] = true;
+            // A fresh attempt reaches the entry states, guards aside.
+            for (monitor.aborts, 0..) |_, index| {
+                if (Nfa.bitOverlaps(monitor.obligation.first, monitor.maskOf(index))) {
+                    state.abort_entered[index * depth + slot] = true;
+                }
+            }
         }
         state.fired = fires;
 
         var report: Report = .{};
+
+        // Aborts resolve an attempt before it would have resolved itself. Each
+        // is checked against every attempt separately, because being armed is a
+        // per-attempt question: the subtree the abort guards has to still be
+        // under evaluation *in this attempt* for aborting it to mean anything.
+        //
+        // This runs after seeding for the same reason step 6 does — an abort
+        // whose condition holds in the cycle an attempt starts applies to that
+        // attempt — and before verdicts, because resolving early is the whole
+        // point.
+        for (monitor.aborts, 0..) |abort, index| {
+            if (!Nfa.bitIsSet(root_bits, abort.cond)) continue;
+            const mask = monitor.maskOf(index);
+            for (state.occupied, 0..) |busy, slot| {
+                if (!busy) continue;
+                // Armed if the abort's subtree could hold a thread of this
+                // attempt this cycle. That is the reachable set, computed above:
+                // the live set would miss both the cycle the subtree is entered
+                // in and the cycle its last thread dies in.
+                if (!state.abort_entered[index * depth + slot]) continue;
+                const current = state.slotOf(@intCast(slot));
+                switch (abort.scope) {
+                    .attempt => {
+                        switch (abort.effect) {
+                            .accept => report.matches += 1,
+                            .reject => report.failures += 1,
+                        }
+                        @memset(current, 0);
+                        state.occupied[slot] = false;
+                    },
+                    // The guarded threads die; whether that kills the attempt
+                    // is the ordinary verdict below deciding it has no live
+                    // states left.
+                    .branch => Nfa.bitSubtract(current, mask),
+                }
+            }
+        }
+
         for (state.occupied, 0..) |busy, slot| {
             if (!busy) continue;
             const current = state.slotOf(@intCast(slot));

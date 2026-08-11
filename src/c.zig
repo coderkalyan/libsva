@@ -52,6 +52,8 @@ const Status = enum(c_int) {
     unbounded_obligation = 4,
     unsupported_consequent = 5,
     unsupported_repeat_operand = 6,
+    mixed_strength = 7,
+    unsupported_abort_scope = 8,
 
     fn of(err: glushkov.Error) Status {
         return switch (err) {
@@ -61,6 +63,8 @@ const Status = enum(c_int) {
             error.ObligationNotBounded => .unbounded_obligation,
             error.UnsupportedConsequent => .unsupported_consequent,
             error.UnsupportedRepeatOperand => .unsupported_repeat_operand,
+            error.MixedStrength => .mixed_strength,
+            error.UnsupportedAbortScope => .unsupported_abort_scope,
         };
     }
 };
@@ -211,6 +215,80 @@ export fn sva_prop_implies(
     return deliver(out, ir.propImplies(gpa, tag, @enumFromInt(antecedent), @enumFromInt(consequent)));
 }
 
+const Junction = enum(c_int) { conjunction, disjunction };
+
+/// `p and q` / `p or q` over two *properties*. Both operands must carry the same
+/// strength; `sva_lower` reports `SVA_ERROR_MIXED_STRENGTH` if they do not.
+export fn sva_prop_junction(ir: *Ir, kind: Junction, lhs: u32, rhs: u32, out: *u32) Status {
+    const tag: Ir.Node.Tag = switch (kind) {
+        .conjunction => .prop_and,
+        .disjunction => .prop_or,
+    };
+    return deliver(out, ir.propJunction(gpa, tag, @enumFromInt(lhs), @enumFromInt(rhs)));
+}
+
+const Shift = enum(c_int) {
+    /// The range read disjunctively: `nexttime[n]` at `lo == hi`, and
+    /// `eventually [m:n]` wider.
+    some,
+    /// The range read conjunctively: `always [m:n]`.
+    every,
+};
+
+/// A property shifted by `lo..hi` cycles. `SVA_UNBOUNDED` as `hi` spells the
+/// unbounded `always p` / `s_eventually p`, which builds but does not lower.
+export fn sva_prop_shift(ir: *Ir, kind: Shift, lo: u32, hi: u32, property: u32, out: *u32) Status {
+    const tag: Ir.Node.Tag = switch (kind) {
+        .some => .prop_delay,
+        .every => .prop_always,
+    };
+    return deliver(out, ir.propRange(gpa, tag, lo, hi, @enumFromInt(property)));
+}
+
+/// `s #-# p` / `s #=# p`: *some* match of `antecedent` followed by `consequent`
+/// holding. The existential dual of `sva_prop_implies` — an antecedent that never
+/// matches makes an implication hold and makes this fail.
+export fn sva_prop_followed_by(
+    ir: *Ir,
+    kind: Implication,
+    antecedent: u32,
+    consequent: u32,
+    out: *u32,
+) Status {
+    const tag: Ir.Node.Tag = switch (kind) {
+        .overlapping => .prop_followed_by_overlap,
+        .nonoverlapping => .prop_followed_by_nonoverlap,
+    };
+    return deliver(out, ir.propFollowedBy(gpa, tag, @enumFromInt(antecedent), @enumFromInt(consequent)));
+}
+
+const Abort = enum(c_int) {
+    /// `accept_on`: the condition holding discharges the property — it holds.
+    accept,
+    /// `reject_on`: the condition holding fails the property.
+    reject,
+    /// `sync_accept_on`: as `accept`, condition read from sampled values.
+    sync_accept,
+    /// `sync_reject_on`: as `reject`, condition read from sampled values.
+    sync_reject,
+};
+
+/// An abort scoped to `property`. Unlike a directive's reset, which abandons an
+/// attempt and leaves no verdict, an accept discharges it and a reject fails it.
+///
+/// The `sync_` kinds read `cond` from sampled values and the others from live
+/// values, exactly as a reset does. Passing a term that matches the kind is the
+/// caller's job; `sva_monitor_abort_sampled` reports which was asked for.
+export fn sva_prop_abort(ir: *Ir, kind: Abort, cond: u32, property: u32, out: *u32) Status {
+    const tag: Ir.Node.Tag = switch (kind) {
+        .accept => .prop_accept_on,
+        .reject => .prop_reject_on,
+        .sync_accept => .prop_sync_accept_on,
+        .sync_reject => .prop_sync_reject_on,
+    };
+    return deliver(out, ir.propAbort(gpa, tag, @enumFromInt(cond), @enumFromInt(property)));
+}
+
 // -- Directives --------------------------------------------------------------
 
 const Kind = enum(c_int) { assert, assume, cover, restrict };
@@ -307,6 +385,45 @@ export fn sva_monitor_implication(monitor: *const Monitor) Implication {
 /// resets has a constant false there.
 export fn sva_monitor_reset(monitor: *const Monitor) u32 {
     return monitor.reset;
+}
+
+/// Aborts scoped to part of the obligation. Zero for a property with none.
+export fn sva_monitor_abort_count(monitor: *const Monitor) u32 {
+    return @intCast(monitor.aborts.len);
+}
+
+/// Root index of one abort's condition.
+export fn sva_monitor_abort_root(monitor: *const Monitor, abort: u32) u32 {
+    return monitor.aborts[abort].cond;
+}
+
+/// What firing does to an attempt: `SVA_ABORT_ACCEPT` discharges it, which is a
+/// pass a `cover` counts, and `SVA_ABORT_REJECT` fails it.
+export fn sva_monitor_abort_effect(monitor: *const Monitor, abort: u32) Abort {
+    return switch (monitor.aborts[abort].effect) {
+        .accept => .accept,
+        .reject => .reject,
+    };
+}
+
+/// Whether firing resolves the whole attempt, or only kills the threads in the
+/// abort's mask and leaves the rest of the attempt running.
+export fn sva_monitor_abort_resolves_attempt(monitor: *const Monitor, abort: u32) bool {
+    return monitor.aborts[abort].scope == .attempt;
+}
+
+/// Whether the condition wants the *sampled* valuation rather than the live one:
+/// true for `sync_accept_on`/`sync_reject_on`. Nothing in this library can check
+/// that a backend honours it.
+export fn sva_monitor_abort_sampled(monitor: *const Monitor, abort: u32) bool {
+    return monitor.aborts[abort].sampled;
+}
+
+/// The obligation states an abort guards: `sva_automaton_words` of the obligation
+/// long. An abort is armed for an attempt only while that attempt has a live
+/// state in here.
+export fn sva_monitor_abort_mask(monitor: *const Monitor, abort: u32) [*]const Word {
+    return monitor.maskOf(abort).ptr;
 }
 
 /// The boolean nodes to evaluate once per cycle, one bit each, in this order.

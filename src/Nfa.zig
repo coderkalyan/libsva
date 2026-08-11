@@ -237,6 +237,11 @@ pub fn bitIntersect(destination: []Word, source: []const Word) void {
     for (destination, source) |*word, keep| word.* &= keep;
 }
 
+/// Clear every bit of `destination` that is set in `source`.
+pub fn bitSubtract(destination: []Word, source: []const Word) void {
+    for (destination, source) |*word, drop| word.* &= ~drop;
+}
+
 pub fn bitAny(bits: []const Word) bool {
     for (bits) |word| if (word != 0) return true;
     return false;

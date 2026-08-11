@@ -104,11 +104,23 @@ typedef enum sva_status {
        Sound tracking needs the obligation determinised, which is not
        implemented. */
     SVA_ERROR_UNBOUNDED_OBLIGATION = 4,
-    /* The consequent of an implication is itself an implication. */
+    /* A property operator's operand raises obligations of its own: an
+       implication as a consequent, or under a conjunction, a followed-by, a
+       shift or an abort. A monitor has one trigger and there is nowhere to put
+       a second. */
     SVA_ERROR_UNSUPPORTED_CONSEQUENT = 5,
     /* Goto or non-consecutive repetition over an operand that is not a single
        boolean. */
     SVA_ERROR_UNSUPPORTED_REPEAT_OPERAND = 6,
+    /* sva_prop_junction over operands of different strength. The pair is pending
+       until both sides resolve, and a pending pair with one weak and one strong
+       side has no single end-of-trace disposition. */
+    SVA_ERROR_MIXED_STRENGTH = 7,
+    /* An abort below an operator that renumbers its operand's states, so the
+       mask naming the abort's subtree cannot be carried through: a conjunction,
+       an SVA_SHIFT_EVERY range, or a followed-by. A disjunction and an
+       SVA_SHIFT_SOME range are fine. */
+    SVA_ERROR_UNSUPPORTED_ABORT_SCOPE = 8,
 } sva_status;
 
 /* ------------------------------------------------------------------------- *
@@ -185,6 +197,33 @@ typedef enum sva_implication {
     /* s |=> p — the consequent starts the cycle after. */
     SVA_NONOVERLAPPING = 1,
 } sva_implication;
+
+typedef enum sva_junction {
+    /* p and q — both hold, each on its own schedule. */
+    SVA_CONJUNCTION = 0,
+    /* p or q — either holding is enough. */
+    SVA_DISJUNCTION = 1,
+} sva_junction;
+
+typedef enum sva_shift {
+    /* The range read disjunctively: the property need hold at only one offset
+       in it. nexttime[n] p is lo == hi == n; eventually [m:n] p is wider. */
+    SVA_SHIFT_SOME = 0,
+    /* The range read conjunctively: always [m:n] p, the property at every
+       offset. */
+    SVA_SHIFT_EVERY = 1,
+} sva_shift;
+
+typedef enum sva_abort {
+    /* accept_on(b) p — b holding discharges p: it holds. */
+    SVA_ABORT_ACCEPT = 0,
+    /* reject_on(b) p — b holding fails p. */
+    SVA_ABORT_REJECT = 1,
+    /* sync_accept_on(b) p — as SVA_ABORT_ACCEPT, b read from sampled values. */
+    SVA_ABORT_SYNC_ACCEPT = 2,
+    /* sync_reject_on(b) p — as SVA_ABORT_REJECT, b read from sampled values. */
+    SVA_ABORT_SYNC_REJECT = 3,
+} sva_abort;
 
 typedef enum sva_kind {
     SVA_ASSERT = 0,
@@ -290,6 +329,30 @@ sva_status sva_prop_sequence(sva_ir *ir, sva_strength strength, sva_node sequenc
                              sva_node *out);
 sva_status sva_prop_implies(sva_ir *ir, sva_implication kind, sva_node antecedent,
                             sva_node consequent, sva_node *out);
+/* Both operands must carry the same strength, which is a property of their
+   subtrees rather than of their own tags: sva_lower reports
+   SVA_ERROR_MIXED_STRENGTH, this call does not. */
+sva_status sva_prop_junction(sva_ir *ir, sva_junction kind, sva_node lhs,
+                             sva_node rhs, sva_node *out);
+/* A property shifted by lo..hi cycles. SVA_UNBOUNDED as hi spells the unbounded
+   `always p` / `s_eventually p`: it builds, and sva_lower refuses it with
+   SVA_ERROR_UNBOUNDED_OBLIGATION. */
+sva_status sva_prop_shift(sva_ir *ir, sva_shift kind, uint32_t lo, uint32_t hi,
+                          sva_node property, sva_node *out);
+/* s #-# p and s #=# p. The existential dual of sva_prop_implies: an antecedent
+   that never matches makes an implication hold vacuously and makes this fail. */
+sva_status sva_prop_followed_by(sva_ir *ir, sva_implication kind,
+                                sva_node antecedent, sva_node consequent,
+                                sva_node *out);
+/* An abort scoped to `property`, rather than to the whole monitor the way a
+   directive's reset is. The other difference is the verdict: a reset *abandons*
+   an attempt, leaving none, while an accept *discharges* it, which is a pass.
+
+   The SVA_ABORT_SYNC_* kinds read `cond` from sampled values and the others from
+   live values, exactly as a reset does. Passing a term that matches the kind is
+   yours to get right; sva_monitor_abort_sampled reports which was asked for. */
+sva_status sva_prop_abort(sva_ir *ir, sva_abort kind, sva_node cond,
+                          sva_node property, sva_node *out);
 
 typedef struct sva_directive {
     /* Yours, to resolve against your own tables. */
@@ -366,6 +429,32 @@ sva_implication sva_monitor_implication(const sva_monitor *monitor);
 /* Root index of the reset condition. Always a real root: an assertion that never
    resets has a constant false there, which folds to nothing in a backend. */
 uint32_t sva_monitor_reset(const sva_monitor *monitor);
+
+/* Aborts scoped to part of the obligation — accept_on and friends. Zero for a
+   property with none, which is the common case.
+
+   An abort is *armed* for one pending attempt exactly when that attempt has a
+   live state in sva_monitor_abort_mask. That is what confines it to the cycles
+   the property beneath it is actually being evaluated in, so `nexttime[2]
+   (reject_on(b) p)` cannot reject during the two cycles it spends getting to p,
+   and nothing has to track a window to arrange it.
+
+   Apply them after seeding a new attempt and before taking verdicts. */
+uint32_t sva_monitor_abort_count(const sva_monitor *monitor);
+uint32_t sva_monitor_abort_root(const sva_monitor *monitor, uint32_t abort);
+/* SVA_ABORT_ACCEPT discharges the attempt, which is a pass a cover counts;
+   SVA_ABORT_REJECT fails it. Never an SVA_ABORT_SYNC_* value: whether the
+   condition was sampled is sva_monitor_abort_sampled. */
+sva_abort sva_monitor_abort_effect(const sva_monitor *monitor, uint32_t abort);
+/* Whether firing resolves the whole attempt, or only clears the states in the
+   mask and leaves the rest of the attempt running — a reject under a
+   disjunction kills its own disjunct and no more. */
+bool sva_monitor_abort_resolves_attempt(const sva_monitor *monitor, uint32_t abort);
+/* Whether the condition wants the sampled valuation rather than the live one.
+   Nothing in this library can check that you honour it. */
+bool sva_monitor_abort_sampled(const sva_monitor *monitor, uint32_t abort);
+/* sva_automaton_words(sva_monitor_obligation(monitor)) words. */
+const uint64_t *sva_monitor_abort_mask(const sva_monitor *monitor, uint32_t abort);
 
 /* The boolean nodes to evaluate once per cycle, one bit each, in this order.
    This is the whole of what a backend has to understand; everything past it is

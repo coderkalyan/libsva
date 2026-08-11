@@ -66,11 +66,15 @@ the layer it expects:
   `seqThroughout`, `seqWithin`, `seqFirstMatch`, `seqRepeat`
   (`.seq_repeat_consec`, `.seq_repeat_goto`, `.seq_repeat_nonconsec`).
 - **property** — `propSeq` (`.prop_seq_weak`, `.prop_seq_strong`),
-  `propImplies` (`.prop_implies_overlap`, `.prop_implies_nonoverlap`).
+  `propImplies` (`.prop_implies_overlap`, `.prop_implies_nonoverlap`),
+  `propJunction` (`.prop_and`, `.prop_or`), `propRange` (`.prop_delay`,
+  `.prop_always`), `propFollowedBy` (`.prop_followed_by_overlap`,
+  `.prop_followed_by_nonoverlap`), `propAbort` (`.prop_accept_on`,
+  `.prop_reject_on`, `.prop_sync_accept_on`, `.prop_sync_reject_on`).
 
-Read a tree back with `tagOf` for a node's operator, `atomOf`, `delayOf` and
-`repeatOf` for its payload, and `operandsOf(node, &buf)` to enumerate the nodes
-it refers to.
+Read a tree back with `tagOf` for a node's operator, `atomOf`, `delayOf`,
+`repeatOf` and `propRangeOf` for its payload, and `operandsOf(node, &buf)` to
+enumerate the nodes it refers to.
 
 `ir.hash()` is a Blake3 content digest: structurally identical assertion sets
 hash equal, so it works as a cache key for whatever a backend compiles.
@@ -98,7 +102,112 @@ otherwise each antecedent match obliges the consequent.
 
 A finite trace ends with attempts still pending, and their **strength** decides
 what happens: a weak property discharges the obligation and holds, a strong one
-fails. Implication takes its strength from its consequent.
+fails. Implication takes its strength from its consequent, and every operator
+above the leaves takes it from its operands. `propJunction` requires its two
+sides to agree: the pair is pending until both resolve, and a pending pair with
+one weak and one strong side has no single disposition to carry, so the lowering
+refuses it rather than picking one.
+
+### The property layer above a sequence
+
+The operators above `propSeq` combine **verdicts**, not matches, and none of them
+gets automaton machinery of its own. A sequence property holds exactly when its
+sequence has a match, so "both hold" is "both have a match", and the whole layer
+collapses onto the sequence layer:
+
+| operator | is | states added |
+|---|---|---|
+| `propJunction .prop_and` | `seqAnd` of the two obligations | the product's |
+| `propJunction .prop_or` | `seqOr` — a disjoint union | 0 |
+| `propRange .prop_delay` | a filler chain the operand is entered from | `hi` |
+| `propRange .prop_always` | the operand shifted to each offset, conjoined | the product's |
+| `propFollowedBy` | the antecedent *concatenated* with the operand | the fusion's |
+
+`propRange` reads its range **disjunctively** for `.prop_delay` and
+**conjunctively** for `.prop_always`, which is the whole difference between
+`nexttime[n]` / `eventually [m:n]` and `always [m:n]`. The two coincide at
+`lo == hi`. An open `hi` spells the unbounded `always p` and `s_eventually p`,
+and is refused: it leaves the obligation without a longest match, exactly as an
+unbounded delay does.
+
+`propFollowedBy` is the existential dual of `propImplies`, and it is *not* that
+construction with the verdict flipped. LRM 16.12.9 defines `s #-# p` as
+`not (s |-> not p)`, and negating an implication turns its universal over
+antecedent matches into an existential **and** turns vacuity from a pass into a
+failure. An existential over "`s` matches, then `p` holds from there" is just a
+match of the two concatenated, so followed-by never becomes a trigger at all —
+its antecedent joins the obligation. The visible consequence is the one that
+matters: where an implication with no antecedent match holds vacuously, a
+followed-by asserted that a witness exists and **fails**.
+
+That is also why there is no conditional or `case` operator. `if (c) p else q` is
+`(c #-# p) or (!c #-# q)`: exactly one guard matches, the other disjunct has no
+witness and so contributes a failure rather than a vacuous pass, and the taken
+branch decides the verdict. The `case` form is the same shape with one disjunct
+per item. Spelled with implication instead it would always pass.
+
+A shift over an implication moves the **antecedent**, not the obligation:
+`nexttime[n] (s |-> p)` obliges `p` for exactly those matches of `s` that start
+`n` cycles into the attempt, and since a trigger is seeded every cycle, growing
+an `n`-cycle filler prefix in front of it selects exactly those and costs the
+ring nothing. A *range* survives that move only for `.prop_always`, because a
+conjunction of universals is a universal over the union of their triggers;
+`eventually [m:n] (s |-> p)` is a disjunction of separately-vacuous implications
+and no single trigger says that, so it is refused.
+
+**Bounded `always` is linear, not a blow-up.** A hundred-way conjunction sounds
+like the case for a dedicated construction, and it is not: consecutive conjuncts
+only have a reachable product where their copies of the operand are live at the
+same time, and that window is as wide as the operand however wide the range is.
+So `always [1:100] p` costs `101` states for a one-cycle `p` and `3535` for a
+five-state one — linear in the range with a slope set by `p` alone. This lowering
+*is* the desugaring, producing exactly the state counts a front-end's own
+`seqAnd` spelling would; the operator earns its place by keeping the semantics
+and the refusals in one place, not by beating it on size.
+
+### Aborts
+
+`propAbort` resolves the property beneath it the moment its condition holds,
+while that property is still being evaluated: `.prop_accept_on` resolves it as
+**holding**, `.prop_reject_on` as **failing**.
+
+This is not `reset` with a different spelling, and the difference is the point: a
+reset **abandons** an attempt, leaving no verdict at all, while an accept
+**discharges** it, which is a pass a `cover` counts. Counting failures alone
+cannot tell the two apart, which is exactly why it is worth stating.
+
+An abort is also *scoped*, where a reset is monitor-wide. It reaches one subtree
+of the obligation, named by a state mask on the `Monitor.Abort`, and an abort is
+**armed** for a pending attempt only while that attempt could hold a thread
+inside the mask. That is what confines it to the cycles its property is really
+being evaluated in — `nexttime[2] (reject_on(b) p)` cannot reject during the two
+cycles it spends reaching `p` — without anything having to track a window. Arming
+is measured over the states the attempt could *reach*, not the ones it ends up
+live in, so it covers both the cycle the subtree is entered in and the cycle its
+last thread dies in; LRM 16.12.7 arms an abort at any point during the evaluation
+attempt, and both are such a point. An abort therefore wins a tie against the
+property's own verdict in the cycle they coincide.
+
+Because the scope is the obligation, an abort below an implication leaves the
+antecedent alone: matches of it keep raising fresh obligations in the very cycles
+the condition holds, which a monitor-wide reset would suppress.
+
+A reject below a `.prop_or` stops resolving the whole attempt and only clears its
+own disjunct — the other side may still hold. An accept keeps resolving the
+attempt, since one disjunct holding makes the disjunction hold.
+
+The `.prop_sync_*` tags read the condition from **sampled** values and the plain
+ones from **live** values, mirroring `reset` (LRM 16.15). Nothing in the IR can
+check that: the request is recorded on `Monitor.Abort.sampled` for a backend to
+honour, and honouring it is the front-end's half of the contract.
+
+Two shapes are refused rather than mis-lowered. A property operator over an
+operand that raises a trigger of its own — a conjunction of two implications, an
+abort outside one — has nowhere to put the second trigger, since a monitor has
+one. And an abort below an operator that *renumbers* its operand's states cannot
+carry its mask through: a disjunction and a shift move an operand as a block and
+are fine, a product (`.prop_and`, `.prop_always`) and a fusion
+(`propFollowedBy`) are not.
 
 **Empty matches do not exist.** Every sequence matches at least one cycle:
 repetition counts are `>= 1` and nothing else can introduce an empty match, so
@@ -244,7 +353,8 @@ started in cycle `t` has either matched or run out of live states by cycle
 `t + depth - 1`. An obligation with no bounded longest match — `##[1:$] ack`, or
 any goto repetition — is rejected with `ObligationNotBounded`, because tracking
 it soundly needs the obligation determinised so that one state characterises an
-attempt. A consequent that is itself an implication is rejected too.
+attempt. A consequent that is itself an implication is rejected too, as is any
+property operator over an operand carrying its own trigger.
 
 An `and` is bounded only if *both* its sides are, where an `intersect` needs
 only one: an intersection's two ends coincide, so a bounded side bounds the
@@ -259,6 +369,14 @@ verdict. `req |=> first_match(##[1:$] ack)` is still unbounded and still
 rejected, which is the shape that matters. `first_match(ack[*1:$])` is really
 just `ack` and is rejected anyway: seeing that needs the longest path over the
 automaton, and the bound is read off the tree.
+
+Everything the property layer adds above the sequences lands in those same two
+automata, so a backend gains no table and no opcode — with one exception.
+`monitor.aborts` is a small array of `Monitor.Abort`, each a root index, an
+effect (`accept` discharges the attempt, `reject` fails it), a scope (whether
+firing resolves the whole attempt or only clears the mask), a `sampled` flag, and
+a state mask read with `monitor.maskOf(i)`. Apply them after seeding a new
+attempt and before taking verdicts.
 
 `Monitor.State` is a reference implementation of the whole per-cycle protocol,
 which is the contract a backend reproduces rather than something it calls.
