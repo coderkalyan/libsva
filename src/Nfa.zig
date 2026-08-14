@@ -48,6 +48,16 @@ follow: []Word,
 first: []Word,
 /// States that complete a match.
 last: []Word,
+/// States an obligation attempt has *failed* in, for a monitor that tracks its
+/// attempts by counter rather than by state vector. Empty — no bit set — for
+/// every other automaton, where failure is the state vector running empty.
+///
+/// Only a determinised obligation has one. There, an attempt is a single state
+/// rather than a set, so "no live states" is not available as a failure signal:
+/// the construction is total and every valuation leads somewhere. What it leads
+/// to when nothing is possible any more is one of these. See
+/// `Glushkov.determinise`.
+dead: []Word,
 /// Per guard of the owning alphabet, the mask of states carrying it. A flat
 /// `alphabet.guards.len * words` matrix; use `statesOf`. This is what lets
 /// `satisfy` fold over guards instead of gathering per state.
@@ -59,6 +69,7 @@ pub fn deinit(nfa: *Nfa, gpa: Allocator) void {
     gpa.free(nfa.first);
     gpa.free(nfa.last);
     gpa.free(nfa.guard_states);
+    gpa.free(nfa.dead);
 }
 
 // -- The alphabet ------------------------------------------------------------
@@ -206,6 +217,46 @@ pub fn matched(nfa: *const Nfa, current: []const Word) bool {
     return bitOverlaps(current, nfa.last);
 }
 
+/// The lowest index set in both masks, which is how a *counted* monitor picks
+/// the one state an attempt moves into. See `chosenFollow`.
+pub fn lowestBoth(left: []const Word, right: []const Word) ?u32 {
+    for (left, right, 0..) |x, y, index| {
+        const both = x & y;
+        if (both != 0) return @intCast(index * word_bits + @ctz(both));
+    }
+    return null;
+}
+
+/// The single state a counted attempt sitting in `state` moves to: the
+/// lowest-indexed successor whose guard holds this cycle.
+///
+/// A counted attempt is *one* state, not a set, so exactly one successor may
+/// take it. Several can be enabled at once even though the obligation is
+/// determinised — a determinised state is a (subset, cell) pair and two cells
+/// may share a valuation — but such siblings carry the same subset, and so the
+/// same exits and the same successors. They are bisimilar, which is why taking
+/// the lowest is a choice and not an approximation. Handing the count to every
+/// enabled sibling instead would manufacture attempts out of nothing.
+///
+/// Never null for a determinised obligation: the construction is total, so some
+/// cell holds this cycle's valuation. Null is reachable only if a caller runs
+/// this against an automaton that is not one.
+pub fn chosenFollow(nfa: *const Nfa, state: u32, satisfied: []const Word) ?u32 {
+    return lowestBoth(nfa.followOf(state), satisfied);
+}
+
+/// The single state a counted attempt seeded this cycle starts in, by the same
+/// rule as `chosenFollow`.
+pub fn chosenSeed(nfa: *const Nfa, satisfied: []const Word) ?u32 {
+    return lowestBoth(nfa.first, satisfied);
+}
+
+/// Whether an attempt sitting in `state` has failed: a counted monitor's
+/// replacement for the state vector running empty.
+pub fn isDead(nfa: *const Nfa, state: u32) bool {
+    return bitIsSet(nfa.dead, state);
+}
+
 // -- Bit sets ----------------------------------------------------------------
 //
 // A mask is a `[]Word` of `wordsFor(bits)` words, least significant bit of word
@@ -245,6 +296,15 @@ pub fn bitSubtract(destination: []Word, source: []const Word) void {
 pub fn bitAny(bits: []const Word) bool {
     for (bits) |word| if (word != 0) return true;
     return false;
+}
+
+/// How many bits are set: the size of the set a mask stands for. What a monitor
+/// counting attempts by identity reads a count out of — see
+/// `Monitor.State.idCount`.
+pub fn bitCount(bits: []const Word) u64 {
+    var total: u64 = 0;
+    for (bits) |word| total += @popCount(word);
+    return total;
 }
 
 pub fn bitOverlaps(left: []const Word, right: []const Word) bool {

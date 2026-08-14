@@ -12,7 +12,8 @@
 //!      concatenation, disjunction, conjunction, length-matching intersection,
 //!      a boolean required throughout a match, shortest-match selection, and
 //!      the three flavors of repetition.
-//!   3. **Property layer** — sequences promoted to properties, and implication.
+//!   3. **Property layer** — sequences promoted to properties, implication,
+//!      and the verdict combinators over them, negation included.
 //!
 //! A leaf of the boolean layer is an `Atom`: an opaque `u32` handle the
 //! front-end assigns. The IR never inspects one — it stores no text, no types,
@@ -104,7 +105,17 @@
 //! `prop_and` and `prop_or` combine verdicts rather than matches — each
 //! operand keeps its own schedule, and the conjunction is pending until both
 //! have resolved. `prop_delay` and `prop_always` shift a property by a range of
-//! cycles, disjunctively and conjunctively respectively.
+//! cycles, disjunctively and conjunctively respectively; an unbounded range
+//! spells `s_eventually p` and `always p`. The four `prop_until*` tags are the
+//! LRM's `until` family: the left operand holds up to the cycle the right one
+//! does, inclusively for the `_with` forms, and the `s_` forms require that
+//! cycle to arrive.
+//!
+//! `prop_not` complements a verdict. There are three of them — holds, fails and
+//! pending — and negation swaps the first two while fixing the third, so a
+//! complemented attempt resolves in exactly the cycle its operand resolved and
+//! not a cycle sooner. `prop_implies` and `prop_iff` are reductions onto it:
+//! `not p or q`, and the conjunction of the two directions.
 //!
 //! A finite trace ends with attempts still pending, and their disposition is
 //! the property's **strength**:
@@ -114,13 +125,20 @@
 //!     trace: it fails.
 //!
 //! Strength is carried by `prop_seq_weak`/`prop_seq_strong`; every operator
-//! above them takes its strength from its operands. Implication takes it from
+//! above them takes its strength from its operands, the `until` family
+//! excepted — there the tag fixes it. Implication takes it from
 //! the consequent, and a never-completed antecedent is vacuous under either —
 //! strength governs the consequent, not the trigger. `prop_and` and `prop_or`
 //! require their two operands to agree, because a pending conjunction of a
 //! weak and a strong operand has no single end-of-trace disposition. On an
 //! infinite trace the distinction is only observable for obligations that are
 //! never resolved.
+//!
+//! `prop_not` inverts strength, LRM 16.12.2: a pending `not p` at the end of a
+//! trace is a pending `p`, whose disposition is then complemented. That is why
+//! negation cannot be a pure automaton operation, and it is what makes
+//! `prop_implies` demand operands of *differing* strength — `not p or q` puts
+//! the inverted strength next to `q`'s under `prop_or`'s agreement rule.
 //!
 //! ## Aborts
 //!
@@ -379,15 +397,20 @@ pub const Node = struct {
         /// `eventually [m:n] p` is `lo = m, hi = n`. `always [m:n] p` is the
         /// conjunctive reading and is `prop_always`.
         ///
-        /// `hi == unbounded` spells the unbounded `s_eventually p`, which the
-        /// lowering rejects: it leaves the obligation without a longest match.
+        /// `hi == unbounded` spells the unbounded `s_eventually p`. It leaves
+        /// the obligation without a longest match, so the lowering tracks it
+        /// with counters rather than with a ring of state vectors; the operand
+        /// may span any number of cycles, because the range is existential.
         prop_delay,
         /// The operand property, holding at *every* offset in `lo..hi`. `lhs` =
         /// property node, `rhs` = `extra` index of `[lo, hi]`.
         ///
         /// The conjunctive counterpart of `prop_delay`; the two coincide when
         /// `lo == hi`. `hi == unbounded` spells the unbounded `always p`, which
-        /// the lowering rejects for the same reason.
+        /// is counter-tracked for the same reason — but, being universal, it
+        /// requires an operand matching in a single cycle. "`p` holds at every
+        /// cycle" is a statement about overlapping attempts of `p`, and one
+        /// counter cannot carry a set of them; the lowering says so.
         prop_always,
         /// Overlapping followed-by: *some* match of the antecedent sequence is
         /// followed by the consequent property holding from that match's last
@@ -429,6 +452,81 @@ pub const Node = struct {
         /// **sampled** values. `lhs` = condition boolean, `rhs` = property.
         prop_sync_reject_on,
 
+        /// `p until q` — the weak, non-inclusive form. `lhs`, `rhs` = property
+        /// nodes.
+        ///
+        /// LRM 16.12.10: `q` holds at some cycle `k` at or after this one, and
+        /// `p` holds at every cycle strictly before `k`. Weak, so a trace that
+        /// ends with `p` still holding and `q` not yet seen holds rather than
+        /// fails.
+        ///
+        /// The four forms are separate tags rather than one tag carrying flags
+        /// because the LRM makes them four operators, and the weak/strong
+        /// distinction here is the *operator's* own: unlike every other property
+        /// tag, whose end-of-trace disposition comes from its leaves, an until
+        /// fixes it. See `Glushkov.propStrength`.
+        prop_until,
+        /// `p until_with q` — weak, inclusive. `lhs`, `rhs` = property nodes.
+        ///
+        /// As `prop_until`, but `p` must hold at cycle `k` as well. LRM 16.12.10
+        /// gives the identity `p until_with q ≡ p until (q and p)`, which is
+        /// what the lowering builds.
+        prop_until_with,
+        /// `p s_until q` — strong, non-inclusive. `lhs`, `rhs` = property nodes.
+        ///
+        /// `prop_until`'s obligation with the opposite end-of-trace disposition:
+        /// `q` is *required* to arrive, so a trace that ends without it fails.
+        prop_s_until,
+        /// `p s_until_with q` — strong, inclusive. `lhs`, `rhs` = property
+        /// nodes.
+        prop_s_until_with,
+
+        /// `not p` — LRM 16.12.2. `lhs` = property node.
+        ///
+        /// The operand's verdict, complemented in the three-valued lattice of
+        /// `Monitor.Verdict`: this holds where `p` fails, fails where `p`
+        /// holds, and is pending where `p` is pending. That third clause is not
+        /// a convention — it is what makes `not` an involution, and the
+        /// lowering pays a real price to honour it.
+        ///
+        /// Nothing to do with `bnot`, which is two-valued complement of a
+        /// boolean *term* one cycle at a time. This complements a whole
+        /// attempt's verdict, and the two are not interchangeable at any depth:
+        /// `not (a ##1 b)` is not a boolean operation on anything.
+        ///
+        /// It also inverts the strength of everything below it, so a `not` over
+        /// a weak operand is strong. See `Glushkov.lowerPropNot`.
+        prop_not,
+        /// `p implies q` — LRM 16.12.2, the *property* implication. `lhs`,
+        /// `rhs` = property nodes.
+        ///
+        /// Exactly `not p or q`, and lowered as that. It is a separate tag so
+        /// that a refusal names the operator the front-end's user wrote rather
+        /// than the disjunction libsva reduced it to.
+        ///
+        /// Not to be confused with `prop_implies_overlap` and its non-
+        /// overlapping twin, which are `|->` and `|=>`: those take a *sequence*
+        /// antecedent, quantify over its matches, and contribute a trigger.
+        /// This takes two properties and contributes nothing but a verdict.
+        ///
+        /// The reduction has a consequence worth stating here rather than
+        /// leaving to be discovered: `not` inverts strength and `prop_or`
+        /// requires its operands to agree, so this lowers only when its two
+        /// operands' strengths *differ*. `Glushkov.Error.MixedStrength` carries
+        /// the derivation and the lift.
+        prop_implies,
+        /// `p iff q` — LRM 16.12.2. `lhs`, `rhs` = property nodes.
+        ///
+        /// `(p implies q) and (q implies p)`, and lowered as that.
+        ///
+        /// Which never succeeds today, for a reason that is arithmetic rather
+        /// than incidental: the left conjunct carries `q`'s strength and the
+        /// right one carries `p`'s, and each direction already required those
+        /// two to be opposite, so the outer conjunction always sees a mixed
+        /// pair. The tag exists so the refusal can name `iff`; see
+        /// `Glushkov.Error.MixedStrength` for what would lift it.
+        prop_iff,
+
         /// Which of the three layers a tag belongs to. Operands are checked
         /// against this when a node is built.
         pub const Layer = enum(u8) { boolean, sequence, property };
@@ -461,6 +559,13 @@ pub const Node = struct {
                 .prop_reject_on,
                 .prop_sync_accept_on,
                 .prop_sync_reject_on,
+                .prop_until,
+                .prop_until_with,
+                .prop_s_until,
+                .prop_s_until_with,
+                .prop_not,
+                .prop_implies,
+                .prop_iff,
                 => .property,
             };
         }
@@ -771,11 +876,30 @@ pub fn propImplies(
     } });
 }
 
-/// Property conjunction or disjunction per `tag` (`prop_and` or `prop_or`).
+/// `not p`: the operand's verdict, complemented in `Monitor.Verdict`.
 ///
-/// Both operands must end up carrying the same strength; that is a property of
-/// their subtrees rather than of the operands' own tags, so it is the lowering
-/// that checks it, not this constructor.
+/// Holds where `prop` fails, fails where `prop` holds, pending where `prop` is
+/// pending — and inverts the strength `prop` contributes, since a pending
+/// attempt is still pending under negation and only its end-of-trace
+/// disposition turns over.
+///
+/// Not `bnot`. That complements a boolean term within one cycle; this
+/// complements a whole attempt's verdict.
+pub fn propNot(ir: *Ir, gpa: Allocator, prop: Node.Index) Allocator.Error!Node.Index {
+    ir.assertOperand(prop, .property);
+    return ir.addNode(gpa, .{ .tag = .prop_not, .data = .{ .lhs = @intFromEnum(prop) } });
+}
+
+/// A binary property junction per `tag`: `prop_and`, `prop_or`, `prop_implies`
+/// or `prop_iff`.
+///
+/// The latter two are reductions onto the former — `p implies q` is
+/// `not p or q`, and `p iff q` is the conjunction of the two directions — and
+/// are tags of their own only so that a refusal names the operator as written.
+///
+/// Every one of the four constrains the strengths its operands end up carrying,
+/// and none of those constraints is checkable here: strength is a property of a
+/// subtree, not of an operand's own tag, so the lowering is what reports it.
 pub fn propJunction(
     ir: *Ir,
     gpa: Allocator,
@@ -783,7 +907,8 @@ pub fn propJunction(
     lhs: Node.Index,
     rhs: Node.Index,
 ) Allocator.Error!Node.Index {
-    std.debug.assert(tag == .prop_and or tag == .prop_or);
+    std.debug.assert(tag == .prop_and or tag == .prop_or or
+        tag == .prop_implies or tag == .prop_iff);
     ir.assertOperand(lhs, .property);
     ir.assertOperand(rhs, .property);
     return ir.addNode(gpa, .{ .tag = tag, .data = .{
@@ -799,8 +924,9 @@ pub fn propJunction(
 ///     the wider range.
 ///   - `prop_always` reads it conjunctively: `prop` must hold at every offset.
 ///
-/// `hi == unbounded` is accepted here and rejected by the lowering, which is
-/// where a missing longest match is diagnosed for every other operator too.
+/// `hi == unbounded` is accepted here and selects the counter-tracked
+/// discipline in the lowering, which is also where the one restriction it
+/// carries — `prop_always` wants a single-cycle operand — is diagnosed.
 pub fn propRange(
     ir: *Ir,
     gpa: Allocator,
@@ -866,6 +992,34 @@ pub fn propAbort(
     } });
 }
 
+/// One of the four `until` forms per `tag`: `lhs` must hold up to the cycle
+/// `rhs` holds in, inclusively for the `_with` tags, and the `s_` tags require
+/// `rhs` to arrive.
+///
+/// Unlike `propJunction`, the operands' own strengths are not required to
+/// agree and are not consulted: the tag carries the end-of-trace disposition
+/// (LRM 16.12.10 spells the four operators out precisely to say which), so
+/// there is no ambiguity for a mixed pair to create.
+///
+/// The lowering restricts `lhs` to a property matching in a single cycle. See
+/// `Glushkov.lowerUntil` for why, and for the diagnostic that says so.
+pub fn propUntil(
+    ir: *Ir,
+    gpa: Allocator,
+    tag: Node.Tag,
+    lhs: Node.Index,
+    rhs: Node.Index,
+) Allocator.Error!Node.Index {
+    std.debug.assert(tag == .prop_until or tag == .prop_until_with or
+        tag == .prop_s_until or tag == .prop_s_until_with);
+    ir.assertOperand(lhs, .property);
+    ir.assertOperand(rhs, .property);
+    return ir.addNode(gpa, .{ .tag = tag, .data = .{
+        .lhs = @intFromEnum(lhs),
+        .rhs = @intFromEnum(rhs),
+    } });
+}
+
 // -- Accessors ---------------------------------------------------------------
 
 pub fn tagOf(ir: *const Ir, node: Node.Index) Node.Tag {
@@ -903,6 +1057,7 @@ pub fn operandsOf(ir: *const Ir, node: Node.Index, buf: *[max_operands]Node.Inde
         .prop_seq_strong,
         .prop_delay,
         .prop_always,
+        .prop_not,
         => {
             buf[0] = @enumFromInt(d.lhs);
             return buf[0..1];
@@ -924,6 +1079,12 @@ pub fn operandsOf(ir: *const Ir, node: Node.Index, buf: *[max_operands]Node.Inde
         .prop_reject_on,
         .prop_sync_accept_on,
         .prop_sync_reject_on,
+        .prop_until,
+        .prop_until_with,
+        .prop_s_until,
+        .prop_s_until_with,
+        .prop_implies,
+        .prop_iff,
         => {
             buf[0] = @enumFromInt(d.lhs);
             buf[1] = @enumFromInt(d.rhs);
@@ -1057,7 +1218,7 @@ pub const magic: [4]u8 = .{ 'S', 'V', 'A', 'B' };
 /// On-disk format version. The IR reserves no space for future operators, so
 /// this is bumped on any layout *or* `Node.Tag` change; readers reject a
 /// mismatch and the caller recompiles from source.
-pub const format_version: u32 = 8;
+pub const format_version: u32 = 10;
 
 const checksum_len = Blake3.digest_length;
 /// Bytes preceding the first payload word: `magic` + `format_version`.

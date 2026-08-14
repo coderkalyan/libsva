@@ -7,22 +7,144 @@
 //!
 //! The two are tracked differently, and the asymmetry is the whole design:
 //!
-//!   - The **trigger** is existential. All we ask of the antecedent is whether
-//!     *some* match ends this cycle, so the union of every antecedent attempt is
-//!     a sound representation and one state vector suffices. Antecedent matches
-//!     ending in the same cycle impose the same obligation, so they collapse.
+//!   - The **trigger** answers a question about *matches*: how many antecedent
+//!     matches end this cycle. One state vector holds every attempt of it, and
+//!     each state carries the set of attempts whose threads sit there, so the
+//!     answer is a count and not a bit. What collapses is the *obligation* the
+//!     matches impose — matches ending in one cycle impose the identical
+//!     future, so one instance of it serves them all — and what does not
+//!     collapse is how many attempts owe it. LRM 16.14.1 starts an evaluation
+//!     of the consequent per match, so a verdict on the shared instance is that
+//!     many verdicts, and reporting one is a wrong answer rather than a coarse
+//!     one. See `# Counting the trigger`.
 //!   - The **obligation** is per-attempt. Merging attempts into one state vector
 //!     is *unsound*: one attempt's threads can die while another's live, and the
 //!     union hides the failure. Each pending attempt therefore gets its own
-//!     state vector.
+//!     state vector, carrying the number of attempts it stands for.
 //!
-//! `depth` bounds how many can be pending at once. It is the obligation's
-//! longest match: an attempt seeded in cycle `t` has either matched or run out
-//! of live states by cycle `t + depth - 1`, so `depth` vectors in a ring is
-//! exact rather than a heuristic. An obligation with no bounded longest match is
-//! rejected at lowering time — tracking it soundly needs the obligation
-//! determinised, so that one state fully characterises an attempt and merging
-//! becomes sound again.
+//! How the pending attempts are held is `mode`, and there are two disciplines
+//! because there are two kinds of obligation.
+//!
+//! ## `.ring` — a pool of state vectors
+//!
+//! `depth` bounds how many attempts can be pending at once. It is the
+//! obligation's longest match: an attempt seeded in cycle `t` has either matched
+//! or run out of live states by cycle `t + depth - 1`, so `depth` vectors in a
+//! ring is exact rather than a heuristic.
+//!
+//! ## `.counted` — a counter per state
+//!
+//! An obligation with no bounded longest match has no such ring: `always p`,
+//! `s_eventually p` and the `until` family can all leave attempts pending
+//! arbitrarily long, so arbitrarily many are in flight. Their obligation is
+//! **determinised** instead, and totally — the death of an attempt is a state
+//! (see `Glushkov.determinise`), not the absence of one.
+//!
+//! That buys back merging. One determinised state fully characterises an
+//! attempt's future, so two attempts sitting in the same state may share it, and
+//! the monitor carries a `u64` count per state rather than a vector per attempt.
+//! What the count is *for* is the verdict: two attempts is two failures, and a
+//! merged vector could only ever report one. A count reaching an exit is that
+//! many matches; a count reaching a `dead` state is that many failures.
+//!
+//! Counters are `u64` and are not saturated. At the measured seven and a half
+//! million ticks a second a `u32` overflows in about ten minutes of wall clock,
+//! which is a reachable simulation; `u64` is not reachable by construction, so
+//! the add stays one instruction.
+//!
+//! `depth` is meaningless in this mode and is zero. Two things follow that a
+//! backend has to get right, and neither is optional:
+//!
+//!   - **One successor, chosen by lowest index.** A count must move along
+//!     exactly ONE enabled transition. Several can be enabled at once even
+//!     though the obligation is determinised, because a determinised state is a
+//!     (subset, cell) pair and two cells may share a valuation. Such siblings
+//!     are bisimilar — same subset, same exits, same successors — so the rule is
+//!     to take the lowest-indexed enabled one, in `Nfa.chosenFollow`. The seed
+//!     obeys the same rule over `first`, in `Nfa.chosenSeed`. Summing a count
+//!     into every enabled successor instead manufactures attempts, and does so
+//!     only on obligations whose cells happen to overlap, which is the worst
+//!     kind of bug to go looking for.
+//!   - **`dead`, not emptiness.** The construction is total, so a count never
+//!     falls off the automaton and "no live states" never happens. Failure is
+//!     `Nfa.dead`.
+//!
+//! # Counting the trigger
+//!
+//! `trigger_window` is the same insight one automaton over, and it is all the
+//! per-attempt state an antecedent needs.
+//!
+//! An obligation is owed per *match*, and a match is an interval: LRM 16.9 has
+//! a sequence matching over `[start, end]`, so what the cycle `end` has to
+//! count is the number of distinct `start`s. Three facts follow, in the order
+//! they constrain the representation.
+//!
+//! **Threads are not matches.** One attempt can reach an exit along several
+//! paths in one cycle — `a ##[1:2] b ##[1:2] c` matches `[t, t+3]` through
+//! either gap — and that is one match over one interval, not two. So the
+//! per-state quantity cannot be an integer: adding thread counts at the exits
+//! answers two. It has to be a *set*, whose union is idempotent.
+//!
+//! **A state cannot stand for an attempt, but it can stand for a set of them.**
+//! Two attempts seeded in different cycles with a thread in one state do not
+//! have the same future — each holds threads elsewhere too, and only this
+//! state's own future is shared — so a shared state may not merge them. What it
+//! can carry is which attempts are there: `State.trigger_ids` holds, per trigger
+//! state, the set of attempts with a thread in it, and the advance maps those
+//! sets forward along transitions by union. That maintains exactly the invariant
+//! "an attempt is here if a thread of it is here", and the number of matches
+//! ending now is the size of the union over the exit states.
+//!
+//! **An attempt's identity may be a rotating index.** Every trigger state is
+//! co-reachable to an exit — `Glushkov.prune` keeps nothing else — so a thread
+//! alive `k` cycles after its attempt was seeded witnesses a match of at least
+//! `k + 1` cycles. With the window set to the trigger's longest match, an
+//! attempt therefore has no thread left `trigger_window` cycles on, two ids that
+//! far apart never coexist, and the index can rotate with the cycle. Nothing has
+//! to retire an id: the attempt that last held it died of its own accord, which
+//! `step` asserts rather than clearing.
+//!
+//! Two things that puts on a backend, and one it gets for free.
+//!
+//!   - **The longest match has to be bounded.** An antecedent whose reach is
+//!     unbounded — `a ##[1:$] b`, `b[=2]` — has unboundedly many start cycles
+//!     alive at once, and no fixed set of ids can name them. Such a property is
+//!     refused, by `Glushkov.Error.AntecedentNotBounded` naming the antecedent,
+//!     rather than counted to a bound and under-reported. `merge`'s
+//!     `a ##[1:$] b` row measures eight attempts resolving in one cycle where a
+//!     bit reports one; a wrong number is worse than no monitor.
+//!
+//!     TODO: counting one soundly needs the trigger determinised, where an
+//!     attempt is a single state and a `u64` per state is exact. That is the
+//!     `.counted` argument above, applied to the other automaton.
+//!   - **A zero window is zero cost.** `trigger_window` is zero unless a
+//!     boolean is genuinely too weak, and that needs two matches of *different*
+//!     lengths to exist: an antecedent whose matches all span the same number of
+//!     cycles ends them in that many distinct cycles, so at most one can end per
+//!     cycle and `Nfa.matched` is the whole answer. `a |=> b` and
+//!     `(a ##1 b) |-> c` alike allocate nothing and carry no id. The exception is
+//!     an abort above the implication, which has to count the attempts still
+//!     matching whether or not two of them can match together — see
+//!     `Abort.covers_trigger`.
+//!   - Free: a union dedupes an attempt against itself, so an ambiguous
+//!     antecedent and a `first_match` need nothing said about them.
+//!
+//! # Complements
+//!
+//! `prop_not` adds nothing to this structure, which is the point. A complement
+//! is lowered to an ordinary fragment — see `Glushkov.lowerPropNot` — whose
+//! exits are the cycles its operand ran out of futures and whose emptiness is
+//! the cycles its operand completed a match. Both disciplines above read it
+//! without knowing it is one, and `Report` needs no new field: a hold of
+//! `not p` arrives as a match and a fail as a failure, like any other property.
+//!
+//! Two things a complement *does* change, and both are `Verdict`'s business
+//! rather than the automaton's. It inverts `strength`, because a pending
+//! attempt stays pending under negation and only its end-of-trace disposition
+//! turns over. And it refuses an `Abort` beneath it — not for want of a mask,
+//! but because arming reads the *unfiltered* one-step image of where an attempt
+//! is, and a complement has deleted the states that would have answered. See
+//! `Glushkov.Builder.complement`.
 //!
 //! # The cycle
 //!
@@ -33,16 +155,23 @@
 //!     seeded in a reset cycle; the next cycle starts fresh.
 //!  3. Turn the root bits into a satisfied-state mask per automaton.
 //!  4. Advance the trigger, then seed it — it starts an attempt every cycle,
-//!     like any assertion. Note whether a match now ends.
-//!  5. If a match ends now and an `Abort` with `covers_trigger` holds, resolve
-//!     it with that abort's verdict and let it seed nothing.
+//!     like any assertion. Count the antecedent matches that end now.
+//!  5. If an `Abort` with `covers_trigger` holds, resolve every attempt with a
+//!     live antecedent thread with that abort's verdict — one verdict each, not
+//!     one between them — clear their threads out of the trigger, and let them
+//!     seed nothing.
 //!  6. Advance every pending obligation attempt.
 //!  7. Seed a new attempt: every cycle when there is no trigger, in the cycle
-//!     the trigger fires for `|->`, and the cycle after for `|=>`.
+//!     the trigger fires for `|->`, and the cycle after for `|=>`. It stands for
+//!     as many attempts as step 4 counted matches.
 //!  8. Apply every armed `Abort` whose condition holds. An abort is armed for
-//!     an attempt when that attempt has a live state in the abort's mask.
+//!     an attempt when that attempt has a live state in the abort's mask. In
+//!     `.counted` mode it is armed for a *state*, so it retires every attempt
+//!     counted there at once — see `Abort.Scope`.
 //!  9. Take verdicts. An attempt that reached an accepting state is discharged;
-//!     one with no live states failed. Both leave the ring.
+//!     one with no live states — in `.counted` mode, one in a `dead` state —
+//!     failed. Both leave the pool, reporting as many verdicts as they stand for
+//!     attempts.
 //! 10. When a finite trace ends, a still-pending attempt holds if the property
 //!     is weak and fails if it is strong.
 //!
@@ -86,11 +215,27 @@ trigger: ?Nfa,
 /// Whether an obligation starts on the trigger's last cycle (`|->`) or the
 /// cycle after it (`|=>`). Meaningless without a trigger.
 overlap: bool,
-/// The property's sequence. One attempt per seeding.
+/// The property's sequence. One attempt per seeding. Determinised, and total,
+/// when `mode` is `.counted`.
 obligation: Nfa,
+/// How the pending attempts are held.
+mode: Mode,
 /// How many attempts can be pending at once — the obligation's longest match,
 /// and so the number of state vectors a backend allocates.
+///
+/// Zero, and meaningless, when `mode` is `.counted`: there is no bound to
+/// report, which is the whole reason that mode exists. A counted backend
+/// allocates one `u64` per obligation state instead.
 depth: u32,
+/// How many antecedent attempts the trigger tracks apart — its longest match,
+/// and so the number of attempt ids a backend rotates through.
+///
+/// Zero when nothing has to be told apart, which is the common case and costs a
+/// backend the whole mechanism: `fires` is then `Nfa.matched`, one bit, exactly
+/// as it was. See `# Counting the trigger` for when a zero is available and why
+/// an unbounded antecedent is refused instead of tracked. Always zero without a
+/// trigger.
+trigger_window: u32,
 /// What a pending attempt does when a finite trace ends.
 strength: Strength,
 /// Index into `alphabet.roots` of the reset condition. Always a real root: an
@@ -104,11 +249,75 @@ aborts: []Abort,
 /// `obligation.words` long. Read it with `maskOf`.
 abort_masks: []Word,
 
+/// What a monitor knows about one attempt. Three values, because a monitor
+/// watches a finite prefix of a trace and a prefix does not decide every
+/// property: an attempt that has neither completed a match nor run out of
+/// futures is *pending*, and pending is a verdict rather than the absence of
+/// one.
+///
+/// Naming it is what `prop_not` costs. Complementing an automaton exchanges
+/// match for no-match, which is two of these; the third has no automaton to
+/// invert it and needs the rule written down:
+///
+///     not holds   = fails
+///     not fails   = holds
+///     not pending = pending
+///
+/// The last line is the load-bearing one. It says a complement may not resolve
+/// an attempt one cycle before its operand resolves, however certain the
+/// outcome has become — which is exactly what makes `not` an involution, and is
+/// the reason `Glushkov.Plan.pending` exists. Without it `not not p` would drift
+/// earlier than `p` on every trace where a match becomes inevitable before it
+/// completes.
+pub const Verdict = enum(u8) {
+    /// Neither decided yet. The trace so far permits both outcomes.
+    pending = 0,
+    /// The attempt is discharged: it holds, and a `cover` counts it.
+    holds = 1,
+    /// The attempt failed.
+    fails = 2,
+
+    pub fn not(verdict: Verdict) Verdict {
+        return switch (verdict) {
+            .pending => .pending,
+            .holds => .fails,
+            .fails => .holds,
+        };
+    }
+};
+
 pub const Strength = enum(u8) {
     /// A pending attempt holds when the trace ends.
     weak,
     /// A pending attempt fails when the trace ends.
     strong,
+
+    /// What the end of a finite trace makes of an attempt still pending — the
+    /// whole content of the weak/strong distinction, as a `Verdict`.
+    pub fn atEnd(strength: Strength) Verdict {
+        return switch (strength) {
+            .weak => .holds,
+            .strong => .fails,
+        };
+    }
+
+    /// The dual, LRM 16.12.2. `not` swaps the two, because negating a pending
+    /// attempt leaves it pending and only its end-of-trace disposition inverts.
+    pub fn not(strength: Strength) Strength {
+        return switch (strength) {
+            .weak => .strong,
+            .strong => .weak,
+        };
+    }
+};
+
+pub const Mode = enum(u8) {
+    /// One state vector per pending attempt, `depth` of them. The obligation's
+    /// longest match is bounded, so the pool is too.
+    ring,
+    /// One `u64` counter per obligation state, and the obligation determinised.
+    /// See the file comment for the two rules this mode puts on a backend.
+    counted,
 };
 
 /// An abort scoped to a subtree of the obligation: `accept_on` and friends.
@@ -129,17 +338,25 @@ pub const Abort = struct {
     /// Whether the abort covers the trigger as well as the obligation: an abort
     /// written *above* the implication rather than inside its consequent.
     ///
-    /// A trigger is the union of every attempt's antecedent, so resolving one
-    /// attempt of it and leaving the others matching is not expressible. It
-    /// never has to be. A monitor has exactly one trigger — every operator that
-    /// could put an abort beside a second one refuses first — so an abort above
-    /// it covers all of its attempts uniformly, and one verdict says everything
-    /// there is to say. `step` resolves the antecedent match ending this cycle
-    /// with `effect` instead of seeding an obligation from it.
+    /// A monitor has exactly one trigger — every operator that could put an
+    /// abort beside a second one refuses first — so an abort above it covers
+    /// every attempt of that trigger, uniformly: the condition is a fact about
+    /// this cycle, and every attempt with a live antecedent thread is one this
+    /// cycle is inside the evaluation of. Uniformly is not collectively, though.
+    /// Each of those attempts is a separate evaluation and owes a verdict of its
+    /// own, so `step` resolves as many as there are — `trigger_window` is what
+    /// counts them — clears their threads out of the trigger so none can
+    /// complete an antecedent later and impose an obligation on an attempt that
+    /// has already been resolved, and seeds nothing from them.
     ///
-    /// Only ever set on a trigger whose every antecedent match is one cycle
-    /// long; `lowerAbort` refuses the rest, because an attempt halfway through a
-    /// longer antecedent owes a verdict of its own that the union cannot count.
+    /// An attempt with no live antecedent thread is not one of them. It can no
+    /// longer match, so the implication already holds vacuously and there is
+    /// nothing left under evaluation to abort — which is also why a monitor that
+    /// reports no vacuous passes reports none here either.
+    ///
+    /// This is why the window is not zero for a multi-cycle antecedent even when
+    /// no two of its matches can end in one cycle: `(a ##1 b) |-> c` needs no
+    /// count for its verdicts and does need one for this.
     covers_trigger: bool,
     /// Which valuation of `cond` a backend must supply: the sampled one for
     /// `sync_accept_on`/`sync_reject_on`, the live one for the plain forms
@@ -163,8 +380,32 @@ pub const Abort = struct {
         accept,
         /// The attempt fails.
         reject,
+
+        /// The `Verdict` firing hands the attempt. An abort always resolves,
+        /// so this is never `.pending`.
+        pub fn verdict(effect: Effect) Verdict {
+            return switch (effect) {
+                .accept => .holds,
+                .reject => .fails,
+            };
+        }
     };
 
+    /// How much of an attempt firing resolves, and — because a `.counted`
+    /// monitor's attempts share their state — how much of one it *can* resolve.
+    ///
+    /// Being armed is a property of the state, not of the attempt's history: an
+    /// abort is armed when the subtree it guards could hold a thread this cycle,
+    /// which is `⋃ follow` of where the attempt is. In `.counted` mode where the
+    /// attempt is *is* one determinised state, so every attempt counted there is
+    /// armed or none is, and retiring the whole count is exact rather than an
+    /// approximation of retiring "the" attempt. That is what `step` does.
+    ///
+    /// `.branch` has no such reading and is refused at lowering time for a
+    /// counted obligation. Killing part of an attempt means clearing states out
+    /// of its vector, and a counted attempt has no vector to clear: its single
+    /// state stands for a whole subset of the operand's, and subtracting a mask
+    /// from it would have to split that subset into a state that does not exist.
     pub const Scope = enum(u8) {
         /// Firing resolves the whole attempt. An accept always does — a
         /// disjunct holding makes the disjunction hold — and so does a reject
@@ -172,7 +413,7 @@ pub const Abort = struct {
         attempt,
         /// Firing only kills the threads in the mask, leaving the rest of the
         /// attempt to run on. A reject under a disjunction: that disjunct is
-        /// dead, the other may still hold.
+        /// dead, the other may still hold. `.ring` mode only.
         branch,
     };
 };
@@ -191,13 +432,24 @@ pub fn maskOf(monitor: *const Monitor, index: usize) []const Word {
     return monitor.abort_masks[index * words ..][0..words];
 }
 
+/// Words in one trigger state's attempt-id set. Zero when `trigger_window` is,
+/// which is what makes the whole mechanism cost a backend nothing there.
+pub fn idWords(monitor: *const Monitor) u32 {
+    return Nfa.wordsFor(monitor.trigger_window);
+}
+
 /// What one cycle did. A `cover` counts `matches`; an `assert` reports
 /// `failures`.
 pub const Report = struct {
-    /// Obligation attempts that ran out of live states.
-    failures: u32 = 0,
+    /// Obligation attempts that ran out of live states, or in `.counted` mode
+    /// reached a `dead` state.
+    ///
+    /// Wide because a counted cycle can resolve many attempts at once: one
+    /// `dead` state may hold the count of every attempt that has just failed
+    /// together. See the file comment on why the counters are not saturated.
+    failures: u64 = 0,
     /// Obligation attempts discharged by a completed match.
-    matches: u32 = 0,
+    matches: u64 = 0,
     /// The reset condition held, so everything in flight was abandoned.
     reset: bool = false,
 };
@@ -212,17 +464,35 @@ pub const State = struct {
     /// Trigger and obligation states whose guard holds this cycle.
     trigger_satisfied: []Word,
     obligation_satisfied: []Word,
-    /// The union of every trigger attempt.
+    /// Every trigger state a thread sits in, over every attempt: the existential
+    /// half of the antecedent, and all of it a zero `trigger_window` needs.
     trigger_current: []Word,
+    /// Which attempts have a thread in each trigger state: `idWords()` words per
+    /// trigger state, holding a bit per live attempt id. What `trigger_current`
+    /// cannot say and a count of matches needs — see `# Counting the trigger`.
+    /// Empty, along with its scratch row and `id_union`, when `trigger_window`
+    /// is zero.
+    trigger_ids: []Word,
+    next_ids: []Word,
+    /// One id set of scratch, for the union a count is taken over.
+    id_union: []Word,
+    /// The id this cycle's antecedent attempt is seeded with. Rotates through
+    /// `trigger_window` with the cycle, not with the seedings: the argument that
+    /// an id is free again is about how long a thread can live.
+    id_now: u32,
     /// `depth` obligation state vectors, each either free or holding one
     /// pending attempt. The order is deliberately meaningless: what makes a
     /// fixed pool work is that `depth` is the obligation's longest match, so an
     /// attempt is always resolved before `depth` more have started and a free
     /// slot always exists when one is needed.
     pending: []Word,
-    occupied: []bool,
-    /// Whether the trigger matched in the previous cycle, for `|=>`.
-    fired: bool,
+    /// How many antecedent attempts each slot stands for, and zero for a free
+    /// one. A slot holding one behaves exactly as a `bool` would; holding three
+    /// it reports three verdicts, because three antecedent matches ended in the
+    /// cycle that seeded it and each owes one.
+    attempts: []u64,
+    /// How many antecedent matches ended in the previous cycle, for `|=>`.
+    fired: u64,
     /// `aborts.len * depth` flags: whether an abort's subtree could hold a
     /// thread of that attempt this cycle. Set before the advance from the
     /// reachable set rather than the live one — see `step`. Empty when there are
@@ -231,6 +501,12 @@ pub const State = struct {
     /// One obligation mask of scratch for computing that reachable set.
     abort_reach: []Word,
     scratch: []Word,
+    /// `.counted` mode: how many attempts sit in each obligation state, and one
+    /// row of scratch to advance them into. Both empty in `.ring` mode, where
+    /// `pending`/`attempts` are the live storage instead; exactly one of the two
+    /// pairs is ever allocated.
+    counts: []u64,
+    next_counts: []u64,
 
     pub fn init(gpa: Allocator, monitor: *const Monitor) Allocator.Error!State {
         const obligation_words = monitor.obligation.words;
@@ -246,13 +522,32 @@ pub const State = struct {
         errdefer gpa.free(trigger_current);
         const pending = try gpa.alloc(Word, @as(usize, monitor.depth) * obligation_words);
         errdefer gpa.free(pending);
-        const occupied = try gpa.alloc(bool, monitor.depth);
-        errdefer gpa.free(occupied);
+        const attempts = try gpa.alloc(u64, monitor.depth);
+        errdefer gpa.free(attempts);
+        // One id set per trigger state, and two more rows to work in. All three
+        // are empty when nothing has to be told apart, which is what "zero
+        // window, zero cost" means for a backend allocating alongside this one.
+        const id_words = monitor.idWords();
+        const trigger_states = if (monitor.trigger) |trigger| trigger.state_count else 0;
+        const trigger_ids = try gpa.alloc(Word, @as(usize, trigger_states) * id_words);
+        errdefer gpa.free(trigger_ids);
+        const next_ids = try gpa.alloc(Word, trigger_ids.len);
+        errdefer gpa.free(next_ids);
+        const id_union = try gpa.alloc(Word, id_words);
+        errdefer gpa.free(id_union);
         const abort_entered = try gpa.alloc(bool, monitor.aborts.len * monitor.depth);
         errdefer gpa.free(abort_entered);
         const abort_reach = try gpa.alloc(Word, obligation_words);
         errdefer gpa.free(abort_reach);
         const scratch = try gpa.alloc(Word, @max(trigger_words, obligation_words));
+        errdefer gpa.free(scratch);
+        // `depth` is zero in `.counted` mode and the counters are what replace
+        // the ring, so exactly one of the two allocations is non-empty.
+        const counted = monitor.mode == .counted;
+        const slots: usize = if (counted) monitor.obligation.state_count else 0;
+        const counts = try gpa.alloc(u64, slots);
+        errdefer gpa.free(counts);
+        const next_counts = try gpa.alloc(u64, slots);
 
         var state: State = .{
             .monitor = monitor,
@@ -261,11 +556,17 @@ pub const State = struct {
             .obligation_satisfied = obligation_satisfied,
             .trigger_current = trigger_current,
             .pending = pending,
-            .occupied = occupied,
-            .fired = false,
+            .attempts = attempts,
+            .trigger_ids = trigger_ids,
+            .next_ids = next_ids,
+            .id_union = id_union,
+            .id_now = 0,
+            .fired = 0,
             .abort_entered = abort_entered,
             .abort_reach = abort_reach,
             .scratch = scratch,
+            .counts = counts,
+            .next_counts = next_counts,
         };
         state.clear();
         return state;
@@ -277,19 +578,30 @@ pub const State = struct {
         gpa.free(state.obligation_satisfied);
         gpa.free(state.trigger_current);
         gpa.free(state.pending);
-        gpa.free(state.occupied);
+        gpa.free(state.attempts);
+        gpa.free(state.trigger_ids);
+        gpa.free(state.next_ids);
+        gpa.free(state.id_union);
         gpa.free(state.abort_entered);
         gpa.free(state.abort_reach);
         gpa.free(state.scratch);
+        gpa.free(state.counts);
+        gpa.free(state.next_counts);
     }
 
     /// Abandon everything in flight.
     pub fn clear(state: *State) void {
         @memset(state.trigger_current, 0);
         @memset(state.pending, 0);
-        @memset(state.occupied, false);
+        @memset(state.attempts, 0);
+        @memset(state.trigger_ids, 0);
+        @memset(state.counts, 0);
         @memset(state.abort_entered, false);
-        state.fired = false;
+        state.fired = 0;
+        // The rotation is not reset with it. Reclaiming an id needs the attempt
+        // that held it to be gone, and a reset has just made that true of every
+        // attempt there was, so where the rotation stands is immaterial — and
+        // leaving it where it is keeps the id a cycle's function.
     }
 
     /// The state vector of the attempt living in `slot`.
@@ -298,11 +610,114 @@ pub const State = struct {
         return state.pending[@as(usize, slot) * words ..][0..words];
     }
 
+    /// A slot no attempt is living in. Occupancy is the count being non-zero: a
+    /// second array saying whether a slot is live could disagree with the count
+    /// in it, and one of the two would be the bug.
     fn freeSlot(state: *const State) ?u32 {
-        for (state.occupied, 0..) |busy, slot| {
-            if (!busy) return @intCast(slot);
+        for (state.attempts, 0..) |count, slot| {
+            if (count == 0) return @intCast(slot);
         }
         return null;
+    }
+
+    /// The attempt ids sitting in trigger state `index`, in `rows` — either
+    /// `trigger_ids` or the scratch row set it is advanced into.
+    fn idsIn(state: *const State, rows: []Word, index: u32) []Word {
+        const words = state.monitor.idWords();
+        return rows[@as(usize, index) * words ..][0..words];
+    }
+
+    /// Move every attempt one cycle along the trigger, by union.
+    ///
+    /// Nothing to do when nothing is tracked. The transfer walks the same
+    /// `follow ∩ satisfied` relation `Nfa.advance` does, one union per enabled
+    /// edge, which is what keeps the two representations from coming apart: a
+    /// state carries an attempt's id exactly when it holds a thread of it, so
+    /// `trigger_current` is `{ s : ids[s] != 0 }` in every cycle.
+    ///
+    /// Union, not addition. Two threads of one attempt that reconverge here are
+    /// one attempt, and an attempt is what a match belongs to — see
+    /// `# Counting the trigger`.
+    fn advanceIds(state: *State, trigger: *const Nfa) void {
+        if (state.monitor.trigger_window == 0) return;
+
+        @memset(state.next_ids, 0);
+        var live: Nfa.BitIterator = .init(state.trigger_current);
+        while (live.next()) |from| {
+            const ids = state.idsIn(state.trigger_ids, from);
+            for (trigger.followOf(from), state.trigger_satisfied, 0..) |edges, holding, word| {
+                var enabled = edges & holding;
+                while (enabled != 0) {
+                    const target = word * Nfa.word_bits + @ctz(enabled);
+                    enabled &= enabled - 1;
+                    Nfa.bitUnion(state.idsIn(state.next_ids, @intCast(target)), ids);
+                }
+            }
+        }
+        @memcpy(state.trigger_ids, state.next_ids);
+    }
+
+    /// Start this cycle's antecedent attempt under the rotating id.
+    fn seedId(state: *State, trigger: *const Nfa) void {
+        const window = state.monitor.trigger_window;
+        if (window == 0) return;
+
+        const id = state.id_now;
+        state.id_now = if (id + 1 == window) 0 else id + 1;
+
+        // Nothing retires the id first. `window` is the trigger's longest match
+        // and every trigger state is co-reachable to an exit, so a thread of the
+        // attempt that held this id `window` cycles ago would witness a match
+        // longer than the longest one there is. It is gone of its own accord,
+        // which this asserts rather than paying a pass over the rows to ensure.
+        if (std.debug.runtime_safety) {
+            for (0..trigger.state_count) |index| {
+                const ids = state.idsIn(state.trigger_ids, @intCast(index));
+                std.debug.assert(!Nfa.bitIsSet(ids, id));
+            }
+        }
+
+        for (trigger.first, state.trigger_satisfied, 0..) |entry, holding, word| {
+            var entering = entry & holding;
+            while (entering != 0) {
+                const target = word * Nfa.word_bits + @ctz(entering);
+                entering &= entering - 1;
+                Nfa.bitSet(state.idsIn(state.trigger_ids, @intCast(target)), id);
+            }
+        }
+    }
+
+    /// How many attempts hold a thread in one of `states`.
+    fn idCount(state: *State, states: []const Word) u64 {
+        @memset(state.id_union, 0);
+        var live: Nfa.BitIterator = .init(states);
+        while (live.next()) |index| {
+            Nfa.bitUnion(state.id_union, state.idsIn(state.trigger_ids, index));
+        }
+        return Nfa.bitCount(state.id_union);
+    }
+
+    /// How many antecedent matches end in this cycle — step 4's answer, and how
+    /// many attempts the obligation it seeds stands for.
+    fn matchCount(state: *State, trigger: *const Nfa) u64 {
+        if (state.monitor.trigger_window == 0) {
+            return @intFromBool(trigger.matched(state.trigger_current));
+        }
+        return state.idCount(trigger.last);
+    }
+
+    /// How many attempts have a live antecedent thread, whether their match ends
+    /// now or they are still matching: what an abort covering the trigger
+    /// resolves, one verdict each.
+    ///
+    /// The matches alone when nothing is tracked, and that is exact rather than a
+    /// fallback: a window is zero only when every match spans the same number of
+    /// cycles, and an abort covering the trigger forces one whenever that number
+    /// exceeds one, so an untracked trigger under an abort holds no thread that
+    /// outlives the cycle it was seeded in.
+    fn inFlightCount(state: *State, fires: u64) u64 {
+        if (state.monitor.trigger_window == 0) return fires;
+        return state.idCount(state.trigger_current);
     }
 
     /// Advance one cycle, given a bit per `alphabet.roots`.
@@ -321,31 +736,37 @@ pub const State = struct {
 
         monitor.obligation.satisfy(&monitor.alphabet, root_bits, state.obligation_satisfied);
 
-        var fires = false;
+        var fires: u64 = 0;
+        var in_flight: u64 = 0;
         if (monitor.trigger) |*trigger| {
             trigger.satisfy(&monitor.alphabet, root_bits, state.trigger_satisfied);
+            // The ids ride the transitions the vector rides, so they move off
+            // the same pre-advance set and have to move first.
+            state.advanceIds(trigger);
             const next = state.scratch[0..trigger.words];
             trigger.advance(state.trigger_current, state.trigger_satisfied, next);
             @memcpy(state.trigger_current, next);
             trigger.seed(state.trigger_satisfied, state.trigger_current);
-            fires = trigger.matched(state.trigger_current);
+            state.seedId(trigger);
+            fires = state.matchCount(trigger);
+            in_flight = state.inFlightCount(fires);
         }
 
-        // An abort above the implication covers the antecedent too, so a match
-        // ending now is resolved by it rather than seeding an obligation. This
-        // is the cycle the pushed-down spelling cannot see at all.
+        // An abort above the implication covers the antecedent too, so the
+        // attempts still matching one are resolved by it rather than left to
+        // seed obligations. This is the cycle the pushed-down spelling cannot
+        // see at all.
         //
-        // Nothing here tells one attempt from another, and nothing needs to:
-        // the trigger is the union of every attempt's antecedent, but the abort
-        // covers all of them, so one verdict discharges what the union stands
-        // for. It is also why the trigger vector is left alone rather than
-        // cleared. `lowerAbort` only sets `covers_trigger` when every follow row
-        // of the trigger is empty, so no partially matched antecedent survives
-        // this cycle to complete later and impose an obligation on an attempt
-        // the abort has already resolved. Lift that restriction and this is the
-        // first thing that has to change.
+        // Every attempt with a live antecedent thread is resolved, not only the
+        // ones whose match ends now: this cycle is inside the evaluation of each
+        // of them, which is what arms an abort. They are counted rather than
+        // collapsed — `in_flight` of them, each owing its own verdict — and
+        // their threads are cleared out of the trigger, because an antecedent
+        // completing later would impose an obligation on an attempt this verdict
+        // has already resolved. Clearing the whole vector is exactly clearing
+        // each of them, an abort above the trigger covering every attempt of it.
         var trigger_verdict: ?Abort.Effect = null;
-        if (fires) {
+        if (in_flight != 0) {
             for (monitor.aborts) |abort| {
                 if (!abort.covers_trigger) continue;
                 if (!Nfa.bitIsSet(root_bits, abort.cond)) continue;
@@ -354,8 +775,24 @@ pub const State = struct {
                 // landing in the same cycle.
                 trigger_verdict = abort.effect;
             }
-            if (trigger_verdict != null) fires = false;
+            if (trigger_verdict != null) {
+                fires = 0;
+                @memset(state.trigger_current, 0);
+                @memset(state.trigger_ids, 0);
+            }
         }
+
+        var report: Report = .{};
+        if (trigger_verdict) |effect| switch (effect) {
+            .accept => report.matches += in_flight,
+            .reject => report.failures += in_flight,
+        };
+
+        // The two disciplines part company here. Everything above is shared —
+        // the reset, the satisfied masks, the trigger, and the verdict an abort
+        // covering the trigger produces — and everything below is only about how
+        // the pending obligation attempts are held.
+        if (monitor.mode == .counted) return state.stepCounted(root_bits, fires, report);
 
         // Which aborts each attempt is inside for this cycle, guards aside.
         //
@@ -371,8 +808,8 @@ pub const State = struct {
         const depth = monitor.depth;
         @memset(state.abort_entered, false);
         if (monitor.aborts.len != 0) {
-            for (state.occupied, 0..) |busy, slot| {
-                if (!busy) continue;
+            for (state.attempts, 0..) |count, slot| {
+                if (count == 0) continue;
                 @memset(state.abort_reach, 0);
                 var live: Nfa.BitIterator = .init(state.slotOf(@intCast(slot)));
                 while (live.next()) |from| {
@@ -386,28 +823,34 @@ pub const State = struct {
         }
 
         const next = state.scratch[0..monitor.obligation.words];
-        for (state.occupied, 0..) |busy, slot| {
-            if (!busy) continue;
+        for (state.attempts, 0..) |count, slot| {
+            if (count == 0) continue;
             const current = state.slotOf(@intCast(slot));
             monitor.obligation.advance(current, state.obligation_satisfied, next);
             @memcpy(current, next);
         }
 
-        const seeding = if (monitor.trigger == null)
-            true
+        // How many attempts a seeding stands for. One per cycle without a
+        // trigger; otherwise as many antecedent matches as ended in the cycle
+        // the obligation starts from, which is this one under `|->` and the
+        // previous one under `|=>`. Zero is no seeding at all.
+        const born: u64 = if (monitor.trigger == null)
+            1
         else if (monitor.overlap)
             fires
         else
             state.fired;
-        if (seeding) {
+        if (born != 0) {
             // A slot is always free here: an attempt is resolved by the time it
             // is `depth - 1` cycles old, so at most `depth - 1` of them survived
-            // into this cycle.
+            // into this cycle. Several matches ending together still take one
+            // slot — they impose the same obligation from the same cycle, so one
+            // state vector answers for all of them and the count says how many.
             const slot = state.freeSlot() orelse unreachable;
             const current = state.slotOf(slot);
             @memset(current, 0);
             monitor.obligation.seed(state.obligation_satisfied, current);
-            state.occupied[slot] = true;
+            state.attempts[slot] = born;
             // A fresh attempt reaches the entry states, guards aside.
             for (monitor.aborts, 0..) |_, index| {
                 if (Nfa.bitOverlaps(monitor.obligation.first, monitor.maskOf(index))) {
@@ -416,14 +859,6 @@ pub const State = struct {
             }
         }
         state.fired = fires;
-
-        var report: Report = .{};
-        if (trigger_verdict) |effect| {
-            switch (effect) {
-                .accept => report.matches += 1,
-                .reject => report.failures += 1,
-            }
-        }
 
         // Aborts resolve an attempt before it would have resolved itself. Each
         // is checked against every attempt separately, because being armed is a
@@ -448,8 +883,8 @@ pub const State = struct {
             const abort = monitor.aborts[index];
             if (!Nfa.bitIsSet(root_bits, abort.cond)) continue;
             const mask = monitor.maskOf(index);
-            for (state.occupied, 0..) |busy, slot| {
-                if (!busy) continue;
+            for (state.attempts, 0..) |count, slot| {
+                if (count == 0) continue;
                 // Armed if the abort's subtree could hold a thread of this
                 // attempt this cycle. That is the reachable set, computed above:
                 // the live set would miss both the cycle the subtree is entered
@@ -458,12 +893,16 @@ pub const State = struct {
                 const current = state.slotOf(@intCast(slot));
                 switch (abort.scope) {
                     .attempt => {
-                        switch (abort.effect) {
-                            .accept => report.matches += 1,
-                            .reject => report.failures += 1,
+                        // One verdict per attempt the slot stands for. The abort
+                        // is armed by the slot's state vector, which every one of
+                        // them shares, so it fires for all or for none.
+                        switch (abort.effect.verdict()) {
+                            .holds => report.matches += count,
+                            .fails => report.failures += count,
+                            .pending => unreachable, // an abort always resolves
                         }
                         @memset(current, 0);
-                        state.occupied[slot] = false;
+                        state.attempts[slot] = 0;
                     },
                     // The guarded threads die; whether that kills the attempt
                     // is the ordinary verdict below deciding it has no live
@@ -473,17 +912,133 @@ pub const State = struct {
             }
         }
 
-        for (state.occupied, 0..) |busy, slot| {
-            if (!busy) continue;
+        for (state.attempts, 0..) |count, slot| {
+            if (count == 0) continue;
             const current = state.slotOf(@intCast(slot));
             if (monitor.obligation.matched(current)) {
-                report.matches += 1;
-                state.occupied[slot] = false;
+                report.matches += count;
+                state.attempts[slot] = 0;
             } else if (!Nfa.bitAny(current)) {
-                report.failures += 1;
-                state.occupied[slot] = false;
+                report.failures += count;
+                state.attempts[slot] = 0;
             }
         }
+        return report;
+    }
+
+    /// `step`'s second half for `.counted` mode: a `u64` per obligation state
+    /// where the ring has a vector per attempt.
+    ///
+    /// The order is `step`'s, with one deliberate difference. The ring applies
+    /// aborts *after* the advance, which it can afford because an
+    /// `.attempt`-scoped abort discards the post-advance vector anyway and the
+    /// arming flag was read off the pre-advance one. Here they have to be applied
+    /// before, and not for tidiness: two states can share a successor —
+    /// everything that has just died shares the trap — and once two counts have
+    /// merged there is no telling which of them was armed. Retiring before the
+    /// merge keeps it exact, and lands the same verdict in the same cycle as the
+    /// ring, because either way a retired attempt is never looked at again.
+    fn stepCounted(
+        state: *State,
+        root_bits: []const Word,
+        fires: u64,
+        partial: Report,
+    ) Report {
+        const monitor = state.monitor;
+        const obligation = &monitor.obligation;
+        const satisfied = state.obligation_satisfied;
+
+        // Whatever step 5 already resolved on the trigger, which is the same
+        // either side of the split.
+        var report = partial;
+
+        // Aborts, outermost first, against the counts as they stand. Being armed
+        // is a question about the *state* — could the guarded subtree hold a
+        // thread of an attempt sitting here this cycle — so one answer serves
+        // every attempt counted there, and retiring the whole count is exact.
+        // The reachable set is the same `⋃ follow` the ring computes, over a live
+        // set that happens to be a single state.
+        for (state.counts, 0..) |*count, index| {
+            if (count.* == 0) continue;
+            const from: u32 = @intCast(index);
+            var at = monitor.aborts.len;
+            while (at > 0) {
+                at -= 1;
+                const abort = monitor.aborts[at];
+                if (!Nfa.bitIsSet(root_bits, abort.cond)) continue;
+                if (!Nfa.bitOverlaps(obligation.followOf(from), monitor.maskOf(at))) continue;
+                // `.branch` is refused for a counted obligation: there is no
+                // vector to subtract a mask from. See `Abort.Scope`.
+                std.debug.assert(abort.scope == .attempt);
+                switch (abort.effect.verdict()) {
+                    .holds => report.matches += count.*,
+                    .fails => report.failures += count.*,
+                    .pending => unreachable,
+                }
+                count.* = 0;
+                break;
+            }
+        }
+
+        // The advance. One successor per state and no more — see `chosenFollow`
+        // for why several can be enabled and why the lowest is the right one.
+        @memset(state.next_counts, 0);
+        for (state.counts, 0..) |count, index| {
+            if (count == 0) continue;
+            const target = obligation.chosenFollow(@intCast(index), satisfied) orelse
+                unreachable; // total: some cell holds this cycle's valuation
+            state.next_counts[target] += count;
+        }
+
+        const born: u64 = if (monitor.trigger == null)
+            1
+        else if (monitor.overlap)
+            fires
+        else
+            state.fired;
+        if (born != 0) {
+            const entry = obligation.chosenSeed(satisfied) orelse unreachable;
+            // A fresh attempt is armed by `first` rather than by a follow row,
+            // and its fate is settled before its count is added: afterwards it is
+            // indistinguishable from whatever else landed in that state. All
+            // `born` of them share that fate — one state, one arming, and the
+            // count is what says how many verdicts it is worth.
+            var seeded: u64 = born;
+            var at = monitor.aborts.len;
+            while (at > 0) {
+                at -= 1;
+                const abort = monitor.aborts[at];
+                if (!Nfa.bitIsSet(root_bits, abort.cond)) continue;
+                if (!Nfa.bitOverlaps(obligation.first, monitor.maskOf(at))) continue;
+                std.debug.assert(abort.scope == .attempt);
+                switch (abort.effect.verdict()) {
+                    .holds => report.matches += born,
+                    .fails => report.failures += born,
+                    .pending => unreachable,
+                }
+                seeded = 0;
+                break;
+            }
+            state.next_counts[entry] += seeded;
+        }
+        state.fired = fires;
+
+        // Verdicts. An exit and a `dead` state cannot be the same state — dead
+        // stands for the empty subset and an exit for a subset holding one of the
+        // operand's — so testing the exit first mirrors the ring rather than
+        // imposing a precedence.
+        for (state.next_counts, 0..) |*count, index| {
+            if (count.* == 0) continue;
+            const at: u32 = @intCast(index);
+            if (Nfa.bitIsSet(obligation.last, at)) {
+                report.matches += count.*;
+                count.* = 0;
+            } else if (obligation.isDead(at)) {
+                report.failures += count.*;
+                count.* = 0;
+            }
+        }
+        @memcpy(state.counts, state.next_counts);
         return report;
     }
 
@@ -496,11 +1051,32 @@ pub const State = struct {
     }
 
     /// Resolve what is still pending because the trace ended.
+    ///
+    /// Every attempt reaching here is `.pending` by definition — anything the
+    /// trace decided was reported in the cycle it was decided — so the whole
+    /// question is what the strength turns that into, which is `Strength.atEnd`.
     pub fn finish(state: *State) Report {
         var report: Report = .{};
-        for (state.occupied) |occupied| {
-            if (!occupied) continue;
-            if (state.monitor.strength == .strong) report.failures += 1;
+        const at_end = state.monitor.strength.atEnd();
+        switch (state.monitor.mode) {
+            // Every attempt a slot stands for is still pending, exactly as every
+            // attempt sharing a counted state is.
+            .ring => for (state.attempts) |count| {
+                switch (at_end) {
+                    .fails => report.failures += count,
+                    .holds => {},
+                    .pending => unreachable, // a trace that ended decides every attempt
+                }
+            },
+            // Every attempt still counted anywhere is still pending, however
+            // many share a state.
+            .counted => for (state.counts) |count| {
+                switch (at_end) {
+                    .fails => report.failures += count,
+                    .holds => {},
+                    .pending => unreachable,
+                }
+            },
         }
         state.clear();
         return report;

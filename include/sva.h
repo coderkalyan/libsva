@@ -8,16 +8,19 @@
  *
  * OBJECTS
  *
- * An sva_ir, an sva_monitor and an sva_run are libsva's objects in your own
- * storage: declare one, initialise it in place, tear it down there. Only what
- * they grow internally is allocated, and libsva picks its own allocator, so
- * there is nothing to configure and nothing to pass. Their contents are opaque.
+ * An sva_ir, an sva_monitor and an sva_run are incomplete types: libsva
+ * allocates one and hands back a pointer, and you hand that pointer back to be
+ * destroyed. libsva picks its own allocator, so there is nothing to configure
+ * and nothing to pass, and nothing out here depends on how big any of them is.
+ * The ABI section below says what that last part replaced.
  *
- * An sva_automaton is only reached by pointer, so it has no size here at all.
+ * An sva_automaton is reached only by pointer and is owned by its monitor.
  * Reading a monitor is direct: an accessor hands back a pointer to a whole array
  * and you index it. One call per table, not per element.
  *
- * Pointer arguments must not be null, except where a comment says otherwise.
+ * Pointer arguments must not be null, except where a comment says otherwise —
+ * and every destroying call accepts null, so a failure path needs one
+ * unconditional cleanup rather than a branch per object it got as far as.
  *
  *
  * FAILURE
@@ -26,18 +29,18 @@
  * parameter, written only on SVA_OK. The only thing a builder can report is an
  * allocation failure:
  *
- *     sva_ir ir;
- *     sva_ir_init(&ir);
+ *     sva_ir *ir = sva_ir_create();
+ *     if (ir == NULL) goto fail;
  *
  *     sva_node req, ack, consequent, property;
  *     uint32_t directive;
- *     if (sva_bool_atom(&ir, 0, &req) != SVA_OK) goto fail;
- *     if (sva_seq_boolean(&ir, req, &req) != SVA_OK) goto fail;
+ *     if (sva_bool_atom(ir, 0, &req) != SVA_OK) goto fail;
+ *     if (sva_seq_boolean(ir, req, &req) != SVA_OK) goto fail;
  *     ...
- *     if (sva_ir_add(&ir, &d, &directive) != SVA_OK) goto fail;
+ *     if (sva_ir_add(ir, &d, &directive) != SVA_OK) goto fail;
  *
- *     sva_monitor monitor;
- *     if (sva_lower(&monitor, &ir, directive, NULL, NULL) == SVA_OK) { ... }
+ *     sva_monitor *monitor;
+ *     if (sva_lower(&monitor, ir, directive, NULL, NULL) == SVA_OK) { ... }
  *
  * Nothing else is checked. A malformed tree — an operand from the wrong layer, a
  * reversed range, goto over a compound sequence — is a bug in your lowering, not
@@ -99,10 +102,22 @@ typedef enum sva_status {
     SVA_ERROR_STATE_LIMIT = 2,
     /* A monitor would have exceeded sva_options.depth_limit. */
     SVA_ERROR_DEPTH_LIMIT = 3,
-    /* The obligation's matches have no bounded length, so the number of
-       attempts pending at once is unbounded and no fixed pool tracks them.
-       Sound tracking needs the obligation determinised, which is not
-       implemented. */
+    /* An obligation with no bounded longest match that counter tracking cannot
+       represent either. One shape, in two spellings: the operand of an unbounded
+       `always` (SVA_SHIFT_EVERY with hi == SVA_UNBOUNDED), and the LEFT operand
+       of any sva_prop_until form, must each match in a single cycle. The
+       diagnostic names the offending operand.
+
+       Both of those operators are universal over cycles — they say the operand
+       holds at every cycle of a window — which is a statement about one attempt
+       of the operand per cycle, all overlapping. A counted attempt is a single
+       state and cannot carry a set of sub-attempts that grows with the trace.
+       When the operand matches in exactly one cycle each sub-attempt resolves
+       inside its own cycle, the set never grows, and the shape is accepted.
+
+       Existential operators carry no such restriction: the operand of an
+       unbounded s_eventually (SVA_SHIFT_SOME) and the RIGHT operand of an until
+       may span any number of cycles. */
     SVA_ERROR_UNBOUNDED_OBLIGATION = 4,
     /* A property operator's operand raises obligations of its own: an
        implication as a consequent, or under a conjunction, a followed-by or a
@@ -114,72 +129,151 @@ typedef enum sva_status {
     /* Goto or non-consecutive repetition over an operand that is not a single
        boolean. */
     SVA_ERROR_UNSUPPORTED_REPEAT_OPERAND = 6,
-    /* sva_prop_junction over operands of different strength. The pair is pending
-       until both sides resolve, and a pending pair with one weak and one strong
-       side has no single end-of-trace disposition. */
+    /* sva_prop_junction over operands whose strengths do not meet that
+       junction's requirement. The pair is pending until both sides resolve, and
+       one strength per monitor cannot say what the end of a trace makes of a
+       pending pair whose two sides would answer differently.
+
+       SVA_CONJUNCTION and SVA_DISJUNCTION want the two strengths EQUAL.
+       SVA_IMPLIES wants them to DIFFER — the same rule seen through the
+       reduction, since `p implies q` is `not p or q` and `not` inverts
+       strength. SVA_IFF can never satisfy it: the two directions carry q's and
+       p's strengths, and each direction already forced those to be opposite, so
+       the outer conjunction always sees a mixed pair. Every iff is refused.
+
+       None of this is conservative. Take p and q both weak and `p implies q`.
+       On a trace where q has definitively failed and p is still pending, the
+       end of the trace makes p hold, so q was required and the implication
+       fails; on a trace where both are pending it holds. Same monitor, two live
+       state configurations, opposite dispositions, one bit to carry them in.
+
+       Lifting it needs a per-state end-of-trace disposition rather than one
+       sva_monitor_strength per monitor. That would delete this status and let
+       iff lower, and it would change what sva_monitor_strength means. */
     SVA_ERROR_MIXED_STRENGTH = 7,
-    /* An abort whose scope libsva cannot carry, in either of two ways.
+    /* An abort whose scope libsva cannot carry, in any of three ways.
 
        It sits below an operator that renumbers its operand's states, so the
        mask naming the abort's subtree cannot be carried through: a conjunction,
        an SVA_SHIFT_EVERY range, or a followed-by. A disjunction and an
        SVA_SHIFT_SOME range are fine.
 
-       Or it sits above an implication whose antecedent can match over more than
-       one cycle. Covering a trigger works because the abort's scope is the whole
-       trigger, which is the union of every attempt's antecedent — but only while
-       no attempt can be caught halfway through matching one. An attempt that is
-       owes a verdict of its own, and the union has nothing to count it with. A
-       single-cycle antecedent cannot be caught halfway, and is accepted. */
+       Or it does not resolve the whole attempt — sva_monitor_abort_resolves_-
+       attempt would be false — over a monitor that came out SVA_MODE_COUNTED.
+       Killing part of an attempt is a mask subtracted from its state vector, and
+       a counted attempt has no vector: its single state stands for a whole
+       subset of the operand's states, and no state stands for that subset minus
+       the mask. An abort that resolves the whole attempt is carried through
+       determinisation and is fine.
+
+       Or it sits under an sva_prop_not, whatever its scope. Not for want of a
+       mask — that moves through the determinisation perfectly well — but
+       because ARMING does not survive. An abort is armed from the unfiltered
+       one-step image of where an attempt is, deliberately, so that it covers
+       the cycle its subtree's last thread dies in; that cycle is the whole
+       point of an accept, which discharges an attempt the property was about to
+       fail. A determinised successor is already filtered by the valuation, and
+       a complement then deletes the one state that image would have been read
+       off, so the abort would read as unarmed in exactly the cycle it should
+       fire. Lowering it would turn every such accept silently into a failure. */
     SVA_ERROR_UNSUPPORTED_ABORT_SCOPE = 8,
+    /* A trigger strictly below an unbounded operator: always (a |=> b),
+       s_eventually (a |=> b), (a |=> b) until c. The diagnostic names the
+       unbounded operator.
+
+       Tracking mode is one per monitor and this shape wants both at once. The
+       implication's own obligation is bounded, so it is SVA_MODE_RING; the
+       operator above it is not, so it is SVA_MODE_COUNTED. For a *bounded* range
+       the shift lands on the antecedent instead, which is the only correct place
+       for it, and an unbounded range has no filler chain to grow there.
+
+       A trigger ABOVE an unbounded operator is fine and is the point of the
+       mode: req |=> s_eventually ack lowers. A trigger is existential, one state
+       vector shared by all of its attempts, so it needs no bound and composes
+       with either discipline. */
+    SVA_ERROR_MODE_MIX = 9,
+    /* An sva_prop_not libsva cannot carry, in either of two ways.
+
+       It complements an operand that contributes a trigger of its own — the
+       complement of an implication, `not (s |-> p)`. A trigger is the UNION of
+       every attempt of the antecedent, which is sound only for the existential
+       question a trigger is ever asked; complementing needs a per-attempt
+       answer that the union has already discarded. Lowering it as `s #-# not p`
+       is the intended lift — LRM 16.12.9 defines followed-by as
+       `not (seq |-> not prop)`, so that is the same identity read backwards —
+       but it is a rewrite on the tree, which libsva does not do.
+
+       Or it sits below an operator that renumbers its operand's states, so the
+       mask naming the complement's still-pending states cannot be carried
+       through: a conjunction, an SVA_SHIFT_EVERY range, an until, or a
+       followed-by. A disjunction and an SVA_SHIFT_SOME range relocate states as
+       a block and are fine, which is what `implies` needs. Exactly the operator
+       set that refuses an abort mask, for exactly that reason. */
+    SVA_ERROR_UNSUPPORTED_COMPLEMENT = 10,
+    /* An implication whose antecedent has no bounded longest match:
+       (a ##[1:$] b) |-> c, (b[=2]) |-> c. The diagnostic names the antecedent.
+
+       An obligation is owed per antecedent MATCH, so the cycle a match ends in
+       has to report how many attempts ended one there — LRM 16.14.1 starts an
+       evaluation of the consequent per match, and three antecedent matches
+       ending together are three of them. Telling those attempts apart is what
+       sva_monitor_trigger_window is for, and an unbounded antecedent has
+       unboundedly many alive at once to tell apart.
+
+       Refused rather than answered with the number of matching CYCLES, which is
+       what a trigger carrying one bit answers and is wrong by however many
+       attempts ended together. Both tracking modes refuse it: the obligation's
+       discipline has no bearing on the antecedent. */
+    SVA_ERROR_UNBOUNDED_ANTECEDENT = 11,
 } sva_status;
 
 /* ------------------------------------------------------------------------- *
- * Objects
+ * Objects, and the ABI contract that replaced their sizes
  *
- * An sva_ir, an sva_monitor and an sva_run are libsva's objects in your storage:
- * declare one, initialise it in place, tear it down there. Only what they grow
- * internally is allocated, and libsva picks its own allocator, so there is
- * nothing to configure.
+ * These three are incomplete types. libsva allocates one and returns a pointer;
+ * you hand that pointer back to be destroyed. Nothing here says how big any of
+ * them is, because nothing outside libsva has any use for that.
  *
- * The contents are opaque. The sizes here have headroom, and the library fails
- * its own build — naming the size it needs — if a struct outgrows one, so a
- * mismatch is never silent.
+ * That is the whole point of the shape. They used to be byte arrays in your
+ * storage, sized by constants in this header and checked when libsva was built
+ * against the structs they stood for. The check only ever saw one side of the
+ * pair: a header from one revision compiled against an archive from another
+ * passed every build and then overran the caller's stack at run time, with
+ * nothing to catch it, because a buffer the caller allocates cannot be
+ * validated by the library that writes past the end of it. A size nobody
+ * outside libsva knows cannot be got wrong.
+ *
+ * What replaces it is a version that can actually be compared. SVA_ABI_VERSION
+ * is bumped whenever a signature, a layout or the meaning of a value changes.
+ * A consumer MUST check it once at startup:
+ *
+ *     if (sva_abi_version() != SVA_ABI_VERSION) { ...refuse to run... }
+ *
+ * The macro is what your translation unit compiled against and the call is what
+ * it linked, so the two disagreeing is precisely a stale header or a stale
+ * archive — reported at the first call rather than executed.
  * ------------------------------------------------------------------------- */
 
-#define SVA_IR_SIZE      96
-#define SVA_MONITOR_SIZE 288
-#define SVA_RUN_SIZE     160
+#define SVA_ABI_VERSION 4
 
-/* `alignas` is a keyword in C++11 and C23, and spelled `_Alignas` in C11. A C++
-   consumer is the expected case, so this cannot just use the C form. */
-#ifdef __cplusplus
-#define SVA_ALIGNAS(n) alignas(n)
-#else
-#define SVA_ALIGNAS(n) _Alignas(n)
-#endif
+uint32_t sva_abi_version(void);
 
-typedef struct sva_ir {
-    SVA_ALIGNAS(8) unsigned char opaque[SVA_IR_SIZE];
-} sva_ir;
-
-typedef struct sva_monitor {
-    SVA_ALIGNAS(8) unsigned char opaque[SVA_MONITOR_SIZE];
-} sva_monitor;
-
-typedef struct sva_run {
-    SVA_ALIGNAS(8) unsigned char opaque[SVA_RUN_SIZE];
-} sva_run;
-
-/* Reached only by pointer, so it needs no size. */
+typedef struct sva_ir sva_ir;
+typedef struct sva_monitor sva_monitor;
+typedef struct sva_run sva_run;
+/* Owned by the monitor it was read out of, and valid for as long as that is. */
 typedef struct sva_automaton sva_automaton;
 
 /* ------------------------------------------------------------------------- *
  * The IR
  * ------------------------------------------------------------------------- */
 
-void sva_ir_init(sva_ir *ir);
-void sva_ir_deinit(sva_ir *ir);
+/* create/destroy, not init/deinit: those named setting an object up in storage
+   you already had, and there is no such storage now. NULL if the allocation
+   failed, which is the only way this can fail. */
+sva_ir *sva_ir_create(void);
+/* Accepts NULL. */
+void sva_ir_destroy(sva_ir *ir);
 
 uint32_t sva_ir_node_count(const sva_ir *ir);
 /* One past the highest atom handle mentioned, which is the width of the
@@ -214,7 +308,34 @@ typedef enum sva_junction {
     SVA_CONJUNCTION = 0,
     /* p or q — either holding is enough. */
     SVA_DISJUNCTION = 1,
+    /* p implies q — LRM 16.12.2's *property* implication, which is exactly
+       `not p or q`.
+
+       Not sva_prop_implies, which is |-> and |=>: those take a SEQUENCE
+       antecedent, quantify over its matches and contribute a trigger. This
+       takes two properties and contributes nothing but a verdict. */
+    SVA_IMPLIES = 2,
+    /* p iff q — the conjunction of the two directions. Always refused with
+       SVA_ERROR_MIXED_STRENGTH; the tag exists so the refusal can name iff. */
+    SVA_IFF = 3,
 } sva_junction;
+
+/* What a monitor knows about one attempt.
+
+   Three values, because a monitor watches a finite prefix and a prefix does not
+   decide every property: an attempt that has neither completed a match nor run
+   out of futures is PENDING, and pending is a verdict rather than the absence
+   of one.
+
+   sva_prop_not is what forces the lattice into the ABI. Complementing an
+   automaton exchanges match for no-match, which is two of these; the third has
+   no automaton to invert it and needs the rule written down. See
+   sva_verdict_not. */
+typedef enum sva_verdict {
+    SVA_VERDICT_PENDING = 0,
+    SVA_VERDICT_HOLDS = 1,
+    SVA_VERDICT_FAILS = 2,
+} sva_verdict;
 
 typedef enum sva_shift {
     /* The range read disjunctively: the property need hold at only one offset
@@ -224,6 +345,27 @@ typedef enum sva_shift {
        offset. */
     SVA_SHIFT_EVERY = 1,
 } sva_shift;
+
+typedef enum sva_until {
+    /* p until q — weak, and p is not required at the cycle q holds in. */
+    SVA_UNTIL_WEAK = 0,
+    /* p until_with q — weak, and p is required there too. */
+    SVA_UNTIL_WEAK_WITH = 1,
+    /* p s_until q — as SVA_UNTIL_WEAK, but q must arrive before the trace
+       ends. */
+    SVA_UNTIL_STRONG = 2,
+    /* p s_until_with q — as SVA_UNTIL_WEAK_WITH, and q must arrive. */
+    SVA_UNTIL_STRONG_WITH = 3,
+} sva_until;
+
+typedef enum sva_mode {
+    /* One state vector per pending obligation attempt, sva_monitor_depth of
+       them. */
+    SVA_MODE_RING = 0,
+    /* One uint64_t counter per obligation state, and the obligation
+       determinised. */
+    SVA_MODE_COUNTED = 1,
+} sva_mode;
 
 typedef enum sva_abort {
     /* accept_on(b) p — b holding discharges p: it holds. */
@@ -340,16 +482,46 @@ sva_status sva_prop_sequence(sva_ir *ir, sva_strength strength, sva_node sequenc
                              sva_node *out);
 sva_status sva_prop_implies(sva_ir *ir, sva_implication kind, sva_node antecedent,
                             sva_node consequent, sva_node *out);
-/* Both operands must carry the same strength, which is a property of their
-   subtrees rather than of their own tags: sva_lower reports
-   SVA_ERROR_MIXED_STRENGTH, this call does not. */
+/* not p — LRM 16.12.2. The operand's verdict, complemented in the three-valued
+   lattice of sva_verdict: holds where `property` fails, fails where it holds,
+   pending where it is pending.
+
+   Nothing to do with sva_bool_not, which complements a boolean TERM within one
+   cycle. This inverts a whole attempt's verdict, and with it the strength
+   `property` contributes — a not over a weak operand is strong.
+
+   It costs a determinisation of the operand, so it is the second operator whose
+   state count can be exponential in its operand's; SVA_ERROR_STATE_LIMIT names
+   the not if it is. It does NOT force SVA_MODE_COUNTED: a complement borrows
+   its operand's bound, so a ring-tracked operand stays ring-tracked. */
+sva_status sva_prop_not(sva_ir *ir, sva_node property, sva_node *out);
+/* One of the four property junctions. Each constrains the strengths its
+   operands end up carrying, which is a property of their subtrees rather than
+   of their own tags: sva_lower reports SVA_ERROR_MIXED_STRENGTH, this call does
+   not. SVA_CONJUNCTION and SVA_DISJUNCTION want the two equal, SVA_IMPLIES
+   wants them to differ, and SVA_IFF is always refused. */
 sva_status sva_prop_junction(sva_ir *ir, sva_junction kind, sva_node lhs,
                              sva_node rhs, sva_node *out);
 /* A property shifted by lo..hi cycles. SVA_UNBOUNDED as hi spells the unbounded
-   `always p` / `s_eventually p`: it builds, and sva_lower refuses it with
-   SVA_ERROR_UNBOUNDED_OBLIGATION. */
+   `always p` / `s_eventually p`, which lowers to an SVA_MODE_COUNTED monitor.
+   SVA_SHIFT_EVERY additionally wants an operand matching in a single cycle and
+   reports SVA_ERROR_UNBOUNDED_OBLIGATION otherwise; SVA_SHIFT_SOME does not. */
 sva_status sva_prop_shift(sva_ir *ir, sva_shift kind, uint32_t lo, uint32_t hi,
                           sva_node property, sva_node *out);
+/* One of the four `until` forms over two *properties*: lhs holds up to the cycle
+   rhs holds in, inclusively for the _WITH kinds, and the STRONG kinds require
+   that cycle to arrive.
+
+   The kind carries the end-of-trace disposition, so unlike sva_prop_junction
+   this does not care whether the operands' own strengths agree — LRM 16.12.10
+   spells four operators out precisely to say which. An until always lowers to an
+   SVA_MODE_COUNTED monitor: nothing bounds how long lhs may have to hold.
+
+   lhs must match in a single cycle, and sva_lower reports
+   SVA_ERROR_UNBOUNDED_OBLIGATION naming it if not. rhs may span any number of
+   cycles. */
+sva_status sva_prop_until(sva_ir *ir, sva_until kind, sva_node lhs, sva_node rhs,
+                          sva_node *out);
 /* s #-# p and s #=# p. The existential dual of sva_prop_implies: an antecedent
    that never matches makes an implication hold vacuously and makes this fail. */
 sva_status sva_prop_followed_by(sva_ir *ir, sva_implication kind,
@@ -387,12 +559,90 @@ sva_status sva_ir_add(sva_ir *ir, const sva_directive *directive, uint32_t *out)
  * An assertion compiles to one obligation automaton plus, for an implication, a
  * trigger automaton saying when to start one.
  *
- * The two are tracked differently. The trigger is existential — all that matters
- * is whether *some* antecedent match ends this cycle — so the union of every
- * trigger attempt is sound and one state vector does. The obligation is
- * per-attempt: merging attempts is unsound, because one attempt's threads can
- * die while another's live and the union hides the failure. Each pending attempt
- * gets its own state vector, and sva_monitor_depth says how many there can be.
+ * The two are tracked differently. The trigger is asked how many antecedent
+ * matches end this cycle, so one state vector holds every attempt of it and each
+ * state carries the set of attempts whose threads sit there — see
+ * sva_monitor_trigger_window. The obligation is per-attempt: merging attempts is
+ * unsound, because one attempt's threads can die while another's live and the
+ * union hides the failure. What DOES collapse is the obligation itself. Matches
+ * ending in one cycle impose the identical future, so one instance of it serves
+ * them all, carrying the number of attempts it stands for; what does not
+ * collapse is that number, and reporting one verdict for three attempts is a
+ * wrong answer rather than a coarse one.
+ *
+ * How the pending attempts are held is sva_monitor_mode, and there are two
+ * disciplines because there are two kinds of obligation.
+ *
+ * SVA_MODE_RING. Each pending attempt gets its own state vector, and
+ * sva_monitor_depth says how many there can be. That bound is the obligation's
+ * longest match, so it is exact rather than a heuristic: an attempt seeded in
+ * cycle t has matched or run out of live states by cycle t + depth - 1.
+ *
+ * SVA_MODE_COUNTED. An obligation with no bounded longest match has no such ring
+ * — always p, s_eventually p and the until family can leave attempts pending
+ * arbitrarily long, so arbitrarily many are in flight. Their obligation is
+ * *determinised*, and totally: the death of an attempt is a state, not the
+ * absence of one. One determinised state then fully characterises an attempt's
+ * future, so attempts sitting in the same state may share it, and a backend
+ * carries one uint64_t count per obligation state instead of a vector per
+ * attempt. The count is what the verdict needs: two attempts is two failures,
+ * and a merged vector could only ever report one.
+ *
+ * The counted step is, per cycle:
+ *
+ *     next[*] = 0
+ *     for each state s with cnt[s] != 0:
+ *         next[chosen(follow(s) & satisfied)] += cnt[s]
+ *     if seeding: next[chosen(first & satisfied)] += fires
+ *     for each state t with next[t] != 0:
+ *         if      (last & bit(t)) matches  += next[t], next[t] = 0
+ *         else if (dead & bit(t)) failures += next[t], next[t] = 0
+ *     cnt = next
+ *
+ * and two rules in it are not optional.
+ *
+ * ONE SUCCESSOR, LOWEST INDEX WINS. `chosen(m)` above is the lowest set bit of
+ * m, and a count MUST move along exactly one enabled transition. Several can be
+ * enabled at once even though the obligation is determinised: a determinised
+ * state is a (subset, cell) pair and two cells may share a valuation. Such
+ * siblings are bisimilar — same subset, so the same exits and the same
+ * successors — which is why taking the lowest is a choice rather than an
+ * approximation. Summing a count into every enabled successor instead
+ * manufactures attempts out of nothing, and does so only on obligations whose
+ * cells happen to overlap. Isolating the lowest set bit is branch-free
+ * (`m & -m`), so there is no reason to approximate it.
+ *
+ * DEAD, NOT EMPTINESS. The construction is total, so a count never falls off the
+ * automaton and "no live states" never happens. Failure is sva_automaton_dead.
+ *
+ * COUNTING THE TRIGGER. `fires` above is a COUNT, not a flag: it is how many
+ * antecedent matches end this cycle, and an obligation instance is worth that
+ * many verdicts. When sva_monitor_trigger_window is zero it is 0 or 1 and
+ * (current & last) != 0 is the whole of it. When it is W, a backend carries a
+ * W-bit id set per trigger state and maintains, per cycle:
+ *
+ *     ids'[*] = {}
+ *     for each state s with ids[s] != {}:
+ *         for each t in follow(s) & satisfied: ids'[t] |= ids[s]
+ *     for each t in first & satisfied: ids'[t] |= { cycle mod W }
+ *     fires = |union of ids'[t] over t in last|
+ *
+ * UNION, NOT ADDITION, and this is the rule the whole mechanism exists for. A
+ * match is an interval [start, end] (LRM 16.9), so what is being counted is
+ * distinct starts. One attempt can reach an exit along several paths in one
+ * cycle — `a ##[1:2] b ##[1:2] c` matches [t, t+3] through either gap — and that
+ * is ONE match. Adding per-state thread counts reports two; a set union reports
+ * one, and still tells two attempts apart. An id may be reused every W cycles
+ * without being retired: every trigger state can reach an exit, so a thread
+ * outliving the longest match does not exist.
+ *
+ * An abort with sva_monitor_abort_covers_trigger reads the same ids: it resolves
+ * every attempt with a live antecedent thread, which is the union over ALL
+ * states rather than over the exits, one verdict each, and clears them.
+ *
+ * Counters are uint64_t and are not saturated: at seven and a half million ticks
+ * a second a uint32_t overflows in about ten minutes of wall clock, which is a
+ * reachable simulation, and uint64_t is not reachable at all.
  * ------------------------------------------------------------------------- */
 
 /* A state mask is sva_automaton_words of these, least significant bit of word
@@ -417,24 +667,70 @@ typedef struct sva_diagnostic {
     uint64_t size;
 } sva_diagnostic;
 
-/* Lower one directive into `out`. `options` and `diagnostic` may be NULL; `out` is
-   written only on success and `diagnostic` only on failure. The IR may be torn
-   down afterwards: a monitor does not refer back to it, except that its root
-   nodes are only meaningful against it. */
-sva_status sva_lower(sva_monitor *out, const sva_ir *ir, uint32_t directive,
+/* Lower one directive. `options` and `diagnostic` may be NULL; `*out` receives a
+   monitor to destroy with sva_monitor_destroy, and is written only on success,
+   while `diagnostic` is written only on failure. The IR may be torn down
+   afterwards: a monitor does not refer back to it, except that its root nodes
+   are only meaningful against it.
+
+   This one keeps its status return and its out parameter rather than handing
+   the monitor back the way sva_ir_create does, because running out of memory is
+   one of eleven things that can go wrong here and the other ten have to be
+   told apart. */
+sva_status sva_lower(sva_monitor **out, const sva_ir *ir, uint32_t directive,
                      const sva_options *options, sva_diagnostic *diagnostic);
-void sva_monitor_deinit(sva_monitor *monitor);
+/* Accepts NULL. */
+void sva_monitor_destroy(sva_monitor *monitor);
 
 uint32_t sva_monitor_id(const sva_monitor *monitor);
 sva_kind sva_monitor_kind(const sva_monitor *monitor);
 uint32_t sva_monitor_clock(const sva_monitor *monitor);
 
+/* How the monitor's pending obligation attempts are held, and so which step a
+   backend emits. See the section comment above for the two rules
+   SVA_MODE_COUNTED puts on one. */
+sva_mode sva_monitor_mode(const sva_monitor *monitor);
+
 /* Obligation attempts that can be pending at once: the obligation's longest
    match, and so the number of state vectors a backend allocates. An attempt
    started in cycle t has either matched or run out of live states by cycle
-   t + depth - 1. */
+   t + depth - 1.
+
+   ZERO, and meaningless, in SVA_MODE_COUNTED. There is no bound to report there
+   — that is what the mode exists for — and a counted backend allocates one
+   uint64_t per obligation state instead. Do not read a zero as a lowering bug. */
 uint32_t sva_monitor_depth(const sva_monitor *monitor);
+/* Antecedent attempts the trigger tells apart: the number of attempt ids a
+   backend rotates through, with one id set per trigger state. See COUNTING THE
+   TRIGGER above for what maintaining them costs and why a union is not a sum.
+
+   ZERO when one bit answers instead, which is the common case and folds the
+   whole mechanism away. That is an antecedent matching in a single cycle, and
+   equally one whose matches all span the SAME number of cycles: distinct start
+   cycles then end in distinct cycles, so at most one match can end per cycle.
+   `a |=> b` and `(a ##1 b) |-> c` both report zero. So does every monitor
+   without a trigger.
+
+   An unbounded antecedent is refused rather than tracked to a bound — see
+   SVA_ERROR_UNBOUNDED_ANTECEDENT — so a non-zero window is always a real
+   bound. */
+uint32_t sva_monitor_trigger_window(const sva_monitor *monitor);
 sva_strength sva_monitor_strength(const sva_monitor *monitor);
+/* The disposition of an attempt still pending when the trace ends — the whole
+   content of sva_monitor_strength, said as a verdict. Never
+   SVA_VERDICT_PENDING: a trace that has ended decides every attempt.
+
+   Prefer this to reading the strength and branching on it. It is the same
+   number and it cannot be got backwards. */
+sva_verdict sva_monitor_pending(const sva_monitor *monitor);
+/* The negation table of the verdict lattice, and the normative one: anything
+   reporting three-valued results must agree with it rather than re-deriving it.
+
+   The row that matters is SVA_VERDICT_PENDING, which maps to itself. Negating
+   an undecided attempt leaves it undecided, however certain its outcome has
+   become — which is what makes `not` an involution, and is why a complement in
+   libsva never resolves an attempt one cycle before its operand does. */
+sva_verdict sva_verdict_not(sva_verdict verdict);
 /* Meaningless without a trigger. */
 sva_implication sva_monitor_implication(const sva_monitor *monitor);
 /* Root index of the reset condition. Always a real root: an assertion that never
@@ -479,11 +775,21 @@ bool sva_monitor_abort_sampled(const sva_monitor *monitor, uint32_t abort);
    above the implication rather than inside its consequent, so it also covers the
    cycles the antecedent is being matched in. Always false without a trigger.
 
-   When it holds in a cycle an antecedent match ends, resolve that match with the
-   abort's effect and seed no attempt from it. This is not the same property as
-   the abort written inside the consequent, which arms only once the consequent
-   starts — a cycle later, for |=>. So an abort above an implication cannot be
-   pushed down into it.
+   When it holds, resolve EVERY attempt with a live antecedent thread with the
+   abort's effect — the ones whose match ends this cycle and the ones still
+   matching alike, one verdict each and not one between them — clear their
+   threads out of the trigger so that none of them completes an antecedent later,
+   and seed no attempt from any of them. The count is the union of the id sets
+   over every trigger state; without a window there is at most one such attempt
+   and it is the one matching now.
+
+   An attempt with no live antecedent thread is not one of them: it can no longer
+   match, so the implication already holds vacuously and there is nothing under
+   evaluation left to abort.
+
+   This is not the same property as the abort written inside the consequent,
+   which arms only once the consequent starts — a cycle later, for |=>. So an
+   abort above an implication cannot be pushed down into it.
 
    If several of these hold at once, the LAST in the list wins: the list runs
    innermost to outermost, and an outer abort beats an inner verdict landing in
@@ -528,6 +834,14 @@ const sva_word *sva_automaton_follow(const sva_automaton *automaton, uint32_t st
 const sva_word *sva_automaton_first(const sva_automaton *automaton);
 /* [words] — states that complete a match. */
 const sva_word *sva_automaton_last(const sva_automaton *automaton);
+/* [words] — states an obligation attempt has FAILED in. Meaningful in
+   SVA_MODE_COUNTED; all-zero otherwise.
+
+   It is the states standing for the empty subset of the operand's — no
+   continuation of the trace can match from here. Do not re-derive it as "states
+   with no path to an exit": that is a wider set, and for `always p`, which has
+   no exits at all because "for ever" has no finite witness, it is every state. */
+const sva_word *sva_automaton_dead(const sva_automaton *automaton);
 /* [words] — the states carrying `guard`. Building the satisfied mask folds over
    guards rather than gathering per state. */
 const sva_word *sva_automaton_guard_states(const sva_automaton *automaton,
@@ -544,14 +858,20 @@ const sva_word *sva_automaton_guard_states(const sva_automaton *automaton,
  *   1. Evaluate the roots into a bit each.
  *   2. If the reset root holds, abandon everything in flight and stop.
  *   3. Turn the root bits into a satisfied-state mask per automaton.
- *   4. Advance the trigger, then seed it. Note whether a match now ends.
- *   5. Advance every pending obligation attempt.
- *   6. Seed a new attempt: every cycle with no trigger, in the cycle the trigger
- *      fires for |->, and the cycle after for |=>.
- *   7. Take verdicts. An accepting state discharges an attempt; no live states
- *      fails it.
- *   8. At the end of a finite trace, a pending attempt holds if the property is
- *      weak and fails if it is strong.
+ *   4. Advance the trigger, then seed it. Count the matches that now end.
+ *   5. If an abort covering the trigger holds, resolve every attempt with a live
+ *      antecedent thread with its effect, clear them, and seed nothing.
+ *   6. Advance every pending obligation attempt.
+ *   7. Seed a new attempt: every cycle with no trigger, in the cycle the trigger
+ *      fires for |->, and the cycle after for |=>. It stands for as many attempts
+ *      as step 4 counted matches.
+ *   8. Take verdicts. An accepting state discharges an attempt; no live states
+ *      fails it — or in SVA_MODE_COUNTED, a count arriving in a dead state,
+ *      because there the automaton is total and no live states never happens.
+ *      Either way it is worth as many verdicts as it stands for attempts.
+ *   9. At the end of a finite trace, a pending attempt holds if the property is
+ *      weak and fails if it is strong. Every attempt still pending counts, in
+ *      either mode, however many share a state vector or a counter.
  *
  * Seeding before taking verdicts is not incidental: under |-> the obligation
  * starts on the trigger's last cycle, so a one-cycle consequent has to be able
@@ -559,17 +879,23 @@ const sva_word *sva_automaton_guard_states(const sva_automaton *automaton,
  * ------------------------------------------------------------------------- */
 
 typedef struct sva_report {
-    /* Obligation attempts that ran out of live states. */
-    uint32_t failures;
+    /* Obligation attempts that ran out of live states, or in SVA_MODE_COUNTED
+       reached a dead state.
+
+       Wide because one cycle can resolve many attempts at once: one dead state
+       may hold the count of every attempt that has just failed together, and one
+       state vector may stand for every antecedent match that seeded it. */
+    uint64_t failures;
     /* Attempts discharged by a completed match. A cover counts these. */
-    uint32_t matches;
+    uint64_t matches;
     /* The reset condition held, so everything in flight was abandoned. */
     bool reset;
 } sva_report;
 
-/* The monitor must outlive the run and must not move. */
-sva_status sva_run_init(sva_run *run, const sva_monitor *monitor);
-void sva_run_deinit(sva_run *run);
+/* The monitor must outlive the run. NULL if the allocation failed. */
+sva_run *sva_run_create(const sva_monitor *monitor);
+/* Accepts NULL. */
+void sva_run_destroy(sva_run *run);
 
 /* Abandon everything in flight, as a reset does. */
 void sva_run_clear(sva_run *run);

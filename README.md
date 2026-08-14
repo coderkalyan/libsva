@@ -70,7 +70,9 @@ the layer it expects:
   `propJunction` (`.prop_and`, `.prop_or`), `propRange` (`.prop_delay`,
   `.prop_always`), `propFollowedBy` (`.prop_followed_by_overlap`,
   `.prop_followed_by_nonoverlap`), `propAbort` (`.prop_accept_on`,
-  `.prop_reject_on`, `.prop_sync_accept_on`, `.prop_sync_reject_on`).
+  `.prop_reject_on`, `.prop_sync_accept_on`, `.prop_sync_reject_on`),
+  `propUntil` (`.prop_until`, `.prop_until_with`, `.prop_s_until`,
+  `.prop_s_until_with`).
 
 Read a tree back with `tagOf` for a node's operator, `atomOf`, `delayOf`,
 `repeatOf` and `propRangeOf` for its payload, and `operandsOf(node, &buf)` to
@@ -102,11 +104,15 @@ otherwise each antecedent match obliges the consequent.
 
 A finite trace ends with attempts still pending, and their **strength** decides
 what happens: a weak property discharges the obligation and holds, a strong one
-fails. Implication takes its strength from its consequent, and every operator
-above the leaves takes it from its operands. `propJunction` requires its two
-sides to agree: the pair is pending until both resolve, and a pending pair with
-one weak and one strong side has no single disposition to carry, so the lowering
-refuses it rather than picking one.
+fails. Implication takes its strength from its consequent, every operator above
+the leaves takes it from its operands, and `propNot` **inverts** it.
+
+`propJunction` constrains the two sides rather than choosing between them, and
+which constraint depends on the tag. `.prop_and` and `.prop_or` want them equal:
+the pair is pending until both resolve, and a pending pair with one weak and one
+strong side has no single disposition to carry. `.prop_implies` wants them to
+*differ*, which is the same rule seen through its reduction to `not p or q`.
+`.prop_iff` can never satisfy it and is always refused; see "Negation" below.
 
 ### The property layer above a sequence
 
@@ -122,13 +128,25 @@ collapses onto the sequence layer:
 | `propRange .prop_delay` | a filler chain the operand is entered from | `hi` |
 | `propRange .prop_always` | the operand shifted to each offset, conjoined | the product's |
 | `propFollowedBy` | the antecedent *concatenated* with the operand | the fusion's |
+| `propUntil` | the left operand's run, then the right one — `##1` for the plain forms, a `##0` fusion for `_with` | the delay's |
+| `propNot` | the operand determinised, with two masks exchanged | the determinisation's |
 
 `propRange` reads its range **disjunctively** for `.prop_delay` and
 **conjunctively** for `.prop_always`, which is the whole difference between
 `nexttime[n]` / `eventually [m:n]` and `always [m:n]`. The two coincide at
 `lo == hi`. An open `hi` spells the unbounded `always p` and `s_eventually p`,
-and is refused: it leaves the obligation without a longest match, exactly as an
-unbounded delay does.
+which leaves the obligation without a longest match and so selects the counted
+tracking discipline described further down.
+
+`propUntil` is LRM 16.12.10's four operators, and reading the definition as a set
+of matches is what makes them cheap. `p until q` asks that `q` hold at some cycle
+`k` with `p` holding over `[t, k)`, which is `q or (p[*1:$] ##1 q)`; `until_with`
+asks `p` at `k` too, which is a fusion of the run's last cycle with `q`'s first,
+so `p[*1:$] ##0 q` and no disjunct is needed. The `s_` forms are the same
+construction — strength is not a property of the match set but of what becomes of
+an attempt the trace ends with still pending, and `q` never arriving is exactly
+that. Unlike every other property tag, the tag carries the strength rather than
+taking it from its leaves.
 
 `propFollowedBy` is the existential dual of `propImplies`, and it is *not* that
 construction with the verdict flipped. LRM 16.12.9 defines `s #-# p` as
@@ -165,6 +183,83 @@ five-state one — linear in the range with a slope set by `p` alone. This lower
 `seqAnd` spelling would; the operator earns its place by keeping the semantics
 and the refusals in one place, not by beating it on size.
 
+### Negation
+
+`propNot` is the one property operator that needs a construction of its own,
+because a monitor answers "did this match" and negation asks "did this *not*
+match" — a complement, which needs the operand determinised.
+
+The automaton half is two masks exchanged on a **total** determinisation:
+
+- A total determinised state is a subset of the operand's states, and the subset
+  is empty exactly where every thread has died — where the operand *fails*, so
+  where `not p` **holds**. Those become the complement's exits.
+- A state whose subset meets the operand's exits is where the operand completes a
+  match, so where `not p` **fails**. A failure here is an empty state vector, so
+  those states are given a `never` guard: nothing enters them, the vector empties
+  in exactly that cycle, and the ordinary reading reports it.
+
+What comes out is an ordinary fragment. It composes with the disjunction and the
+shifts like any other, and — the part that surprises — it does **not** select the
+counted discipline. Counted mode exists for obligations with no longest match and
+reads failure out of `dead` because its determinisation is left total; a
+complement's is not, so a ring holds it. `not p` borrows `p`'s bound exactly:
+after `p`'s longest match every thread has matched or died, so `p` has resolved
+and so has its complement.
+
+**The verdict lattice is three-valued, and that is what negation costs.**
+Complementing an automaton exchanges match for no-match, which is two values;
+the third has no automaton to invert it:
+
+```
+not holds = fails      not fails = holds      not pending = pending
+```
+
+`sva_verdict` names it in the ABI and `sva_verdict_not` is the normative table.
+The last row is load-bearing rather than decorative. It says a complement may not
+resolve an attempt one cycle before its operand resolves, however certain the
+outcome has become — and `p ##1 (b or !b)` is a real case where the outcome is
+certain a cycle early. Ordinary pruning deletes states that can reach no exit,
+because for a sequence "no exit reachable" and "no continuation can match" are
+the same sentence; inside a complement they are not, and pruning there would
+report the failure at the cycle the match became *inevitable* instead of the
+cycle it arrived. So a complement marks its states as pending-by-construction and
+pruning spares them. Without that, `not not p` would drift earlier than `p`.
+
+Strength inverts too (LRM 16.12.2). An **abort beneath a `not` is refused**, and
+not for want of a mask — the mask moves through the subsets fine. Arming is what
+does not survive: an abort is armed from the *unfiltered* one-step image of
+where an attempt is, deliberately, so that it covers the cycle its subtree's
+last thread dies in — which is the cycle an `accept_on` exists for, discharging
+an attempt the property was about to fail. A determinised successor is already
+filtered by the valuation, and the complement then deletes the very state that
+image would have been read off, so the abort would read as unarmed exactly when
+it should fire.
+
+`p implies q` is `not p or q` and `p iff q` is the conjunction of the two
+directions. Both are tags rather than front-end desugarings for one reason —
+a refusal has to name the operator the user wrote, and the desugared tree would
+put `prop_or` on the diagnostic. They are not cheaper: the `implies` lowering
+*is* the desugaring and produces the same automaton state for state.
+
+The strength arithmetic is where this bites. `not` inverts, and the disjunction
+underneath wants its operands to agree, so **`implies` lowers only when its two
+operands' strengths differ** — `weak implies weak` is refused. That is not
+conservatism: with both weak, a trace where `q` has definitively failed while `p`
+is still pending ends with `p` holding, so `q` was required and the implication
+fails, while a trace where both are pending ends with it holding. One
+`Monitor.Strength` cannot carry both. `iff` is worse and it is arithmetic: each
+direction forces its operands opposite and comes out carrying its right-hand
+one's strength, so the outer conjunction always sees a mixed pair and every `iff`
+is refused. Lifting both needs a per-state end-of-trace disposition rather than
+one bit per monitor, which would change what `sva_monitor_strength` means.
+
+Determinisation is exponential in the worst case and the cap is the existing one:
+`Options.limit`, reported through the same path as every other blow-up, with
+`Diagnostic.node` naming the `not`. Measured, complementing costs roughly double:
+`not a` is 2 states against 1, `not (a ##1 b)` 4 against 2, `not (a ##[1:3] b)`
+6 against 4.
+
 ### Aborts
 
 `propAbort` resolves the property beneath it the moment its condition holds,
@@ -195,13 +290,15 @@ the condition holds, which a monitor-wide reset would suppress.
 An abort *above* an implication is a different property from one below it, not
 another spelling of the same one, so neither can be rewritten into the other. It
 covers the antecedent as well, and `Monitor.Abort.covers_trigger` says so: when
-the condition holds in a cycle an antecedent match ends, that match is resolved
-with the abort's effect and seeds nothing. That is a cycle earlier than the
+the condition holds, every attempt with a live antecedent thread is resolved with
+the abort's effect and seeds nothing — the ones whose match ends there and the
+ones still matching alike, one verdict each. That is a cycle earlier than the
 pushed-down form can manage, since below the implication the abort only arms
-once the consequent starts — the cycle after, for `|=>`. A trigger is the union
-of every attempt's antecedent and cannot be resolved one attempt at a time, but
-it never has to be: a monitor has exactly one trigger, so an abort above it
-covers all of its attempts uniformly and one verdict says everything.
+once the consequent starts — the cycle after, for `|=>`. A monitor has exactly
+one trigger, so an abort above it covers every attempt of it uniformly; how many
+attempts that is comes from `Monitor.trigger_window`, and their threads are
+cleared so that none completes an antecedent later and imposes an obligation on
+an attempt already resolved.
 
 When two aborts resolve one attempt in the same cycle the **outermost** wins.
 `accept_on(a) (reject_on(b) p)` with both conditions holding is a pass: the
@@ -227,19 +324,27 @@ failure mode is silent — it collapses the plain forms onto the `.prop_sync_*`
 ones, since a condition pulsing strictly between two ticks is precisely what
 separates them.
 
-Three shapes are refused rather than mis-lowered. A property operator over an
+Four shapes are refused rather than mis-lowered. A property operator over an
 operand that raises a trigger of its own — a conjunction of two implications, a
 followed-by or a disjunctive shift over one — has nowhere to put the second
 trigger, since a monitor has one. An abort below an operator that *renumbers*
 its operand's states cannot carry its mask through: a disjunction and a shift
 move an operand as a block and are fine, a product (`.prop_and`,
-`.prop_always`) and a fusion (`propFollowedBy`) are not. And an abort above an
-implication whose antecedent can match over more than one cycle is refused, for
-both kinds: an attempt caught halfway through such an antecedent owes a verdict
-of its own, and the union that represents the trigger has nothing to count it
-with. Telling those apart needs the trigger tracked per attempt, so a ring like
-the obligation's, which needs the antecedent's longest match bounded — and
-nothing else asks that of an antecedent.
+`.prop_always`) and a fusion (`propFollowedBy`) are not. And an implication whose
+antecedent has no bounded longest match — `(a ##[1:$] b) |-> c` — is refused with
+`AntecedentNotBounded`: an obligation is owed per antecedent *match*, so the cycle
+a match ends in has to report how many attempts ended one there, and an unbounded
+antecedent has unboundedly many alive at once to tell apart. Counting them
+soundly needs the trigger determinised; reporting the number of matching *cycles*
+instead is a wrong number rather than a coarse one.
+
+And an abort that only kills its own branch — a reject under a disjunction —
+cannot be carried over an obligation that will be counted, because killing part
+of an attempt is a mask subtracted from its state vector and a counted attempt
+has no vector, only one state standing for a whole subset. An abort that resolves
+the whole attempt is carried through the determinisation and is fine: being armed
+depends on the state alone, so firing retires every attempt counted there at
+once, which is exact rather than an approximation of retiring "the" attempt.
 
 **Empty matches do not exist.** Every sequence matches at least one cycle:
 repetition counts are `>= 1` and nothing else can introduce an empty match, so
@@ -372,35 +477,62 @@ automaton saying when to start one. Both are built against a single alphabet, so
 a term the antecedent and the consequent share is evaluated once rather than
 twice.
 
-The two are tracked differently, and that asymmetry is the design. The trigger
-is existential — all we ask is whether *some* antecedent match ends this cycle —
-so the union of every trigger attempt is sound and one state vector does. The
-obligation is per-attempt: merging attempts is unsound, because one attempt's
-threads can die while another's live and the union hides the failure. Each
-pending attempt therefore gets its own state vector, and `monitor.depth` says
-how many a backend must allocate.
+The two are tracked differently, and that asymmetry is the design. The trigger is
+asked how many antecedent matches end this cycle, so one state vector holds every
+attempt of it and each state carries the *set* of attempts with a thread there —
+`Monitor.trigger_window` ids, rotating, and zero of them when no two matches can
+end together, which is the common case and costs nothing. The obligation is
+per-attempt: merging attempts is unsound, because one attempt's threads can die
+while another's live and the union hides the failure. What does collapse is the
+obligation itself — matches ending in one cycle impose the identical future, so
+one instance of it serves them all and carries the number of attempts it stands
+for. Reporting one verdict for three attempts is a wrong answer, not a coarse
+one: LRM 16.14.1 starts an evaluation of the consequent per match.
 
-`depth` is the obligation's longest match, which is exactly right: an attempt
-started in cycle `t` has either matched or run out of live states by cycle
-`t + depth - 1`. An obligation with no bounded longest match — `##[1:$] ack`, or
-any goto repetition — is rejected with `ObligationNotBounded`, because tracking
-it soundly needs the obligation determinised so that one state characterises an
-attempt. A consequent that is itself an implication is rejected too, as is any
-property operator over an operand carrying its own trigger.
+How the pending attempts are held is `monitor.mode`, and there are two
+disciplines because there are two kinds of obligation.
 
-An `and` is bounded only if *both* its sides are, where an `intersect` needs
-only one: an intersection's two ends coincide, so a bounded side bounds the
-pair, but an `and` runs on to the later end and inherits whichever side has no
-bound. So `req |=> (ack ##[1:$] done) and rdy` is rejected as a consequent
-while the same shape under `intersect` is not.
+**`.ring`.** Each pending attempt gets its own state vector, and `monitor.depth`
+says how many a backend must allocate. `depth` is the obligation's longest match,
+which is exactly right: an attempt started in cycle `t` has either matched or run
+out of live states by cycle `t + depth - 1`.
+
+**`.counted`.** An obligation with no bounded longest match — `##[1:$] ack`, any
+goto repetition, `always p`, `s_eventually p`, any `until` — has no such ring.
+Its obligation is *determinised*, and totally: the death of an attempt becomes a
+state rather than the absence of one, so one state fully characterises an
+attempt's future and attempts sharing a state may share it. A backend then
+carries one `u64` count per obligation state instead of a vector per attempt.
+The count is what the verdict needs — two attempts is two failures, and a merged
+vector could only ever report one. `monitor.depth` is zero and meaningless there.
+
+Two rules come with it. A count moves along exactly **one** enabled transition,
+the lowest-indexed: several can be enabled at once because a determinised state
+is a `(subset, cell)` pair and two cells may share a valuation, and those
+siblings are bisimilar. And failure is `automaton.dead`, not an empty vector: the
+construction is total, so a count never falls off the automaton.
+
+Two shapes are still refused. A trigger strictly *below* an unbounded operator —
+`always (a |=> b)` — wants both disciplines at once and gets
+`ObligationModeMixed`; a trigger *above* one is fine, so `req |=> s_eventually
+ack` lowers. And the universal operators want a single-cycle operand:
+`always p` and an `until`'s **left** operand say `p` holds at every cycle of a
+window, which is a statement about overlapping attempts of `p` that one counter
+cannot carry. That is `ObligationNotBounded`, naming the operand. Existential
+positions — `s_eventually`'s operand, an `until`'s **right** operand — are
+unrestricted.
+
+An `and` is unbounded as soon as *either* side is, where an `intersect` needs
+only one bounded side: an intersection's two ends coincide, so a bounded side
+bounds the pair, but an `and` runs on to the later end. So
+`req |=> (ack ##[1:$] done) and rdy` is counted while the same shape under
+`intersect` is ringed.
 
 `first_match` keeps a subset of its operand's matches, so it reports the
-operand's bound: exact where the earliest match is also the longest on offer,
-and an over-estimate otherwise — which costs a state vector rather than a
-verdict. `req |=> first_match(##[1:$] ack)` is still unbounded and still
-rejected, which is the shape that matters. `first_match(ack[*1:$])` is really
-just `ack` and is rejected anyway: seeing that needs the longest path over the
-automaton, and the bound is read off the tree.
+operand's bound: exact where the earliest match is also the longest on offer, and
+an over-estimate otherwise. `first_match(ack[*1:$])` is really just `ack` and is
+counted anyway — seeing that needs the longest path over the automaton, and the
+bound is read off the tree.
 
 Everything the property layer adds above the sequences lands in those same two
 automata, so a backend gains no table and no opcode — with one exception.
@@ -410,7 +542,8 @@ firing resolves the whole attempt or only clears the mask), a `covers_trigger`
 flag, a `sampled` flag, and a state mask read with `monitor.maskOf(i)`. Apply
 them outermost first — the array runs the other way — after seeding a new
 attempt and before taking verdicts. One with `covers_trigger` also acts earlier,
-on the antecedent match, resolving it instead of seeding.
+on the antecedent: it resolves every attempt still matching one, instead of
+seeding.
 
 `Monitor.State` is a reference implementation of the whole per-cycle protocol,
 which is the contract a backend reproduces rather than something it calls.
@@ -419,29 +552,35 @@ which is the contract a backend reproduces rather than something it calls.
 
 `include/sva.h`, linked against `libsva.a`. One export per Zig entry point.
 
-An `sva_ir`, an `sva_monitor` and an `sva_run` are libsva's objects in *your*
-storage — declare one, initialise it in place, tear it down there. Only what they
-grow internally is allocated, and libsva picks its own allocator, so there is
-nothing to configure and nothing to pass. Their contents are opaque; the header
-declares their sizes with headroom, and the library fails its own build — naming
-the size it needs — if a struct outgrows one.
+An `sva_ir`, an `sva_monitor` and an `sva_run` are incomplete types: libsva
+allocates one and hands back a pointer, and you hand that pointer back to be
+destroyed. libsva picks its own allocator, so there is nothing to configure and
+nothing to pass, and nothing on your side depends on how big any of them is.
 
-An `sva_automaton` is only ever reached by pointer, so it has no size at all.
-Reading a monitor is direct: an accessor hands back a pointer to a whole array
-and you index it — one call per table, not per element.
+They used to be byte arrays in the caller's storage, sized by constants in the
+header. That contract could only ever be checked from one side: a header from a
+different build compiled fine against the archive and then overran the caller's
+stack, silently. `SVA_ABI_VERSION` and `sva_abi_version()` replace it, because a
+version can be compared from both sides — check it once at startup.
+
+An `sva_automaton` is reached only by pointer and owned by its monitor. Reading
+a monitor is direct: an accessor hands back a pointer to a whole array and you
+index it — one call per table, not per element.
 
 ```c
-sva_ir ir;
-sva_ir_init(&ir);
+if (sva_abi_version() != SVA_ABI_VERSION) return 1; /* stale header or archive */
+
+sva_ir *ir = sva_ir_create();
+if (ir == NULL) goto fail;
 
 sva_node req, ack, consequent, property, reset;
-if (sva_bool_atom(&ir, 0, &req) != SVA_OK) goto fail;
-if (sva_seq_boolean(&ir, req, &req) != SVA_OK) goto fail;
-if (sva_bool_atom(&ir, 1, &ack) != SVA_OK) goto fail;
-if (sva_seq_boolean(&ir, ack, &ack) != SVA_OK) goto fail;
-if (sva_prop_sequence(&ir, SVA_WEAK, ack, &consequent) != SVA_OK) goto fail;
-if (sva_prop_implies(&ir, SVA_NONOVERLAPPING, req, consequent, &property) != SVA_OK) goto fail;
-if (sva_bool_const(&ir, false, &reset) != SVA_OK) goto fail; /* never resets */
+if (sva_bool_atom(ir, 0, &req) != SVA_OK) goto fail;
+if (sva_seq_boolean(ir, req, &req) != SVA_OK) goto fail;
+if (sva_bool_atom(ir, 1, &ack) != SVA_OK) goto fail;
+if (sva_seq_boolean(ir, ack, &ack) != SVA_OK) goto fail;
+if (sva_prop_sequence(ir, SVA_WEAK, ack, &consequent) != SVA_OK) goto fail;
+if (sva_prop_implies(ir, SVA_NONOVERLAPPING, req, consequent, &property) != SVA_OK) goto fail;
+if (sva_bool_const(ir, false, &reset) != SVA_OK) goto fail; /* never resets */
 
 const sva_directive d = {
     .id = 0,
@@ -451,10 +590,10 @@ const sva_directive d = {
     .property = property,
 };
 uint32_t index;
-if (sva_ir_add(&ir, &d, &index) != SVA_OK) goto fail;
+if (sva_ir_add(ir, &d, &index) != SVA_OK) goto fail;
 
-sva_monitor monitor;
-if (sva_lower(&monitor, &ir, index, NULL, NULL) == SVA_OK) { /* emit code */ }
+sva_monitor *monitor;
+if (sva_lower(&monitor, ir, index, NULL, NULL) == SVA_OK) { /* emit code */ }
 ```
 
 Anything that can fail returns a status and delivers its result through an out
@@ -466,7 +605,8 @@ Nothing else is checked. A **malformed tree** — an operand from the wrong laye
 reversed range — is a bug in the caller's lowering, not a property of what it is
 compiling; there is no source location to report, because the location is the
 caller's own code. The Zig assertions stand and the wrapper does not check twice.
-**Legal input libsva cannot lower yet** — an unbounded obligation, a nested
+**Legal input libsva cannot lower yet** — a mode mix, a multi-cycle operand under
+a universal operator, a nested
 implication, a limit tripped — comes back from `sva_lower` as a status plus the
 node that caused it, which is what a front-end turns into a diagnostic.
 

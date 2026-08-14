@@ -104,6 +104,24 @@ pub fn build(b: *std.Build) void {
     header.root_module.link_libcpp = true;
     const run_header = b.addRunArtifact(header);
 
+    // `zig build merge` — the P0 measurement behind the property layer's phase
+    // 3: whether one merged state vector tracks an unbounded obligation as
+    // soundly as a vector per attempt, and whether determinising it changes the
+    // answer. Prints a table rather than asserting: it exists to be read once
+    // and decide a design, so it is its own step and not part of `test`.
+    const merge = b.addExecutable(.{
+        .name = "sva-merge",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/merge.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "sva", .module = mod }},
+        }),
+    });
+    const run_merge = b.addRunArtifact(merge);
+    const merge_step = b.step("merge", "Measure merged-vector soundness (design experiment)");
+    merge_step.dependOn(&run_merge.step);
+
     const test_step = b.step("test", "Run unit tests and the C / C++ tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_smoke.step);

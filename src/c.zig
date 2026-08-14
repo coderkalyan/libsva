@@ -2,11 +2,12 @@
 //!
 //! # Objects
 //!
-//! An `sva_ir`, an `sva_monitor` and an `sva_run` are the Zig objects sitting in
-//! the caller's own storage — declared on the stack, initialised in place, and
-//! torn down there. Only what they grow internally is allocated. The header
-//! spells their sizes as byte arrays whose contents are nobody's business, and a
-//! `comptime` check here fails the build if one of them outgrows its constant.
+//! An `sva_ir`, an `sva_monitor` and an `sva_run` are Zig objects allocated here
+//! and handed out by pointer; the header declares all three incomplete, so
+//! nothing outside knows how big one is. They were the caller's own storage
+//! once, sized by constants in the header — a contract that could only ever be
+//! checked against one side of the pair, so a stale header overran a caller's
+//! stack in silence. `sva_abi_version` is what a consumer compares now.
 //!
 //! An `sva_automaton` is only ever reached by pointer, so it stays an incomplete
 //! type.
@@ -54,6 +55,9 @@ const Status = enum(c_int) {
     unsupported_repeat_operand = 6,
     mixed_strength = 7,
     unsupported_abort_scope = 8,
+    mode_mix = 9,
+    unsupported_complement = 10,
+    unbounded_antecedent = 11,
 
     fn of(err: glushkov.Error) Status {
         return switch (err) {
@@ -61,10 +65,13 @@ const Status = enum(c_int) {
             error.StateLimitExceeded => .state_limit,
             error.DepthLimitExceeded => .depth_limit,
             error.ObligationNotBounded => .unbounded_obligation,
+            error.ObligationModeMixed => .mode_mix,
             error.UnsupportedConsequent => .unsupported_consequent,
             error.UnsupportedRepeatOperand => .unsupported_repeat_operand,
             error.MixedStrength => .mixed_strength,
             error.UnsupportedAbortScope => .unsupported_abort_scope,
+            error.UnsupportedComplement => .unsupported_complement,
+            error.AntecedentNotBounded => .unbounded_antecedent,
         };
     }
 };
@@ -75,14 +82,32 @@ fn deliver(out: *u32, result: Allocator.Error!Ir.Node.Index) Status {
     return .ok;
 }
 
-// -- The IR ------------------------------------------------------------------
+// -- ABI ---------------------------------------------------------------------
 
-export fn sva_ir_init(ir: *Ir) void {
-    ir.* = .init();
+/// Must equal `SVA_ABI_VERSION` in `include/sva.h`; bump both together whenever
+/// a signature, a layout or the meaning of a value changes. Nothing on this side
+/// can read a C macro, so `test/smoke.c` is what holds the two in step — it
+/// compiles against the header, links this archive, and asserts they agree.
+export fn sva_abi_version() u32 {
+    return 4;
 }
 
-export fn sva_ir_deinit(ir: *Ir) void {
-    ir.deinit(gpa);
+// -- The IR ------------------------------------------------------------------
+
+/// Null if the allocation failed. Named `create` rather than `init` because
+/// there is no longer any caller storage for an `init` to have initialised.
+export fn sva_ir_create() ?*Ir {
+    const ir = gpa.create(Ir) catch return null;
+    ir.* = .init();
+    return ir;
+}
+
+/// Accepts null, so a caller that failed part-way through has one cleanup path
+/// rather than a branch per object it got as far as building.
+export fn sva_ir_destroy(ir: ?*Ir) void {
+    const owned = ir orelse return;
+    owned.deinit(gpa);
+    gpa.destroy(owned);
 }
 
 export fn sva_ir_node_count(ir: *const Ir) u32 {
@@ -215,16 +240,45 @@ export fn sva_prop_implies(
     return deliver(out, ir.propImplies(gpa, tag, @enumFromInt(antecedent), @enumFromInt(consequent)));
 }
 
-const Junction = enum(c_int) { conjunction, disjunction };
+const Junction = enum(c_int) {
+    /// `p and q` — both hold, each on its own schedule.
+    conjunction,
+    /// `p or q` — either holding is enough.
+    disjunction,
+    /// `p implies q` — the *property* implication, `not p or q`. Not `|->`,
+    /// which is `sva_prop_implies`.
+    implies,
+    /// `p iff q` — the conjunction of the two directions.
+    iff,
 
-/// `p and q` / `p or q` over two *properties*. Both operands must carry the same
-/// strength; `sva_lower` reports `SVA_ERROR_MIXED_STRENGTH` if they do not.
+    fn tag(kind: Junction) Ir.Node.Tag {
+        return switch (kind) {
+            .conjunction => .prop_and,
+            .disjunction => .prop_or,
+            .implies => .prop_implies,
+            .iff => .prop_iff,
+        };
+    }
+};
+
+/// `not p`: the operand's verdict complemented in the three-valued lattice of
+/// `sva_verdict`. Holds where `property` fails, fails where it holds, pending
+/// where it is pending.
+///
+/// Nothing to do with `sva_bool_not`, which complements a boolean term within
+/// one cycle. This inverts a whole attempt's verdict, and with it the strength
+/// `property` contributes.
+export fn sva_prop_not(ir: *Ir, property: u32, out: *u32) Status {
+    return deliver(out, ir.propNot(gpa, @enumFromInt(property)));
+}
+
+/// One of the four property junctions. Every one constrains the strengths its
+/// operands end up carrying, and `sva_lower` is what reports a violation:
+/// `SVA_CONJUNCTION` and `SVA_DISJUNCTION` want them equal, `SVA_IMPLIES` wants
+/// them to differ, and `SVA_IFF` can never be satisfied. See
+/// `SVA_ERROR_MIXED_STRENGTH`.
 export fn sva_prop_junction(ir: *Ir, kind: Junction, lhs: u32, rhs: u32, out: *u32) Status {
-    const tag: Ir.Node.Tag = switch (kind) {
-        .conjunction => .prop_and,
-        .disjunction => .prop_or,
-    };
-    return deliver(out, ir.propJunction(gpa, tag, @enumFromInt(lhs), @enumFromInt(rhs)));
+    return deliver(out, ir.propJunction(gpa, kind.tag(), @enumFromInt(lhs), @enumFromInt(rhs)));
 }
 
 const Shift = enum(c_int) {
@@ -236,13 +290,46 @@ const Shift = enum(c_int) {
 };
 
 /// A property shifted by `lo..hi` cycles. `SVA_UNBOUNDED` as `hi` spells the
-/// unbounded `always p` / `s_eventually p`, which builds but does not lower.
+/// unbounded `always p` / `s_eventually p`, which lowers to a counter-tracked
+/// monitor; `always` additionally wants an operand matching in a single cycle
+/// and reports `SVA_ERROR_UNBOUNDED_OBLIGATION` otherwise.
 export fn sva_prop_shift(ir: *Ir, kind: Shift, lo: u32, hi: u32, property: u32, out: *u32) Status {
     const tag: Ir.Node.Tag = switch (kind) {
         .some => .prop_delay,
         .every => .prop_always,
     };
     return deliver(out, ir.propRange(gpa, tag, lo, hi, @enumFromInt(property)));
+}
+
+const Until = enum(c_int) {
+    /// `p until q` — weak, and `p` is not required at the cycle `q` holds.
+    weak,
+    /// `p until_with q` — weak, and `p` is required there too.
+    weak_with,
+    /// `p s_until q` — as `weak`, but `q` must arrive before the trace ends.
+    strong,
+    /// `p s_until_with q` — as `weak_with`, and `q` must arrive.
+    strong_with,
+
+    fn tag(kind: Until) Ir.Node.Tag {
+        return switch (kind) {
+            .weak => .prop_until,
+            .weak_with => .prop_until_with,
+            .strong => .prop_s_until,
+            .strong_with => .prop_s_until_with,
+        };
+    }
+};
+
+/// One of the four `until` forms over two *properties*: `lhs` holds up to the
+/// cycle `rhs` holds in, inclusively for the `_with` kinds.
+///
+/// The kind carries the end-of-trace disposition, so unlike `sva_prop_junction`
+/// this does not care whether the operands' own strengths agree. `lhs` must match
+/// in a single cycle; `sva_lower` reports `SVA_ERROR_UNBOUNDED_OBLIGATION` and
+/// names it if not. `rhs` may span any number of cycles.
+export fn sva_prop_until(ir: *Ir, kind: Until, lhs: u32, rhs: u32, out: *u32) Status {
+    return deliver(out, ir.propUntil(gpa, kind.tag(), @enumFromInt(lhs), @enumFromInt(rhs)));
 }
 
 /// `s #-# p` / `s #=# p`: *some* match of `antecedent` followed by `consequent`
@@ -326,32 +413,41 @@ const Options = extern struct {
 
 const Diagnostic = extern struct { node: u32, size: u64 };
 
-/// Lower one directive into `out`. `options` and `diagnostic` may be null, and
-/// neither `out` nor `diagnostic` is written unless the call fails or succeeds
-/// respectively.
+/// Lower one directive. `options` and `diagnostic` may be null; `out` is written
+/// only on success, with a monitor for `sva_monitor_destroy`, and `diagnostic`
+/// only on failure.
 export fn sva_lower(
-    out: *Monitor,
+    out: **Monitor,
     ir: *const Ir,
     directive: u32,
     options: ?*const Options,
     diagnostic: ?*Diagnostic,
 ) Status {
     const limits: Options = if (options) |given| given.* else .{ .state_limit = 0, .depth_limit = 0 };
+    const monitor = gpa.create(Monitor) catch return .out_of_memory;
     var reason: glushkov.Diagnostic = undefined;
-    out.* = glushkov.assertion(gpa, ir, @enumFromInt(directive), .{
+    monitor.* = glushkov.assertion(gpa, ir, @enumFromInt(directive), .{
         .limit = if (limits.state_limit == 0) 4096 else limits.state_limit,
         .depth_limit = if (limits.depth_limit == 0) 256 else limits.depth_limit,
     }, &reason) catch |err| {
+        // A refusal is the common outcome for legal-but-unsupported input, so
+        // the allocation has to come back here rather than leak once per
+        // assertion the front-end tries and is told no.
+        gpa.destroy(monitor);
         if (diagnostic) |where| {
             where.* = .{ .node = @intFromEnum(reason.node), .size = reason.size };
         }
         return Status.of(err);
     };
+    out.* = monitor;
     return .ok;
 }
 
-export fn sva_monitor_deinit(monitor: *Monitor) void {
-    monitor.deinit(gpa);
+/// Accepts null, as `sva_ir_destroy` does and for the same reason.
+export fn sva_monitor_destroy(monitor: ?*Monitor) void {
+    const owned = monitor orelse return;
+    owned.deinit(gpa);
+    gpa.destroy(owned);
 }
 
 export fn sva_monitor_id(monitor: *const Monitor) u32 {
@@ -366,14 +462,65 @@ export fn sva_monitor_clock(monitor: *const Monitor) u32 {
     return @intFromEnum(monitor.clock);
 }
 
+const Mode = enum(c_int) { ring, counted };
+
+/// How the monitor's pending obligation attempts are held, which decides which
+/// step a backend emits. See the header for the two rules `SVA_MODE_COUNTED`
+/// puts on one.
+export fn sva_monitor_mode(monitor: *const Monitor) Mode {
+    return @enumFromInt(@intFromEnum(monitor.mode));
+}
+
 /// Obligation attempts that can be pending at once: the number of state vectors
 /// a backend allocates.
+///
+/// Zero, and meaningless, in `SVA_MODE_COUNTED`. There is no bound to report
+/// there — that is what the mode exists for — and a counted backend allocates
+/// one `uint64_t` per obligation state instead.
 export fn sva_monitor_depth(monitor: *const Monitor) u32 {
     return monitor.depth;
 }
 
+/// Antecedent attempts the trigger has to tell apart: the number of attempt ids
+/// a backend rotates through, one set of them per trigger state.
+///
+/// Zero when a bit answers instead, which is the common case and is the whole
+/// mechanism folded away — an antecedent matching in one cycle, or one whose
+/// matches all span the same number of cycles, ends at most one of them per
+/// cycle. Always zero without a trigger. See the protocol comment in the header
+/// for what a non-zero one obliges.
+export fn sva_monitor_trigger_window(monitor: *const Monitor) u32 {
+    return monitor.trigger_window;
+}
+
 export fn sva_monitor_strength(monitor: *const Monitor) Strength {
     return @enumFromInt(@intFromEnum(monitor.strength));
+}
+
+/// What a monitor knows about one attempt. Three values, because a finite
+/// prefix does not decide every property.
+const Verdict = enum(c_int) { pending = 0, holds = 1, fails = 2 };
+
+/// The disposition of an attempt still pending when the trace ends — the whole
+/// content of `sva_monitor_strength`, said as a verdict. Never
+/// `SVA_VERDICT_PENDING`: a trace that has ended decides every attempt.
+///
+/// Prefer this to reading the strength and branching on it. It is the same
+/// number and it cannot be got backwards.
+export fn sva_monitor_pending(monitor: *const Monitor) Verdict {
+    return @enumFromInt(@intFromEnum(monitor.strength.atEnd()));
+}
+
+/// The negation table of the verdict lattice, and the normative one: a backend
+/// or front-end that reports three-valued results must agree with it rather
+/// than re-deriving it.
+///
+/// The row that matters is `SVA_VERDICT_PENDING`, which maps to itself.
+/// Negating an undecided attempt leaves it undecided, however certain its
+/// outcome has become — which is what makes `not` an involution.
+export fn sva_verdict_not(verdict: Verdict) Verdict {
+    const value: Monitor.Verdict = @enumFromInt(@intFromEnum(verdict));
+    return @enumFromInt(@intFromEnum(value.not()));
 }
 
 /// Meaningless without a trigger.
@@ -504,6 +651,20 @@ export fn sva_automaton_last(automaton: *const Nfa) [*]const Word {
     return automaton.last.ptr;
 }
 
+/// States an obligation attempt has *failed* in. Meaningful in
+/// `SVA_MODE_COUNTED`, where the obligation is determinised and total so a count
+/// never falls off it and "no live states" never happens; all-zero otherwise.
+///
+/// It is the states standing for the empty subset of the operand's — no
+/// continuation of the trace can match from here — which is what "an attempt
+/// here has failed" means for a matching obligation and for a safety one like
+/// `always p` at once. A reader deriving it instead as "no path to an exit"
+/// would get the wider set, and for `always p`, which has no exits at all, that
+/// is every state.
+export fn sva_automaton_dead(automaton: *const Nfa) [*]const Word {
+    return automaton.dead.ptr;
+}
+
 /// The states carrying `guard`, so building the satisfied mask folds over guards
 /// rather than gathering per state.
 export fn sva_automaton_guard_states(automaton: *const Nfa, guard: u32) [*]const Word {
@@ -512,16 +673,23 @@ export fn sva_automaton_guard_states(automaton: *const Nfa, guard: u32) [*]const
 
 // -- Running -----------------------------------------------------------------
 
-const Report = extern struct { failures: u32, matches: u32, reset: bool };
+const Report = extern struct { failures: u64, matches: u64, reset: bool };
 
-/// `monitor` must outlive the run and must not move.
-export fn sva_run_init(run: *Monitor.State, monitor: *const Monitor) Status {
-    run.* = Monitor.State.init(gpa, monitor) catch return .out_of_memory;
-    return .ok;
+/// `monitor` must outlive the run. Null if the allocation failed.
+export fn sva_run_create(monitor: *const Monitor) ?*Monitor.State {
+    const run = gpa.create(Monitor.State) catch return null;
+    run.* = Monitor.State.init(gpa, monitor) catch {
+        gpa.destroy(run);
+        return null;
+    };
+    return run;
 }
 
-export fn sva_run_deinit(run: *Monitor.State) void {
-    run.deinit(gpa);
+/// Accepts null.
+export fn sva_run_destroy(run: ?*Monitor.State) void {
+    const owned = run orelse return;
+    owned.deinit(gpa);
+    gpa.destroy(owned);
 }
 
 /// Abandon everything in flight, as a reset does.
@@ -543,31 +711,12 @@ export fn sva_run_finish(run: *Monitor.State) Report {
 }
 
 // -- Contract ----------------------------------------------------------------
-
-/// Sizes the header declares, with a little headroom so a field can be added
-/// without breaking every caller's build. A struct that outgrows one fails the
-/// build here, naming the size it needs, rather than corrupting a caller's stack.
-const ir_size = 96;
-const monitor_size = 288;
-const run_size = 160;
-const object_align = 8;
+//
+// What is left to check from this side. The object sizes went with the byte
+// arrays they described; a version the consumer compares replaced them, and only
+// `test/smoke.c` is in a position to check that.
 
 comptime {
-    for ([_]struct { []const u8, usize, usize }{
-        .{ "SVA_IR_SIZE", ir_size, @sizeOf(Ir) },
-        .{ "SVA_MONITOR_SIZE", monitor_size, @sizeOf(Monitor) },
-        .{ "SVA_RUN_SIZE", run_size, @sizeOf(Monitor.State) },
-    }) |entry| {
-        const name, const declared, const actual = entry;
-        if (actual > declared) @compileError(std.fmt.comptimePrint(
-            "{s} is {d} but {d} is needed",
-            .{ name, declared, actual },
-        ));
-    }
-    for ([_]type{ Ir, Monitor, Monitor.State }) |T| {
-        std.debug.assert(@alignOf(T) <= object_align);
-    }
-
     // The C enums are the Zig ones renumbered from zero, so a cast stands in for
     // a mapping — and a reordering breaks the build here instead of silently
     // relabelling a directive or a verdict.
@@ -576,6 +725,17 @@ comptime {
     }
     for (@typeInfo(Strength).@"enum".fields, @typeInfo(Monitor.Strength).@"enum".fields) |c, zig| {
         std.debug.assert(std.mem.eql(u8, c.name, zig.name) and c.value == zig.value);
+    }
+    for (@typeInfo(Mode).@"enum".fields, @typeInfo(Monitor.Mode).@"enum".fields) |c, zig| {
+        std.debug.assert(std.mem.eql(u8, c.name, zig.name) and c.value == zig.value);
+    }
+    // `Until` maps by hand rather than by cast, so what is checked is that the
+    // four tags exist and are the four the mapping names — a tag renamed out from
+    // under `Until.tag` is a compile error there, and a fifth form added to the
+    // `Ir` and not here is caught by this count.
+    for (@typeInfo(Until).@"enum".fields) |field| {
+        const kind: Until = @enumFromInt(field.value);
+        std.debug.assert(kind.tag().layer() == .property);
     }
     // `BoolOp` mirrors the boolean prefix of the tag enum, which is what lets
     // `sva_bool_read` cast a tag straight across.
@@ -649,44 +809,42 @@ fn rootOfAtom(ir: *const Ir, monitor: *const Monitor, atom: u32) ?u32 {
 }
 
 test "the C API builds, lowers and runs an implication" {
-    var ir: Ir = undefined;
-    sva_ir_init(&ir);
-    defer sva_ir_deinit(&ir);
+    const ir = sva_ir_create().?;
+    defer sva_ir_destroy(ir);
 
     // req |=> ack
-    const req = try atomCycle(&ir, 0);
-    const ack = try atomCycle(&ir, 1);
+    const req = try atomCycle(ir, 0);
+    const ack = try atomCycle(ir, 1);
     var consequent: u32 = undefined;
-    try must(sva_prop_sequence(&ir, .weak, ack, &consequent));
+    try must(sva_prop_sequence(ir, .weak, ack, &consequent));
     var property: u32 = undefined;
-    try must(sva_prop_implies(&ir, .nonoverlapping, req, consequent, &property));
-    const directive = try addDirective(&ir, property);
+    try must(sva_prop_implies(ir, .nonoverlapping, req, consequent, &property));
+    const directive = try addDirective(ir, property);
 
-    var monitor: Monitor = undefined;
-    try must(sva_lower(&monitor, &ir, directive, null, null));
-    defer sva_monitor_deinit(&monitor);
+    var monitor: *Monitor = undefined;
+    try must(sva_lower(&monitor, ir, directive, null, null));
+    defer sva_monitor_destroy(monitor);
 
-    try testing.expectEqual(@as(u32, 42), sva_monitor_id(&monitor));
-    try testing.expectEqual(Kind.assert, sva_monitor_kind(&monitor));
-    try testing.expectEqual(Implication.nonoverlapping, sva_monitor_implication(&monitor));
-    try testing.expectEqual(Strength.weak, sva_monitor_strength(&monitor));
-    try testing.expectEqual(@as(u32, 1), sva_monitor_depth(&monitor));
+    try testing.expectEqual(@as(u32, 42), sva_monitor_id(monitor));
+    try testing.expectEqual(Kind.assert, sva_monitor_kind(monitor));
+    try testing.expectEqual(Implication.nonoverlapping, sva_monitor_implication(monitor));
+    try testing.expectEqual(Strength.weak, sva_monitor_strength(monitor));
+    try testing.expectEqual(@as(u32, 1), sva_monitor_depth(monitor));
     // Two atoms plus the constant false that says the assertion never resets.
-    try testing.expectEqual(@as(u32, 3), sva_monitor_root_count(&monitor));
-    try testing.expect(sva_monitor_reset(&monitor) < sva_monitor_root_count(&monitor));
-    try testing.expectEqual(@as(u32, 1), sva_automaton_state_count(sva_monitor_obligation(&monitor)));
-    try testing.expect(sva_monitor_trigger(&monitor) != null);
+    try testing.expectEqual(@as(u32, 3), sva_monitor_root_count(monitor));
+    try testing.expect(sva_monitor_reset(monitor) < sva_monitor_root_count(monitor));
+    try testing.expectEqual(@as(u32, 1), sva_automaton_state_count(sva_monitor_obligation(monitor)));
+    try testing.expect(sva_monitor_trigger(monitor) != null);
 
     // A root is a boolean expression, so not every one is an atom — the reset
     // here is a constant, and it occupies a bit like any other root.
     const order = [_]u32{
-        rootOfAtom(&ir, &monitor, 0).?,
-        rootOfAtom(&ir, &monitor, 1).?,
+        rootOfAtom(ir, monitor, 0).?,
+        rootOfAtom(ir, monitor, 1).?,
     };
 
-    var run: Monitor.State = undefined;
-    try must(sva_run_init(&run, &monitor));
-    defer sva_run_deinit(&run);
+    const run = sva_run_create(monitor).?;
+    defer sva_run_destroy(run);
 
     const trace = [_]struct { req: bool, ack: bool, failures: u32, matches: u32 }{
         .{ .req = true, .ack = false, .failures = 0, .matches = 0 },
@@ -698,130 +856,141 @@ test "the C API builds, lowers and runs an implication" {
         var bits = [_]Word{0};
         if (cycle.req) bits[0] |= @as(Word, 1) << @intCast(order[0]);
         if (cycle.ack) bits[0] |= @as(Word, 1) << @intCast(order[1]);
-        const report = sva_run_step(&run, &bits);
+        const report = sva_run_step(run, &bits);
         try testing.expectEqual(cycle.failures, report.failures);
         try testing.expectEqual(cycle.matches, report.matches);
     }
-    try testing.expectEqual(@as(u32, 0), sva_run_finish(&run).failures);
+    try testing.expectEqual(@as(u32, 0), sva_run_finish(run).failures);
 }
 
 test "lowering failures name the node" {
-    var ir: Ir = undefined;
-    sva_ir_init(&ir);
-    defer sva_ir_deinit(&ir);
+    const ir = sva_ir_create().?;
+    defer sva_ir_destroy(ir);
 
-    // req |=> ##[1:$] ack, whose obligation has no bounded longest match.
-    const ack = try atomCycle(&ir, 1);
-    const body = try leadingDelay(&ir, 1, std.math.maxInt(u32), ack);
-    const req = try atomCycle(&ir, 0);
-    var weak: u32 = undefined;
-    try must(sva_prop_sequence(&ir, .weak, body, &weak));
-    var unbounded: u32 = undefined;
-    try must(sva_prop_implies(&ir, .nonoverlapping, req, weak, &unbounded));
-    const first = try addDirective(&ir, unbounded);
+    // always (req |=> ack): a trigger strictly below an unbounded operator, so
+    // the implication's bounded obligation wants a ring and the operator above it
+    // wants counters. Tracking mode is one per monitor, so this is refused —
+    // loudly, and naming the operator that made the two disagree.
+    const ack = try atomCycle(ir, 1);
+    const req = try atomCycle(ir, 0);
+    var consequent: u32 = undefined;
+    try must(sva_prop_sequence(ir, .weak, ack, &consequent));
+    var implication: u32 = undefined;
+    try must(sva_prop_implies(ir, .nonoverlapping, req, consequent, &implication));
+    var mixed: u32 = undefined;
+    try must(sva_prop_shift(ir, .every, 0, Ir.unbounded, implication, &mixed));
+    const first = try addDirective(ir, mixed);
 
     // And a wide delay range: many filler states, but a longest match under the
     // depth cap, which is checked first and would otherwise mask the state cap.
-    const tail = try atomCycle(&ir, 1);
+    const tail = try atomCycle(ir, 1);
     var wide: u32 = undefined;
-    try must(sva_seq_delay(&ir, req, 1, 100, tail, &wide));
+    try must(sva_seq_delay(ir, req, 1, 100, tail, &wide));
     var bare: u32 = undefined;
-    try must(sva_prop_sequence(&ir, .weak, wide, &bare));
-    const second = try addDirective(&ir, bare);
+    try must(sva_prop_sequence(ir, .weak, wide, &bare));
+    const second = try addDirective(ir, bare);
 
-    var monitor: Monitor = undefined;
+    // Both lowerings fail, so nothing is written here and there is nothing to
+    // destroy: a refused lowering hands back no monitor and keeps none.
+    var monitor: *Monitor = undefined;
     var reason: Diagnostic = undefined;
     try testing.expectEqual(
-        Status.unbounded_obligation,
-        sva_lower(&monitor, &ir, first, null, &reason),
+        Status.mode_mix,
+        sva_lower(&monitor, ir, first, null, &reason),
     );
-    try testing.expectEqual(body, reason.node);
+    try testing.expectEqual(mixed, reason.node);
 
     const limits: Options = .{ .state_limit = 64, .depth_limit = 0 };
-    try testing.expectEqual(Status.state_limit, sva_lower(&monitor, &ir, second, &limits, &reason));
+    try testing.expectEqual(Status.state_limit, sva_lower(&monitor, ir, second, &limits, &reason));
     try testing.expectEqual(wide, reason.node);
     // One state per cycle the delay may skip, plus the two matches.
     try testing.expectEqual(@as(u64, 101), reason.size);
 }
 
 test "guards are readable as cubes over the roots" {
-    var ir: Ir = undefined;
-    sva_ir_init(&ir);
-    defer sva_ir_deinit(&ir);
+    const ir = sva_ir_create().?;
+    defer sva_ir_destroy(ir);
 
     // `(a && b) ##1 a`, so one guard has two literals and the other has one.
     var a: u32 = undefined;
     var b: u32 = undefined;
-    try must(sva_bool_atom(&ir, 0, &a));
-    try must(sva_bool_atom(&ir, 1, &b));
+    try must(sva_bool_atom(ir, 0, &a));
+    try must(sva_bool_atom(ir, 1, &b));
     var conjunction: u32 = undefined;
-    try must(sva_bool_and(&ir, a, b, &conjunction));
+    try must(sva_bool_and(ir, a, b, &conjunction));
     var both: u32 = undefined;
-    try must(sva_seq_boolean(&ir, conjunction, &both));
-    const tail = try atomCycle(&ir, 0);
+    try must(sva_seq_boolean(ir, conjunction, &both));
+    const tail = try atomCycle(ir, 0);
     var pattern: u32 = undefined;
-    try must(sva_seq_delay(&ir, both, 1, 1, tail, &pattern));
+    try must(sva_seq_delay(ir, both, 1, 1, tail, &pattern));
     var property: u32 = undefined;
-    try must(sva_prop_sequence(&ir, .weak, pattern, &property));
-    const directive = try addDirective(&ir, property);
+    try must(sva_prop_sequence(ir, .weak, pattern, &property));
+    const directive = try addDirective(ir, property);
 
-    var monitor: Monitor = undefined;
-    try must(sva_lower(&monitor, &ir, directive, null, null));
-    defer sva_monitor_deinit(&monitor);
+    var monitor: *Monitor = undefined;
+    try must(sva_lower(&monitor, ir, directive, null, null));
+    defer sva_monitor_destroy(monitor);
 
-    const automaton = sva_monitor_obligation(&monitor);
+    const automaton = sva_monitor_obligation(monitor);
     try testing.expectEqual(@as(u32, 2), sva_automaton_state_count(automaton));
 
     const guards = sva_automaton_guards(automaton);
     var total: u32 = 0;
     for (0..sva_automaton_state_count(automaton)) |state| {
         var count: u32 = 0;
-        const literals = sva_monitor_guard(&monitor, guards[state], &count);
+        const literals = sva_monitor_guard(monitor, guards[state], &count);
         total += count;
         for (0..count) |index| {
-            try testing.expect(literals.?[index] >> 1 < sva_monitor_root_count(&monitor));
+            try testing.expect(literals.?[index] >> 1 < sva_monitor_root_count(monitor));
         }
     }
     try testing.expectEqual(@as(u32, 3), total);
 
     // Guard zero is the empty cube.
     var count: u32 = 7;
-    try testing.expect(sva_monitor_guard(&monitor, 0, &count) == null);
+    try testing.expect(sva_monitor_guard(monitor, 0, &count) == null);
     try testing.expectEqual(@as(u32, 0), count);
 }
 
 test "a bare sequence property has no trigger" {
-    var ir: Ir = undefined;
-    sva_ir_init(&ir);
-    defer sva_ir_deinit(&ir);
+    const ir = sva_ir_create().?;
+    defer sva_ir_destroy(ir);
 
-    const a = try atomCycle(&ir, 0);
-    const b = try atomCycle(&ir, 0);
+    const a = try atomCycle(ir, 0);
+    const b = try atomCycle(ir, 0);
     var pattern: u32 = undefined;
-    try must(sva_seq_delay(&ir, a, 1, 1, b, &pattern));
+    try must(sva_seq_delay(ir, a, 1, 1, b, &pattern));
     var property: u32 = undefined;
-    try must(sva_prop_sequence(&ir, .strong, pattern, &property));
-    const directive = try addDirective(&ir, property);
+    try must(sva_prop_sequence(ir, .strong, pattern, &property));
+    const directive = try addDirective(ir, property);
 
-    var monitor: Monitor = undefined;
-    try must(sva_lower(&monitor, &ir, directive, null, null));
-    defer sva_monitor_deinit(&monitor);
-    try testing.expect(sva_monitor_trigger(&monitor) == null);
-    try testing.expectEqual(Strength.strong, sva_monitor_strength(&monitor));
-    try testing.expectEqual(@as(u32, 2), sva_monitor_depth(&monitor));
+    var monitor: *Monitor = undefined;
+    try must(sva_lower(&monitor, ir, directive, null, null));
+    defer sva_monitor_destroy(monitor);
+    try testing.expect(sva_monitor_trigger(monitor) == null);
+    try testing.expectEqual(Strength.strong, sva_monitor_strength(monitor));
+    try testing.expectEqual(@as(u32, 2), sva_monitor_depth(monitor));
     // One atom plus the constant false reset.
-    try testing.expectEqual(@as(u32, 2), sva_monitor_root_count(&monitor));
+    try testing.expectEqual(@as(u32, 2), sva_monitor_root_count(monitor));
 
-    var run: Monitor.State = undefined;
-    try must(sva_run_init(&run, &monitor));
-    defer sva_run_deinit(&run);
+    const run = sva_run_create(monitor).?;
+    defer sva_run_destroy(run);
 
     // `a ##1 a` over a held `a`: an attempt completes every cycle from the second
     // on, and the newest is still pending at the end. Being strong, it fails. The
     // atom's bit has to be looked up, not assumed.
-    const held = [_]Word{@as(Word, 1) << @intCast(rootOfAtom(&ir, &monitor, 0).?)};
-    try testing.expectEqual(@as(u32, 0), sva_run_step(&run, &held).matches);
-    try testing.expectEqual(@as(u32, 1), sva_run_step(&run, &held).matches);
-    try testing.expectEqual(@as(u32, 1), sva_run_step(&run, &held).matches);
-    try testing.expectEqual(@as(u32, 1), sva_run_finish(&run).failures);
+    const held = [_]Word{@as(Word, 1) << @intCast(rootOfAtom(ir, monitor, 0).?)};
+    try testing.expectEqual(@as(u32, 0), sva_run_step(run, &held).matches);
+    try testing.expectEqual(@as(u32, 1), sva_run_step(run, &held).matches);
+    try testing.expectEqual(@as(u32, 1), sva_run_step(run, &held).matches);
+    try testing.expectEqual(@as(u32, 1), sva_run_finish(run).failures);
+}
+
+test "destroying null is allowed" {
+    // The header promises this so that a caller which failed part-way through
+    // can clean up unconditionally. Nothing else here would notice it going
+    // away, and a consumer's error path is exactly where it would be missed.
+    sva_ir_destroy(null);
+    sva_monitor_destroy(null);
+    sva_run_destroy(null);
 }
