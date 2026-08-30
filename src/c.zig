@@ -58,6 +58,10 @@ const Status = enum(c_int) {
     mode_mix = 9,
     unsupported_complement = 10,
     unbounded_antecedent = 11,
+    local_cross_read = 12,
+    local_under_determinisation = 13,
+    local_fused_read = 14,
+    local_unbounded_attempts = 15,
 
     fn of(err: glushkov.Error) Status {
         return switch (err) {
@@ -68,10 +72,14 @@ const Status = enum(c_int) {
             error.ObligationModeMixed => .mode_mix,
             error.UnsupportedConsequent => .unsupported_consequent,
             error.UnsupportedRepeatOperand => .unsupported_repeat_operand,
+            error.AntecedentNotBounded => .unbounded_antecedent,
+            error.LocalCrossRead => .local_cross_read,
+            error.LocalUnderDeterminisation => .local_under_determinisation,
+            error.LocalFusedRead => .local_fused_read,
+            error.LocalUnboundedAttempts => .local_unbounded_attempts,
             error.MixedStrength => .mixed_strength,
             error.UnsupportedAbortScope => .unsupported_abort_scope,
             error.UnsupportedComplement => .unsupported_complement,
-            error.AntecedentNotBounded => .unbounded_antecedent,
         };
     }
 };
@@ -89,7 +97,7 @@ fn deliver(out: *u32, result: Allocator.Error!Ir.Node.Index) Status {
 /// can read a C macro, so `test/smoke.c` is what holds the two in step — it
 /// compiles against the header, links this archive, and asserts they agree.
 export fn sva_abi_version() u32 {
-    return 4;
+    return 5;
 }
 
 // -- The IR ------------------------------------------------------------------

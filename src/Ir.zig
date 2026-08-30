@@ -193,6 +193,24 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Blake3 = std.crypto.hash.Blake3;
 
+/// A local variable slot: an opaque type and an optional initializer. Both
+/// handles are the front-end's; libsva stores them and never inspects them.
+pub const Local = struct {
+    /// Opaque type handle. Only the front-end knows what a slot holds.
+    type: u32,
+    /// The initializer's opaque handle, or `local_no_init`. LRM 16.10: the
+    /// initialization assignment is performed when an attempt creates the
+    /// slot's copy, in declaration order, so an initializer may read a
+    /// lower-numbered slot that was already initialised this attempt.
+    init: u32,
+};
+
+/// A slot with no initializer. LRM 16.10: "Local variables do not have default
+/// initial values" — an uninitialised slot is *unassigned* at the start of the
+/// attempt, and reading one before it is assigned is a static error the
+/// front-end rules out; libsva does not represent an unassigned value.
+pub const local_no_init: u32 = std.math.maxInt(u32);
+
 const Ir = @This();
 
 /// The boolean/sequence/property tree.
@@ -206,6 +224,19 @@ extra: std.ArrayListUnmanaged(u32),
 /// mentions, and so the size of the per-cycle valuation a backend allocates.
 /// Maintained by `atom`.
 atom_count: u32,
+/// Local variable slots in declaration order, dense from zero. Empty for the
+/// local-free assertions that are the overwhelming majority, and every table
+/// and code path keyed on locals is gated on this being non-empty.
+locals: std.ArrayListUnmanaged(Local),
+/// Per-atom read masks: a flat `atom_count * local_words` array of `u64`,
+/// atom-major, so atom `a`'s mask is `[a * local_words ..][0..local_words]`.
+/// Least-significant bit of word zero is slot zero. LRM 16.10 lets a local
+/// appear in any expression the atom stands for, and which slots an atom reads
+/// is declared by the front-end rather than discovered here.
+atom_reads: std.ArrayListUnmanaged(u64),
+/// Words in one slot mask: `locals.len` rounded up to 64. Cached because it is
+/// the stride of `atom_reads` and every mask read recomputes it otherwise.
+local_words: u32,
 
 /// An empty IR. Allocates nothing until the first `add*` call.
 pub fn init() Ir {
@@ -214,6 +245,9 @@ pub fn init() Ir {
         .assertions = .{},
         .extra = .empty,
         .atom_count = 0,
+        .locals = .empty,
+        .atom_reads = .empty,
+        .local_words = 0,
     };
 }
 
@@ -221,6 +255,8 @@ pub fn deinit(ir: *Ir, gpa: Allocator) void {
     ir.nodes.deinit(gpa);
     ir.assertions.deinit(gpa);
     ir.extra.deinit(gpa);
+    ir.locals.deinit(gpa);
+    ir.atom_reads.deinit(gpa);
 }
 
 /// An opaque handle to a boolean-layer leaf term. The front-end assigns these
@@ -353,6 +389,16 @@ pub const Node = struct {
         /// past the last occurrence. Payload as `seq_repeat_consec`, and the
         /// operand is a `seq_boolean` for the same reason.
         seq_repeat_nonconsec,
+
+        /// A sequence with local variable assignments: `(sequence, assignments)`
+        /// from LRM 16.10. Assignments run at the end of every nonempty match.
+        /// An empty assignment list returns the sequence unchanged; a non-empty
+        /// list requires the sequence to not admit empty matches (libsva
+        /// guarantees this for every sequence it can build). `lhs` = sequence
+        /// node (backward-pointing, asserted), `rhs` = `extra` offset holding
+        /// `[count, slot0, handle0, slot1, handle1, ...]`, where each `slot`
+        /// is dense from zero within the current IR's locals table.
+        seq_match,
 
         // == Property layer ===================================================
 
@@ -544,6 +590,7 @@ pub const Node = struct {
                 .seq_repeat_consec,
                 .seq_repeat_goto,
                 .seq_repeat_nonconsec,
+                .seq_match,
                 => .sequence,
                 .prop_seq_weak,
                 .prop_seq_strong,
@@ -844,6 +891,44 @@ pub fn seqRepeat(
     } });
 }
 
+/// Local variable assignments on a sequence: `(sequence, assignments)` from
+/// LRM 16.10. Assignments run at the end of every nonempty match. An empty
+/// assignment list returns `seq` unchanged. A non-empty list requires `seq` to
+/// not admit empty matches; libsva guarantees this for every sequence it builds.
+/// `assigns_raw` is a flat array of `[count, slot0, handle0, slot1, handle1, ...]`,
+/// where slots are dense from zero within the current IR's locals table.
+pub fn seqMatch(
+    ir: *Ir,
+    gpa: Allocator,
+    seq: Node.Index,
+    assigns_raw: []const u32,
+) Allocator.Error!Node.Index {
+    ir.assertOperand(seq, .sequence);
+    std.debug.assert(assigns_raw.len % 2 == 0); // pairs of (slot, handle)
+    const count = assigns_raw.len / 2;
+
+    if (std.debug.runtime_safety) {
+        for (0..count) |i| {
+            const slot = assigns_raw[i * 2];
+            std.debug.assert(slot < ir.localCount());
+        }
+    }
+
+    // Empty: return the sequence unchanged.
+    if (count == 0) return seq;
+
+    // Build [count, slot0, handle0, slot1, handle1, ...] into extra.
+    var payload: std.ArrayListUnmanaged(u32) = .empty;
+    defer payload.deinit(gpa);
+    try payload.append(gpa, @intCast(count));
+    try payload.appendSlice(gpa, assigns_raw);
+    const start = try ir.addExtra(gpa, payload.items);
+    return ir.addNode(gpa, .{ .tag = .seq_match, .data = .{
+        .lhs = @intFromEnum(seq),
+        .rhs = @intFromEnum(start),
+    } });
+}
+
 // -- Convenience node constructors: property layer ---------------------------
 
 /// Promote a sequence to a property, weak or strong per `tag`
@@ -1053,6 +1138,7 @@ pub fn operandsOf(ir: *const Ir, node: Node.Index, buf: *[max_operands]Node.Inde
         .seq_repeat_consec,
         .seq_repeat_goto,
         .seq_repeat_nonconsec,
+        .seq_match,
         .prop_seq_weak,
         .prop_seq_strong,
         .prop_delay,
@@ -1186,6 +1272,8 @@ pub fn hash(ir: *const Ir) Digest {
         std.mem.sliceAsBytes(ir.assertions.items(.reset)),
         std.mem.sliceAsBytes(ir.assertions.items(.prop)),
         std.mem.sliceAsBytes(ir.extra.items),
+        std.mem.sliceAsBytes(ir.locals.items),
+        std.mem.sliceAsBytes(ir.atom_reads.items),
     }) |section| {
         std.mem.writeInt(u32, &scratch, @intCast(section.len), .little);
         st.update(&scratch);
@@ -1218,7 +1306,7 @@ pub const magic: [4]u8 = .{ 'S', 'V', 'A', 'B' };
 /// On-disk format version. The IR reserves no space for future operators, so
 /// this is bumped on any layout *or* `Node.Tag` change; readers reject a
 /// mismatch and the caller recompiles from source.
-pub const format_version: u32 = 10;
+pub const format_version: u32 = 11;
 
 const checksum_len = Blake3.digest_length;
 /// Bytes preceding the first payload word: `magic` + `format_version`.
@@ -1246,6 +1334,12 @@ pub fn serialize(ir: *const Ir, gpa: Allocator) Allocator.Error![]u8 {
 
     try writeU32(&out, gpa, @intCast(ir.extra.items.len));
     try out.appendSlice(gpa, std.mem.sliceAsBytes(ir.extra.items));
+
+    try writeU32(&out, gpa, @intCast(ir.locals.items.len));
+    try out.appendSlice(gpa, std.mem.sliceAsBytes(ir.locals.items));
+
+    try writeU32(&out, gpa, @intCast(ir.atom_reads.items.len));
+    try out.appendSlice(gpa, std.mem.sliceAsBytes(ir.atom_reads.items));
 
     var digest: Digest = undefined;
     Blake3.hash(out.items, &digest, .{});
@@ -1301,6 +1395,15 @@ pub fn deserialize(gpa: Allocator, bytes: []const u8) DeserializeError!Ir {
     try ir.extra.resize(gpa, try cur.readU32());
     try cur.copyInto(std.mem.sliceAsBytes(ir.extra.items));
 
+    try ir.locals.resize(gpa, try cur.readU32());
+    try cur.copyInto(std.mem.sliceAsBytes(ir.locals.items));
+
+    try ir.atom_reads.resize(gpa, try cur.readU32());
+    try cur.copyInto(std.mem.sliceAsBytes(ir.atom_reads.items));
+
+    // Recompute the cached local_words from locals.len.
+    ir.local_words = @intCast((ir.locals.items.len + 63) / 64);
+
     return ir;
 }
 
@@ -1308,6 +1411,67 @@ fn writeU32(out: *std.ArrayListUnmanaged(u8), gpa: Allocator, v: u32) Allocator.
     var buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &buf, v, .little);
     try out.appendSlice(gpa, &buf);
+}
+
+// -- Local variable management -----------------------------------------------
+
+/// Declare one local variable slot. Returns its slot number (dense from zero in
+/// declaration order). LRM 16.10: each slot begins uninitialized, and the
+/// optional initializer runs when the attempt is created. `type_` and `init` are
+/// opaque to libsva; the front-end assigns both. An attempt's slots are
+/// independent: an initializer may read a lower-numbered slot already
+/// initialized this attempt.
+pub fn localDeclare(ir: *Ir, gpa: Allocator, type_: u32, init_: u32) Allocator.Error!u32 {
+    try ir.locals.append(gpa, .{ .type = type_, .init = init_ });
+    ir.local_words = @intCast((ir.locals.items.len + 63) / 64);
+    return @intCast(ir.locals.items.len - 1);
+}
+
+/// Count of local variable slots declared in this IR, dense from zero.
+pub fn localCount(ir: *const Ir) u32 {
+    return @intCast(ir.locals.items.len);
+}
+
+/// Words in one local slot's read mask: `localCount()` rounded up to 64. Dense
+/// atoms use this as their stride into `atom_reads.items`.
+pub fn localWords(ir: *const Ir) u32 {
+    return ir.local_words;
+}
+
+/// Record which local variable slots one atom's expression reads. `slots` must
+/// be exactly `localWords()` words, least-significant bit of word zero being
+/// slot zero. Every slot mentioned must exist (`< localCount()`). A backend
+/// must declare all locals *before* recording any atom's reads; libsva does not
+/// re-stride existing masks if locals grow later.
+pub fn atomReads(ir: *Ir, gpa: Allocator, atom_id: Atom, slots: []const u64) Allocator.Error!void {
+    const a = @intFromEnum(atom_id);
+    std.debug.assert(a < ir.atom_count);
+    const lw = ir.localWords();
+    std.debug.assert(slots.len == lw);
+
+    if (lw == 0) return; // no locals declared, nothing to store
+
+    // Grow `atom_reads` to cover this atom if needed: `atom_count * local_words` u64s.
+    const current_capacity = ir.atom_reads.items.len / lw;
+    if (current_capacity <= a) {
+        try ir.atom_reads.resize(gpa, (a + 1) * lw);
+    }
+
+    const start = a * lw;
+    @memcpy(ir.atom_reads.items[start..][0..lw], slots);
+}
+
+/// Read mask for one atom: which local slots it reads. Returns null if never
+/// recorded for this atom (implicitly all-zero). Slice is `localWords()` words.
+pub fn atomReadsOf(ir: *const Ir, atom_id: Atom) ?[]const u64 {
+    const a = @intFromEnum(atom_id);
+    const lw = ir.localWords();
+    if (a >= ir.atom_count or lw == 0) return null;
+    const offset: usize = @intCast(a * lw);
+    if (offset >= ir.atom_reads.items.len) return null;
+    const len: usize = @intCast(lw);
+    if (offset + len > ir.atom_reads.items.len) return null;
+    return ir.atom_reads.items[offset..][0..len];
 }
 
 const Cursor = struct {

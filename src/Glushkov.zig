@@ -226,6 +226,35 @@ pub const Error = error{
     /// `determinise` over the other automaton, and `Monitor.Mode` would grow a
     /// third discipline to read it.
     AntecedentNotBounded,
+    /// One operand of an `intersect` or `and` assigns a local variable slot
+    /// that the sibling operand reads from the incoming context. LRM F.5.5
+    /// requires both operands to be evaluated from the SAME input context, so
+    /// the read sibling cannot see the write; one valuation per state cannot
+    /// express both views at once, and the two operands of a product are one
+    /// thread here.
+    LocalCrossRead,
+    /// A local variable assignment under an operator that determinises its
+    /// operand — `seq_first_match` or `prop_not`. A determinised state
+    /// stands for a SET of operand threads, and with an assignment beneath it
+    /// those threads hold different valuations, which is exactly what one
+    /// valuation per state cannot carry. Reading a local under either is fine:
+    /// with no assignment there, every operand thread carries the valuation
+    /// that flowed in.
+    LocalUnderDeterminisation,
+    /// A zero-delay fusion whose right-hand component reads a local variable
+    /// slot the left-hand component assigns in the same cycle. Fusion conjoins
+    /// the two guards into one cube, and this shape needs the cube split around
+    /// the assignment: the left half must be evaluated before the assignment
+    /// and the right half after. One valuation per state cannot express both.
+    LocalFusedRead,
+    /// Local variables under a universal operator with no upper bound — an
+    /// unbounded `prop_always` range, or either operand of a `prop_until*`.
+    /// Those leave one attempt per cycle pending for ever, which the counted
+    /// discipline exists to collapse into a counter per state; a valuation
+    /// makes the collapse unsound: two attempts in one state with different
+    /// valuations have different futures. An unbounded *sequence* obligation
+    /// is a different shape and stays supported.
+    LocalUnboundedAttempts,
     /// The obligation is bounded but deeper than `Options.depth_limit`, or the
     /// antecedent is and has more attempts in flight than that.
     DepthLimitExceeded,
