@@ -624,5 +624,4 @@ int main(void) {
     if (errors() != 0) return 1;
     if (counted() != 0) return 1;
     if (complement() != 0) return 1;
-    return 0;
 }

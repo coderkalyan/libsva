@@ -120,6 +120,28 @@ export fn sva_ir_atom_count(ir: *const Ir) u32 {
     return ir.atom_count;
 }
 
+// -- Local variables ---------------------------------------------------------
+
+export fn sva_local_declare(ir: *Ir, type_: u32, init: u32, out: *u32) Status {
+    const slot = Ir.localDeclare(ir, gpa, type_, init) catch return .out_of_memory;
+    out.* = slot;
+    return .ok;
+}
+
+export fn sva_ir_local_count(ir: *const Ir) u32 {
+    return Ir.localCount(ir);
+}
+
+export fn sva_ir_local_words(ir: *const Ir) u32 {
+    return Ir.localWords(ir);
+}
+
+export fn sva_atom_reads(ir: *Ir, atom: u32, slots: [*]const u64) Status {
+    const lw = Ir.localWords(ir);
+    if (lw == 0) return .ok; // no locals declared, no reads to record
+    Ir.atomReads(ir, gpa, @enumFromInt(atom), slots[0..lw]) catch return .out_of_memory;
+    return .ok;
+}
 // -- Boolean layer -----------------------------------------------------------
 
 export fn sva_bool_const(ir: *Ir, value: bool, out: *u32) Status {
