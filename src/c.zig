@@ -62,6 +62,7 @@ const Status = enum(c_int) {
     local_under_determinisation = 13,
     local_fused_read = 14,
     local_unbounded_attempts = 15,
+    local_incomplete = 16,
 
     fn of(err: glushkov.Error) Status {
         return switch (err) {
@@ -77,6 +78,7 @@ const Status = enum(c_int) {
             error.LocalUnderDeterminisation => .local_under_determinisation,
             error.LocalFusedRead => .local_fused_read,
             error.LocalUnboundedAttempts => .local_unbounded_attempts,
+            error.LocalIncomplete => .local_incomplete,
             error.MixedStrength => .mixed_strength,
             error.UnsupportedAbortScope => .unsupported_abort_scope,
             error.UnsupportedComplement => .unsupported_complement,
@@ -492,7 +494,7 @@ export fn sva_monitor_clock(monitor: *const Monitor) u32 {
     return @intFromEnum(monitor.clock);
 }
 
-const Mode = enum(c_int) { ring, counted };
+const Mode = enum(c_int) { ring, counted, threaded };
 
 /// How the monitor's pending obligation attempts are held, which decides which
 /// step a backend emits. See the header for the two rules `SVA_MODE_COUNTED`
@@ -836,6 +838,91 @@ fn rootOfAtom(ir: *const Ir, monitor: *const Monitor, atom: u32) ?u32 {
         if (view.op == .atom and view.lhs == atom) return @intCast(index);
     }
     return null;
+}
+/// Callbacks for evaluating local variable reads and performing assignments.
+pub const sva_locals = extern struct {
+    /// (user, site_index, frame_ptr) -> assigned_value
+    assign: ?*const fn (?*anyopaque, u32, [*]const u64) callconv(.C) u64,
+    /// (user, root_index, frame_ptr) -> root_value
+    root: ?*const fn (?*anyopaque, u32, [*]const u64) callconv(.C) bool,
+    /// User-provided context passed to callbacks
+    user: ?*anyopaque,
+};
+
+/// Count of local variable slots in the monitor's obligation.
+export fn sva_monitor_local_count(monitor: *const Monitor) u32 {
+    return monitor.local_count;
+}
+
+/// Words per local variable slot mask.
+export fn sva_monitor_local_words(monitor: *const Monitor) u32 {
+    return monitor.local_words;
+}
+
+/// Type handle of a local variable slot. Indices are dense from zero.
+export fn sva_monitor_local_type(monitor: *const Monitor, slot: u32) u32 {
+    if (slot >= monitor.locals.len) return 0;
+    return monitor.locals[slot].type;
+}
+
+/// Initialization handle of a local variable slot.
+export fn sva_monitor_local_init(monitor: *const Monitor, slot: u32) u32 {
+    if (slot >= monitor.locals.len) return 0;
+    return monitor.locals[slot].init;
+}
+
+/// Count of assignment sites in the monitor (slots assigned per state).
+export fn sva_monitor_assign_count(monitor: *const Monitor) u32 {
+    return @intCast(monitor.sites.len / 2);
+}
+
+/// Slot index of a given assignment site (pair index).
+export fn sva_monitor_assign_slot(monitor: *const Monitor, site: u32) u32 {
+    const idx = site * 2;
+    if (idx >= monitor.sites.len) return 0;
+    return monitor.sites[idx];
+}
+
+/// Handle index (RHS) of a given assignment site.
+export fn sva_monitor_assign_handle(monitor: *const Monitor, site: u32) u32 {
+    const idx = site * 2 + 1;
+    if (idx >= monitor.sites.len) return 0;
+    return monitor.sites[idx];
+}
+
+/// Slots read by roots (atomic guards). A mask of sva_monitor_local_words words.
+export fn sva_monitor_root_local(monitor: *const Monitor) [*]const Word {
+    if (monitor.root_local.len == 0) return &.{};
+    return monitor.root_local.ptr;
+}
+
+/// Assignment sites to perform on arriving in a state (from obligation automaton).
+/// Returns pointer to site indices, or null if no locals or this state has no assignments.
+export fn sva_automaton_program(automaton: *const Nfa, state: u32) ?[*]const u32 {
+    const program = Nfa.programOf(automaton, state);
+    if (program.len == 0) return null;
+    return program.ptr;
+}
+
+/// Live-slot mask for a state: which slots may still be read onward.
+/// Dimensions: sva_monitor_local_words words. Empty if no locals.
+export fn sva_automaton_live(automaton: *const Nfa, state: u32) [*]const Word {
+    const live = Nfa.liveOf(automaton, state);
+    if (live.len == 0) return &.{};
+    return live.ptr;
+}
+
+/// Bind a run to local variable callbacks for threaded stepping.
+/// Called before stepping a monitor with locals (SVA_MODE_THREADED).
+export fn sva_run_bind(run: *Monitor.State, locals: *const sva_locals) void {
+    // TODO: LRM 16.10 -- the threaded group step is not implemented, so there is
+    // nothing to bind values to yet. A no-op would let a caller believe its
+    // callbacks were installed and then step a monitor that silently never calls
+    // them; sva_lower refuses an IR with slots for the same reason, so reaching
+    // here at all means a monitor was built by some other route.
+    _ = run;
+    _ = locals;
+    @panic("sva_run_bind: local variable stepping is not implemented (LRM 16.10)");
 }
 
 test "the C API builds, lowers and runs an implication" {

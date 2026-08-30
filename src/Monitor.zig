@@ -248,6 +248,20 @@ aborts: []Abort,
 /// One obligation-state mask per entry of `aborts`, in that order and each
 /// `obligation.words` long. Read it with `maskOf`.
 abort_masks: []Word,
+/// Local variable slot table from the IR; Ir.locals.items when the property has
+/// any local variables. Empty when there are no locals.
+locals: []const Ir.Local,
+/// Count of local variable slots in the obligation.
+local_count: u32,
+/// Words per local slot mask.
+local_words: u32,
+/// Flat pool of assignment sites: (slot, handle) pairs, dense indices.
+sites: []const u32,
+/// Per state of the obligation: offset and length into `sites`.
+/// Empty when no locals. Materialized by Glushkov after pruning.
+assign_sites: []const Nfa.Program,
+/// Slots read by roots (atomic guards). Union of atom_reads masks.
+root_local: []const Word,
 
 /// What a monitor knows about one attempt. Three values, because a monitor
 /// watches a finite prefix of a trace and a prefix does not decide every
@@ -318,6 +332,9 @@ pub const Mode = enum(u8) {
     /// One `u64` counter per obligation state, and the obligation determinised.
     /// See the file comment for the two rules this mode puts on a backend.
     counted,
+    /// Group-based stepping with local variables. One group per distinct valuation
+    /// per attempt, with state masks and local values tracked separately.
+    threaded,
 };
 
 /// An abort scoped to a subtree of the obligation: `accept_on` and friends.
@@ -1076,6 +1093,10 @@ pub const State = struct {
                     .holds => {},
                     .pending => unreachable,
                 }
+            },
+            // Threaded mode with local variables: TODO implement full group stepping
+            .threaded => {
+                // Placeholder: threaded mode stepping not yet implemented
             },
         }
         state.clear();

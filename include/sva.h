@@ -254,6 +254,16 @@ typedef enum sva_status {
        different futures. An unbounded *sequence* obligation is not this shape
        and is supported. The diagnostic names the operator. */
     SVA_ERROR_LOCAL_UNBOUNDED_ATTEMPTS = 15,
+    /* The IR declares local variable slots and this libsva does not lower them
+       yet: the projection onto states, the flow sets and the threaded group step
+       are unimplemented (../clotho-svalocal/docs/design/sva-local-variables.md
+       is the design they are being built to). Every table below would read as
+       empty, which a backend would take for "no local variables" and simulate as
+       though the assignments were not there -- a wrong answer rather than a
+       missing feature, so it is refused here instead.
+
+       TODO: LRM 16.10. Delete this status once the group discipline lands. */
+    SVA_ERROR_LOCAL_INCOMPLETE = 16,
 } sva_status;
 
 /* ------------------------------------------------------------------------- *

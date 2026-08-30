@@ -255,6 +255,14 @@ pub const Error = error{
     /// valuations have different futures. An unbounded *sequence* obligation
     /// is a different shape and stays supported.
     LocalUnboundedAttempts,
+    /// The IR declares local variable slots and this lowering does not carry them
+    /// yet: no projection onto states, no flow sets, no group discipline. Every
+    /// local table would come out empty, which a backend reads as "no local
+    /// variables" and simulates as though the match items were absent -- so the
+    /// directive is refused rather than lowered into a wrong answer.
+    ///
+    /// TODO: LRM 16.10. Goes away with the group step.
+    LocalIncomplete,
     /// The obligation is bounded but deeper than `Options.depth_limit`, or the
     /// antecedent is and has more attempts in flight than that.
     DepthLimitExceeded,
@@ -308,6 +316,15 @@ pub fn assertion(
     diagnostic: ?*Diagnostic,
 ) Error!Monitor {
     const directive = ir.assertions.get(@intFromEnum(index));
+
+    // Refused up front, before anything is built: the tables that would carry LRM
+    // 16.10 local variables through this lowering do not exist yet, and an empty
+    // table is indistinguishable from an assertion that has no local variables.
+    // See Error.LocalIncomplete.
+    if (ir.localCount() > 0) {
+        if (diagnostic) |d| d.* = .{ .node = directive.prop, .size = ir.localCount() };
+        return error.LocalIncomplete;
+    }
 
     var builder: Builder = .{ .gpa = gpa, .ir = ir, .options = options, .diagnostic = diagnostic };
     defer builder.deinit();
@@ -446,6 +463,12 @@ pub fn assertion(
         .reset = pinned[0],
         .aborts = aborts,
         .abort_masks = abort_masks,
+        .locals = &.{},
+        .local_count = ir.localCount(),
+        .local_words = ir.localWords(),
+        .sites = &.{},
+        .assign_sites = &.{},
+        .root_local = &.{},
     };
 }
 
@@ -3475,9 +3498,135 @@ const Builder = struct {
             .last = last,
             .dead = dead,
             .guard_states = guard_states,
+            .program = &.{},
+            .sites = &.{},
+            .live = &.{},
+            .local_words = 0,
         };
     }
 };
+/// Flow analysis per F.5.4: sample, block, flow masks per IR node.
+/// Gate on localCount > 0; zero words means analysis was skipped.
+const FlowAnalysis = struct {
+    sample: []Word,
+    block: []Word,
+    out: []Word,
+    must: []Word,
+    words: u32,
+    local_count: u32,
+
+    fn nodeIndex(analysis: *const FlowAnalysis, node: Ir.Node.Index) usize {
+        return @as(usize, @intFromEnum(node)) * analysis.words;
+    }
+
+    fn sampleOf(analysis: *const FlowAnalysis, node: Ir.Node.Index) []Word {
+        if (analysis.words == 0) return &.{};
+        return analysis.sample[analysis.nodeIndex(node)..][0..analysis.words];
+    }
+
+    fn blockOf(analysis: *const FlowAnalysis, node: Ir.Node.Index) []Word {
+        if (analysis.words == 0) return &.{};
+        return analysis.block[analysis.nodeIndex(node)..][0..analysis.words];
+    }
+
+    fn outOf(analysis: *const FlowAnalysis, node: Ir.Node.Index) []Word {
+        if (analysis.words == 0) return &.{};
+        return analysis.out[analysis.nodeIndex(node)..][0..analysis.words];
+    }
+
+    fn mustOf(analysis: *const FlowAnalysis, node: Ir.Node.Index) []Word {
+        if (analysis.words == 0) return &.{};
+        return analysis.must[analysis.nodeIndex(node)..][0..analysis.words];
+    }
+
+    fn deinit(analysis: *FlowAnalysis, gpa: Allocator) void {
+        gpa.free(analysis.sample);
+        gpa.free(analysis.block);
+        gpa.free(analysis.out);
+        gpa.free(analysis.must);
+    }
+};
+/// Check for LocalUnderDeterminisation: assignments beneath first_match or prop_not.
+fn checkDeterminisation(ir: *const Ir, node: Ir.Node.Index, diagnostic: ?*Diagnostic) Error!void {
+    const tag = ir.tagOf(node);
+    switch (tag) {
+        .seq_first_match, .prop_not => {
+            // Check if the operand contains any seq_match (assignment) nodes
+            if (hasAssignmentsBelow(ir, node)) {
+                if (diagnostic) |into| into.* = .{ .node = node };
+                return error.LocalUnderDeterminisation;
+            }
+        },
+        else => {},
+    }
+}
+
+/// Whether a sequence subtree contains any assignments (seq_match nodes).
+fn hasAssignmentsBelow(ir: *const Ir, node: Ir.Node.Index) bool {
+    const tag = ir.tagOf(node);
+
+    if (tag == .seq_match) return true;
+
+    var buf: [Ir.max_operands]Ir.Node.Index = undefined;
+    const operands = ir.operandsOf(node, &buf);
+    for (operands) |op| {
+        if (hasAssignmentsBelow(ir, op)) return true;
+    }
+    return false;
+}
+
+/// Check for LocalCrossRead: seq_intersect/seq_and where one samples and other reads incoming.
+/// For now, use a simple heuristic: if the operand has seq_match, check it.
+fn checkCrossRead(ir: *const Ir, node: Ir.Node.Index, diagnostic: ?*Diagnostic) Error!void {
+    const tag = ir.tagOf(node);
+    const data = ir.dataOf(node);
+
+    if (tag != .seq_intersect and tag != .seq_and) return;
+
+    // TODO: Full flow analysis to detect actual conflicts. For now, if both
+    // operands have assignments, it's potentially a hazard if guards interact.
+    const left = @as(Ir.Node.Index, @enumFromInt(data.lhs));
+    const right = @as(Ir.Node.Index, @enumFromInt(data.rhs));
+
+    const left_has_assigns = hasAssignmentsBelow(ir, left);
+    const right_has_assigns = hasAssignmentsBelow(ir, right);
+
+    if (left_has_assigns and right_has_assigns) {
+        // Both have assignments: potential cross-read. Requires full flow analysis
+        // to disambiguate. For now, flag conservatively.
+        if (diagnostic) |into| into.* = .{ .node = node };
+        return error.LocalCrossRead;
+    }
+}
+
+/// Check for LocalUnboundedAttempts: slots under unbounded ranges.
+fn checkUnboundedAttempts(ir: *const Ir, node: Ir.Node.Index, diagnostic: ?*Diagnostic) Error!void {
+    const tag = ir.tagOf(node);
+    const data = ir.dataOf(node);
+
+    switch (tag) {
+        .prop_always => {
+            // Unbounded always with any assigns beneath is refused
+            const range = ir.propRangeOf(node);
+            if (range.hi == Ir.unbounded) {
+                if (hasAssignmentsBelow(ir, @enumFromInt(data.lhs))) {
+                    if (diagnostic) |into| into.* = .{ .node = node };
+                    return error.LocalUnboundedAttempts;
+                }
+            }
+        },
+        .prop_until, .prop_until_with, .prop_s_until, .prop_s_until_with => {
+            // Either operand with assignments is refused
+            const left = @as(Ir.Node.Index, @enumFromInt(data.lhs));
+            const right = @as(Ir.Node.Index, @enumFromInt(data.rhs));
+            if (hasAssignmentsBelow(ir, left) or hasAssignmentsBelow(ir, right)) {
+                if (diagnostic) |into| into.* = .{ .node = node };
+                return error.LocalUnboundedAttempts;
+            }
+        },
+        else => {},
+    }
+}
 
 // -- Tests -------------------------------------------------------------------
 //
