@@ -929,6 +929,27 @@ pub fn seqMatch(
     } });
 }
 
+/// One assignment of a `seq_match` node: the slot written and the opaque handle
+/// the front-end evaluates for its value.
+pub const Assign = struct { slot: u32, handle: u32 };
+
+/// The assignment list of a `seq_match` node, in source order. LRM 16.10 performs
+/// them in that order at the end of every nonempty match of the operand, so the
+/// order is semantic: a later item may read an earlier one's write.
+pub fn matchOf(ir: *const Ir, node: Node.Index, buf: *std.ArrayListUnmanaged(Assign), gpa: Allocator) Allocator.Error!void {
+    std.debug.assert(ir.tagOf(node) == .seq_match);
+    const start = ir.dataOf(node).rhs;
+    const count = ir.extra.items[start];
+    buf.clearRetainingCapacity();
+    try buf.ensureTotalCapacity(gpa, count);
+    for (0..count) |i| {
+        buf.appendAssumeCapacity(.{
+            .slot = ir.extra.items[start + 1 + i * 2],
+            .handle = ir.extra.items[start + 2 + i * 2],
+        });
+    }
+}
+
 // -- Convenience node constructors: property layer ---------------------------
 
 /// Promote a sequence to a property, weak or strong per `tag`

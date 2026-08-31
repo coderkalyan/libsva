@@ -760,6 +760,16 @@ const Fragment = struct {
     follow: []Word,
     first: []Word,
     last: []Word,
+    /// Per state, the LRM 16.10 assignment program that runs on arriving there,
+    /// indexing `Builder.sites`. `Nfa.Program.none` for every state of a
+    /// local-free lowering, which is what keeps this one array's cost the whole
+    /// cost of the feature here: the pool it points into is never allocated.
+    ///
+    /// Positions are renumbered by every combinator, so this travels with them —
+    /// `blit` carries it, and the constructions that build a state out of a PAIR
+    /// of positions (a zero-delay fusion, an intersect or and product) have to
+    /// concatenate the two programs themselves, in that order.
+    program: []Nfa.Program,
 
     /// `state_count` states, all guarded by `always`, with no edges.
     fn init(gpa: Allocator, state_count: u32) Allocator.Error!Fragment {
@@ -771,11 +781,14 @@ const Fragment = struct {
         const first = try gpa.alloc(Word, words);
         errdefer gpa.free(first);
         const last = try gpa.alloc(Word, words);
+        errdefer gpa.free(last);
+        const program = try gpa.alloc(Nfa.Program, state_count);
 
         @memset(guard, .always);
         @memset(follow, 0);
         @memset(first, 0);
         @memset(last, 0);
+        @memset(program, Nfa.Program.none);
         return .{
             .state_count = state_count,
             .words = words,
@@ -783,6 +796,7 @@ const Fragment = struct {
             .follow = follow,
             .first = first,
             .last = last,
+            .program = program,
         };
     }
 
@@ -791,6 +805,7 @@ const Fragment = struct {
         gpa.free(fragment.follow);
         gpa.free(fragment.first);
         gpa.free(fragment.last);
+        gpa.free(fragment.program);
     }
 
     fn row(fragment: *Fragment, state: u32) []Word {
@@ -801,15 +816,51 @@ const Fragment = struct {
         return fragment.follow[@as(usize, state) * fragment.words ..][0..fragment.words];
     }
 
-    /// Copy `source`'s states and internal edges in starting at `base`. Entry
-    /// and exit sets are the caller's business: a combinator rarely wants them
-    /// verbatim.
+    /// Copy `source`'s states, internal edges and assignment programs in starting
+    /// at `base`. Entry and exit sets are the caller's business: a combinator
+    /// rarely wants them verbatim.
+    ///
+    /// A program travels as an index pair into a pool that is never renumbered, so
+    /// relocating a state is a plain copy — which is why every combinator that
+    /// only relocates states needs nothing else for LRM 16.10.
     fn blit(fragment: *Fragment, source: *const Fragment, base: u32) void {
         for (0..source.state_count) |index| {
             const state: u32 = @intCast(index);
             fragment.guard[base + state] = source.guard[state];
+            fragment.program[base + state] = source.program[state];
             blitMask(fragment.row(base + state), source.rowConst(state), base);
         }
+    }
+
+    /// The program of a state built out of two positions at once: `left`'s sites
+    /// then `right`'s. LRM 16.10 runs a match item list at the end of the match it
+    /// is attached to, and a fused or product state ends both, so the left
+    /// operand's assignments precede the right's — the same order the source text
+    /// has them in.
+    fn fuseProgram(
+        fragment: *Fragment,
+        sites: *std.ArrayListUnmanaged(u32),
+        gpa: Allocator,
+        state: u32,
+        left: Nfa.Program,
+        right: Nfa.Program,
+    ) Allocator.Error!void {
+        if (left.len == 0 and right.len == 0) return;
+        if (right.len == 0) {
+            fragment.program[state] = left;
+            return;
+        }
+        if (left.len == 0) {
+            fragment.program[state] = right;
+            return;
+        }
+        // Reserved up front: the copy reads out of the same list it appends to, and
+        // an append that reallocates would leave the source slice dangling.
+        try sites.ensureUnusedCapacity(gpa, left.len + right.len);
+        const start: u32 = @intCast(sites.items.len);
+        for (0..left.len) |offset| sites.appendAssumeCapacity(sites.items[left.start + offset]);
+        for (0..right.len) |offset| sites.appendAssumeCapacity(sites.items[right.start + offset]);
+        fragment.program[state] = .{ .start = start, .len = left.len + right.len };
     }
 };
 
@@ -855,6 +906,15 @@ const Builder = struct {
     root_of: std.AutoHashMapUnmanaged(u64, u31) = .empty,
     /// Backing pool for interned cubes.
     literals: std.ArrayListUnmanaged(Literal) = .empty,
+    /// Backing pool the fragments' `program` slices index: LRM 16.10 assignment
+    /// site numbers, dense over the monitor's site table and appended in the order
+    /// the `seq_match` nodes are lowered. Never renumbered, so relocating a state
+    /// is a copy of the index pair. Empty for a local-free assertion.
+    sites: std.ArrayListUnmanaged(u32) = .empty,
+    /// Per assignment site, the slot it writes and the opaque handle the backend
+    /// evaluates for its value. Parallel to `sites`' contents by index.
+    assign_slot: std.ArrayListUnmanaged(u32) = .empty,
+    assign_handle: std.ArrayListUnmanaged(u32) = .empty,
     /// Interned cubes; slots 0 and 1 are `always` and `never`.
     table: std.ArrayListUnmanaged(Guard) = .empty,
     /// Cube under construction.
@@ -871,6 +931,9 @@ const Builder = struct {
         builder.roots.deinit(builder.gpa);
         builder.root_of.deinit(builder.gpa);
         builder.literals.deinit(builder.gpa);
+        builder.sites.deinit(builder.gpa);
+        builder.assign_slot.deinit(builder.gpa);
+        builder.assign_handle.deinit(builder.gpa);
         builder.table.deinit(builder.gpa);
         builder.scratch.deinit(builder.gpa);
         builder.cube_bucket.deinit(builder.gpa);
@@ -2052,7 +2115,65 @@ const Builder = struct {
                     ir.tagOf(node) == .seq_repeat_nonconsec,
                 );
             },
+            .seq_match => {
+                // LRM 16.10 runs a match item list "at the end of any nonempty match
+                // of the subsequence", and a match of the operand ends in one of its
+                // exit positions -- so the program lands on every state in `last` and
+                // nowhere else. The automaton's shape does not change: the operand's
+                // own fragment comes back with those states annotated.
+                var operand = try builder.lower(@enumFromInt(data.lhs));
+                errdefer operand.deinit(builder.gpa);
+                try builder.attachMatchItems(node, &operand);
+                return operand;
+            },
             else => unreachable, // not a sequence-layer tag
+        }
+    }
+
+    /// Attach a `seq_match` node's assignments to every exit position of its
+    /// operand, appending them to the site pool.
+    ///
+    /// A position may already carry a program: match item lists nest
+    /// (`((a, x = 1), y = 2)`), and the inner list is attached first, so the outer
+    /// one's sites go after it — which is the order LRM 16.10 asks for, innermost
+    /// match ending first. Extending is a re-append rather than an in-place grow
+    /// because the pool is shared and a program is a contiguous slice of it; the
+    /// duplicated prefix costs a few words on a shape that nests match items and
+    /// nothing at all on every other.
+    fn attachMatchItems(builder: *Builder, node: Ir.Node.Index, fragment: *Fragment) Error!void {
+        const gpa = builder.gpa;
+        var assigns: std.ArrayListUnmanaged(Ir.Assign) = .empty;
+        defer assigns.deinit(gpa);
+        try builder.ir.matchOf(node, &assigns, gpa);
+        std.debug.assert(assigns.items.len > 0); // `seqMatch` folds an empty list away
+
+        // Site numbers are dense over the whole monitor and minted here, in the
+        // order the nodes are lowered, so the backend's site table is this list.
+        const first_site: u32 = @intCast(builder.assign_slot.items.len);
+        for (assigns.items) |assign| {
+            try builder.assign_slot.append(gpa, assign.slot);
+            try builder.assign_handle.append(gpa, assign.handle);
+        }
+
+        var exits: BitIterator = .init(fragment.last);
+        while (exits.next()) |index| {
+            const state: u32 = @intCast(index);
+            const held = fragment.program[state];
+            // Reserve first: appending from the same list would read through a
+            // slice the append itself may have reallocated.
+            try builder.sites.ensureUnusedCapacity(gpa, held.len + assigns.items.len);
+            const start: u32 = @intCast(builder.sites.items.len);
+            for (0..held.len) |offset| {
+                const site = builder.sites.items[held.start + offset];
+                builder.sites.appendAssumeCapacity(site);
+            }
+            for (0..assigns.items.len) |offset| {
+                builder.sites.appendAssumeCapacity(first_site + @as(u32, @intCast(offset)));
+            }
+            fragment.program[state] = .{
+                .start = start,
+                .len = held.len + @as(u32, @intCast(assigns.items.len)),
+            };
         }
     }
 
@@ -2164,6 +2285,19 @@ const Builder = struct {
             blitMask(fragment.row(state), right.rowConst(fusion.right_entry), left_count);
             if (Nfa.bitIsSet(left.first, fusion.left_exit)) Nfa.bitSet(fragment.first, state);
             if (Nfa.bitIsSet(right.last, fusion.right_entry)) Nfa.bitSet(fragment.last, state);
+            // The fused cycle ends the left operand's match and begins the right's,
+            // so it owes both positions' assignments, left first (LRM 16.10 and
+            // F.5.5's `##0` clause, which flows the left's output context into the
+            // right). A read on the right of a slot the left writes here would need
+            // the guard cube split around the assignment instead, which is what
+            // Error.LocalFusedRead refuses.
+            try fragment.fuseProgram(
+                &builder.sites,
+                gpa,
+                state,
+                left.program[fusion.left_exit],
+                right.program[fusion.right_entry],
+            );
         }
         for (0..left_count) |index| {
             const state: u32 = @intCast(index);
@@ -2394,6 +2528,18 @@ const Builder = struct {
         for (pairs.items, 0..) |pair, offset| {
             const state: u32 = @intCast(offset);
             fragment.guard[state] = pair.guard;
+            // A product state stands for one position of each operand at once, so
+            // it owes both their assignments, left first (LRM 16.10; F.5.5 gives the
+            // two operands the same input context, and Error.LocalCrossRead refuses
+            // the one shape where a shared valuation would be visible across the
+            // fork). `finished` is not a position and carries no program.
+            try fragment.fuseProgram(
+                &builder.sites,
+                gpa,
+                state,
+                if (pair.left == finished) Nfa.Program.none else left.program[pair.left],
+                if (pair.right == finished) Nfa.Program.none else right.program[pair.right],
+            );
             var left_next: BitIterator = .init(left.rowConst(pair.left));
             while (left_next.next()) |left_state| {
                 var right_next: BitIterator = .init(right.rowConst(pair.right));
@@ -2564,6 +2710,18 @@ const Builder = struct {
         for (pairs.items, 0..) |pair, offset| {
             const state: u32 = @intCast(offset);
             fragment.guard[state] = pair.guard;
+            // A product state stands for one position of each operand at once, so
+            // it owes both their assignments, left first (LRM 16.10; F.5.5 gives the
+            // two operands the same input context, and Error.LocalCrossRead refuses
+            // the one shape where a shared valuation would be visible across the
+            // fork). `finished` is not a position and carries no program.
+            try fragment.fuseProgram(
+                &builder.sites,
+                gpa,
+                state,
+                if (pair.left == finished) Nfa.Program.none else left.program[pair.left],
+                if (pair.right == finished) Nfa.Program.none else right.program[pair.right],
+            );
             try andSuccessors(gpa, left, right, pair, &successors);
             for (successors.items) |target| {
                 const next = index.get(pairKey(target.left, target.right)) orelse continue;
@@ -3227,6 +3385,11 @@ const Builder = struct {
             const state = kept.map[index];
             if (state == dropped) continue;
             into.guard[state] = fragment.guard[index];
+            // A program is an index pair into a pool pruning never touches, so it
+            // relocates with its state and needs no rewrite. A dropped state's
+            // program goes with it: no cycle can enter it, so its assignments were
+            // unreachable (LRM 16.10 attaches them to a match that cannot happen).
+            into.program[state] = fragment.program[index];
             var outgoing: BitIterator = .init(fragment.rowConst(@intCast(index)));
             while (outgoing.next()) |target| {
                 if (kept.map[target] != dropped) Nfa.bitSet(into.row(state), kept.map[target]);
@@ -3441,6 +3604,98 @@ const Builder = struct {
         };
     }
 
+    /// Union the slots a boolean node reads into `into`. A guard is a cube over
+    /// roots, a root is a boolean tree, and only its atoms read anything — the mask
+    /// is the front-end's, declared through `sva_atom_reads`.
+    fn boolReads(builder: *Builder, node: Ir.Node.Index, into: []Word) void {
+        const ir = builder.ir;
+        const data = ir.dataOf(node);
+        switch (ir.tagOf(node)) {
+            .bool_const => {},
+            .atom => {
+                const reads = ir.atomReadsOf(@enumFromInt(data.lhs)) orelse return;
+                for (into, reads) |*word, mask| word.* |= mask;
+            },
+            .bnot => builder.boolReads(@enumFromInt(data.lhs), into),
+            .band, .bor => {
+                builder.boolReads(@enumFromInt(data.lhs), into);
+                builder.boolReads(@enumFromInt(data.rhs), into);
+            },
+            else => unreachable, // not a boolean-layer tag
+        }
+    }
+
+    /// The slots a state's own cycle reads: every literal of its guard, plus every
+    /// slot its program WRITES.
+    ///
+    /// The writes belong here because a compound assignment reads the slot it
+    /// updates (LRM 16.6 admits exactly those operators on a local variable
+    /// lvalue), and the read is inside the handle the front-end evaluates rather
+    /// than in any atom, so nothing declares it. Treating a written slot as read at
+    /// its own site is the sound reading, and it costs only a merge that liveness
+    /// would otherwise have allowed.
+    fn stateReads(builder: *Builder, fragment: *const Fragment, state: u32, into: []Word) void {
+        const entry = builder.table.items[@intFromEnum(fragment.guard[state])];
+        for (builder.literals.items[entry.start..][0..entry.len]) |literal| {
+            builder.boolReads(builder.roots.items[literal.root], into);
+        }
+        const program = fragment.program[state];
+        for (0..program.len) |offset| {
+            const site = builder.sites.items[program.start + offset];
+            Nfa.bitSet(into, builder.assign_slot.items[site]);
+        }
+    }
+
+    /// F.5.4's flow set, projected onto the automaton: per state, the slots whose
+    /// values may still be read from that state onward.
+    ///
+    /// A group sitting in a state has already had that state's guard hold, so what
+    /// is still readable is what the states it can go on to read — a least fixpoint
+    /// over `follow`, iterated because the graph has cycles wherever a repetition
+    /// does. Restricting a valuation to this before comparing two groups is what
+    /// lets groups that differ only in dead slots merge, which is what stops an
+    /// accumulating assignment under an unbounded repetition growing a group per
+    /// cycle for ever.
+    fn liveness(
+        builder: *Builder,
+        fragment: *const Fragment,
+        kept: *const Surviving,
+        state_count: u32,
+        words: u32,
+        follow: []const Word,
+        live: []Word,
+        local_words: u32,
+    ) Allocator.Error!void {
+        const gpa = builder.gpa;
+        const reads = try gpa.alloc(Word, @as(usize, state_count) * local_words);
+        defer gpa.free(reads);
+        @memset(reads, 0);
+        for (0..fragment.state_count) |index| {
+            const state = kept.map[index];
+            if (state == dropped) continue;
+            builder.stateReads(fragment, @intCast(index), reads[@as(usize, state) * local_words ..][0..local_words]);
+        }
+
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (0..state_count) |index| {
+                const state: u32 = @intCast(index);
+                const into = live[@as(usize, state) * local_words ..][0..local_words];
+                var next: BitIterator = .init(follow[@as(usize, state) * words ..][0..words]);
+                while (next.next()) |target| {
+                    const target_reads = reads[@as(usize, target) * local_words ..][0..local_words];
+                    const target_live = live[@as(usize, target) * local_words ..][0..local_words];
+                    for (into, target_reads, target_live) |*word, read, alive| {
+                        const before = word.*;
+                        word.* |= read | alive;
+                        if (word.* != before) changed = true;
+                    }
+                }
+            }
+        }
+    }
+
     /// Renumber one pruned fragment into an `Nfa` over the compacted guards.
     fn emit(
         builder: *Builder,
@@ -3473,9 +3728,24 @@ const Builder = struct {
         @memset(dead, 0);
         @memset(guard_states, 0);
 
+        // LRM 16.10 assignment programs, and the slot liveness that lets two groups
+        // holding the same *readable* values merge. Both are empty for a local-free
+        // assertion, which is the gate every local-keyed path in Nfa is behind.
+        const local_words: u32 = if (builder.ir.localCount() == 0) 0 else builder.ir.localWords();
+        const program = if (local_words == 0)
+            try gpa.alloc(Nfa.Program, 0)
+        else
+            try gpa.alloc(Nfa.Program, state_count);
+        errdefer gpa.free(program);
+        if (program.len != 0) @memset(program, Nfa.Program.none);
+        const live = try gpa.alloc(Word, @as(usize, state_count) * local_words);
+        errdefer gpa.free(live);
+        @memset(live, 0);
+
         for (0..fragment.state_count) |index| {
             const state = kept.map[index];
             if (state == dropped) continue;
+            if (program.len != 0) program[state] = fragment.program[index];
             const guard = guard_map[@intFromEnum(fragment.guard[index])];
             guard_of[state] = @enumFromInt(guard);
             Nfa.bitSet(guard_states[@as(usize, guard) * words ..][0..words], state);
@@ -3489,6 +3759,10 @@ const Builder = struct {
             if (Nfa.bitIsSet(fragment.last, @intCast(index))) Nfa.bitSet(last, state);
         }
 
+        if (local_words != 0) {
+            try builder.liveness(fragment, kept, state_count, words, follow, live, local_words);
+        }
+
         return .{
             .state_count = state_count,
             .words = words,
@@ -3498,10 +3772,12 @@ const Builder = struct {
             .last = last,
             .dead = dead,
             .guard_states = guard_states,
-            .program = &.{},
-            .sites = &.{},
-            .live = &.{},
-            .local_words = 0,
+            .program = program,
+            // The pool is the builder's and outlives every fragment; each automaton
+            // gets its own copy so a monitor owns its tables outright.
+            .sites = try gpa.dupe(u32, builder.sites.items),
+            .live = live,
+            .local_words = local_words,
         };
     }
 };
