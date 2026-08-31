@@ -152,6 +152,37 @@ export fn sva_atom_reads(ir: *Ir, atom: u32, slots: [*]const u64) Status {
     Ir.atomReads(ir, gpa, @enumFromInt(atom), slots[0..lw]) catch return .out_of_memory;
     return .ok;
 }
+/// One assignment of a match item list, laid out as the header's `sva_assign`.
+const Assign = extern struct {
+    slot: u32,
+    handle: u32,
+};
+
+export fn sva_seq_match(
+    ir: *Ir,
+    sequence: u32,
+    assigns: ?[*]const Assign,
+    count: u32,
+    out: *u32,
+) Status {
+    // An empty list is the sequence itself, so a front-end need not special-case a
+    // match item list it built and found empty.
+    if (count == 0) {
+        out.* = sequence;
+        return .ok;
+    }
+    const items = assigns.?[0..count];
+
+    // `Ir.seqMatch` takes the pairs flat, which is how they are encoded in `extra`.
+    const raw = gpa.alloc(u32, @as(usize, count) * 2) catch return .out_of_memory;
+    defer gpa.free(raw);
+    for (items, 0..) |item, index| {
+        raw[index * 2] = item.slot;
+        raw[index * 2 + 1] = item.handle;
+    }
+    return deliver(out, ir.seqMatch(gpa, @enumFromInt(sequence), raw));
+}
+
 // -- Boolean layer -----------------------------------------------------------
 
 export fn sva_bool_const(ir: *Ir, value: bool, out: *u32) Status {
