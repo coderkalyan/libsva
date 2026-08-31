@@ -1475,7 +1475,13 @@ pub fn atomReads(ir: *Ir, gpa: Allocator, atom_id: Atom, slots: []const u64) All
     // Grow `atom_reads` to cover this atom if needed: `atom_count * local_words` u64s.
     const current_capacity = ir.atom_reads.items.len / lw;
     if (current_capacity <= a) {
+        const was = ir.atom_reads.items.len;
         try ir.atom_reads.resize(gpa, (a + 1) * lw);
+        // `resize` does not initialise what it grows into, and an atom nobody
+        // declared reads for must read NOTHING rather than whatever was on the
+        // heap -- a stray bit here makes a local-free root look per-group, which
+        // is a wrong answer dressed as a slow one.
+        @memset(ir.atom_reads.items[was..], 0);
     }
 
     const start = a * lw;

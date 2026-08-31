@@ -317,13 +317,11 @@ pub fn assertion(
 ) Error!Monitor {
     const directive = ir.assertions.get(@intFromEnum(index));
 
-    // Refused up front, before anything is built: the tables that would carry LRM
-    // 16.10 local variables through this lowering do not exist yet, and an empty
-    // table is indistinguishable from an assertion that has no local variables.
-    // See Error.LocalIncomplete.
+    // The shapes one valuation per thread cannot represent, refused before
+    // anything is built so a diagnostic names a node the front-end can still map
+    // back to source (LRM 16.10, F.5.4, F.5.5).
     if (ir.localCount() > 0) {
-        if (diagnostic) |d| d.* = .{ .node = directive.prop, .size = ir.localCount() };
-        return error.LocalIncomplete;
+        try checkLocalHazards(gpa, ir, directive.prop, diagnostic);
     }
 
     var builder: Builder = .{ .gpa = gpa, .ir = ir, .options = options, .diagnostic = diagnostic };
@@ -341,7 +339,17 @@ pub fn assertion(
         if (diagnostic) |into| into.* = .{ .node = node };
         return error.ObligationModeMixed;
     }
-    const mode: Monitor.Mode = if (bound.length == null) .counted else .ring;
+    // A local variable makes a thread a (position, valuation) pair, and neither a
+    // state vector nor a counter per state can tell two valuations apart, so a
+    // monitor with slots is tracked as a list of valuation GROUPS instead --
+    // whatever bound its obligation has. `depth` stays the attempt bound where
+    // there is one and 0 where there is not, which is what the header promises.
+    const mode: Monitor.Mode = if (ir.localCount() > 0)
+        .threaded
+    else if (bound.length == null)
+        .counted
+    else
+        .ring;
     // Only a ring has a depth; counted mode reports zero and means it.
     const depth = if (bound.length) |longest|
         try builder.checkDepth(bound.culprit, longest)
@@ -448,6 +456,20 @@ pub fn assertion(
     // masks and is read back at the narrower width for the same reason.
     if (mode == .counted) @memcpy(automata[0].dead, dead[0..words]);
 
+    // The local variable tables the backend reads, owned by the monitor: the slot
+    // table verbatim from the IR, the dense assignment-site table the states'
+    // programs index, and the per-root read mask that splits root evaluation.
+    const locals = try gpa.dupe(Ir.Local, ir.locals.items);
+    errdefer gpa.free(locals);
+    const assign_slot = try gpa.dupe(u32, builder.assign_slot.items);
+    errdefer gpa.free(assign_slot);
+    const assign_handle = try gpa.dupe(u32, builder.assign_handle.items);
+    errdefer gpa.free(assign_handle);
+    // Over the alphabet's roots, not the builder's: materialisation compacts and
+    // renumbers them, and this mask is indexed the way a backend indexes them.
+    const root_local = try rootLocalMask(&builder, gpa, alphabet.roots);
+    errdefer gpa.free(root_local);
+
     return .{
         .id = directive.id,
         .kind = directive.kind,
@@ -463,13 +485,37 @@ pub fn assertion(
         .reset = pinned[0],
         .aborts = aborts,
         .abort_masks = abort_masks,
-        .locals = &.{},
-        .local_count = ir.localCount(),
-        .local_words = ir.localWords(),
-        .sites = &.{},
-        .assign_sites = &.{},
-        .root_local = &.{},
+        .locals = locals,
+        .local_words = if (ir.localCount() == 0) 0 else ir.localWords(),
+        .assign_slot = assign_slot,
+        .assign_handle = assign_handle,
+        .root_local = root_local,
     };
+}
+
+/// Which roots read a local variable slot, one bit each. A backend evaluates those
+/// per valuation group and the rest once per cycle, so this is the whole of what
+/// local variables cost a monitor whose sequences only READ them.
+fn rootLocalMask(builder: *Builder, gpa: Allocator, roots: []const Ir.Node.Index) Allocator.Error![]Word {
+    const words = Nfa.wordsFor(@intCast(roots.len));
+    const mask = try gpa.alloc(Word, words);
+    @memset(mask, 0);
+    if (builder.ir.localCount() == 0) return mask;
+
+    const slot_words = builder.ir.localWords();
+    const reads = try gpa.alloc(Word, slot_words);
+    defer gpa.free(reads);
+    for (roots, 0..) |root, index| {
+        @memset(reads, 0);
+        builder.boolReads(root, reads);
+        for (reads) |word| {
+            if (word != 0) {
+                Nfa.bitSet(mask, @intCast(index));
+                break;
+            }
+        }
+    }
+    return mask;
 }
 
 /// Whether any of `aborts` was written above the implication, and so covers the
@@ -567,6 +613,9 @@ fn maxLength(ir: *const Ir, node: Ir.Node.Index) ?u64 {
         // path over the automaton and this reads the tree, so the answer is a
         // rejected obligation rather than a wrong `depth`.
         .seq_first_match => return maxLength(ir, @enumFromInt(data.lhs)),
+        // LRM 16.10's assignments happen at the end of a match of the operand
+        // and change no cycle of it, so the bound is the operand's.
+        .seq_match => return maxLength(ir, @enumFromInt(data.lhs)),
         .seq_delay => {
             const delay = ir.delayOf(node);
             if (delay.hi == Ir.unbounded) return null;
@@ -3822,88 +3871,135 @@ const FlowAnalysis = struct {
         gpa.free(analysis.must);
     }
 };
-/// Check for LocalUnderDeterminisation: assignments beneath first_match or prop_not.
-fn checkDeterminisation(ir: *const Ir, node: Ir.Node.Index, diagnostic: ?*Diagnostic) Error!void {
+/// Whether a subtree contains an assignment, i.e. a `seq_match` node.
+fn hasAssignmentsBelow(ir: *const Ir, node: Ir.Node.Index) bool {
+    if (ir.tagOf(node) == .seq_match) return true;
+    var buf: [Ir.max_operands]Ir.Node.Index = undefined;
+    for (ir.operandsOf(node, &buf)) |operand| {
+        if (hasAssignmentsBelow(ir, operand)) return true;
+    }
+    return false;
+}
+
+/// Union into `into` the slots any `seq_match` below `node` WRITES: F.5.4's
+/// `sample`, without the declaration scoping, which this IR has no node for.
+fn samplesBelow(ir: *const Ir, node: Ir.Node.Index, into: []Word) void {
+    if (ir.tagOf(node) == .seq_match) {
+        // The encoding is `[count, slot, handle, ...]`; only the slots matter here,
+        // so this reads them out of `extra` rather than materialising the list.
+        const start = ir.dataOf(node).rhs;
+        const count = ir.extra.items[start];
+        for (0..count) |item| Nfa.bitSet(into, ir.extra.items[start + 1 + item * 2]);
+    }
+    var buf: [Ir.max_operands]Ir.Node.Index = undefined;
+    for (ir.operandsOf(node, &buf)) |operand| samplesBelow(ir, operand, into);
+}
+
+/// Union into `into` the slots any atom below `node` READS.
+fn readsBelow(ir: *const Ir, node: Ir.Node.Index, into: []Word) void {
+    if (ir.tagOf(node) == .atom) {
+        if (ir.atomReadsOf(@enumFromInt(ir.dataOf(node).lhs))) |reads| {
+            for (into, reads) |*word, mask| word.* |= mask;
+        }
+        return;
+    }
+    var buf: [Ir.max_operands]Ir.Node.Index = undefined;
+    for (ir.operandsOf(node, &buf)) |operand| readsBelow(ir, operand, into);
+}
+
+/// The four shapes a single valuation per thread cannot represent, refused before
+/// anything is built (LRM 16.10, F.5.4, F.5.5, and
+/// ../clotho-svalocal/docs/design/sva-local-variables.md 3).
+///
+/// Walks the whole directive once. Every check is on the SHAPE of the tree rather
+/// than on the automaton, so a refusal names a node the front-end can map back to
+/// source text.
+fn checkLocalHazards(
+    gpa: Allocator,
+    ir: *const Ir,
+    node: Ir.Node.Index,
+    diagnostic: ?*Diagnostic,
+) Error!void {
     const tag = ir.tagOf(node);
+    const data = ir.dataOf(node);
+    const words = ir.localWords();
+
     switch (tag) {
+        // A determinised state stands for a SET of operand threads, and with an
+        // assignment beneath it those threads hold different valuations -- exactly
+        // what one valuation per thread cannot carry. A READ below either is fine:
+        // with nothing assigned there, every operand thread carries the valuation
+        // that flowed in.
         .seq_first_match, .prop_not => {
-            // Check if the operand contains any seq_match (assignment) nodes
             if (hasAssignmentsBelow(ir, node)) {
                 if (diagnostic) |into| into.* = .{ .node = node };
                 return error.LocalUnderDeterminisation;
             }
         },
-        else => {},
-    }
-}
-
-/// Whether a sequence subtree contains any assignments (seq_match nodes).
-fn hasAssignmentsBelow(ir: *const Ir, node: Ir.Node.Index) bool {
-    const tag = ir.tagOf(node);
-
-    if (tag == .seq_match) return true;
-
-    var buf: [Ir.max_operands]Ir.Node.Index = undefined;
-    const operands = ir.operandsOf(node, &buf);
-    for (operands) |op| {
-        if (hasAssignmentsBelow(ir, op)) return true;
-    }
-    return false;
-}
-
-/// Check for LocalCrossRead: seq_intersect/seq_and where one samples and other reads incoming.
-/// For now, use a simple heuristic: if the operand has seq_match, check it.
-fn checkCrossRead(ir: *const Ir, node: Ir.Node.Index, diagnostic: ?*Diagnostic) Error!void {
-    const tag = ir.tagOf(node);
-    const data = ir.dataOf(node);
-
-    if (tag != .seq_intersect and tag != .seq_and) return;
-
-    // TODO: Full flow analysis to detect actual conflicts. For now, if both
-    // operands have assignments, it's potentially a hazard if guards interact.
-    const left = @as(Ir.Node.Index, @enumFromInt(data.lhs));
-    const right = @as(Ir.Node.Index, @enumFromInt(data.rhs));
-
-    const left_has_assigns = hasAssignmentsBelow(ir, left);
-    const right_has_assigns = hasAssignmentsBelow(ir, right);
-
-    if (left_has_assigns and right_has_assigns) {
-        // Both have assignments: potential cross-read. Requires full flow analysis
-        // to disambiguate. For now, flag conservatively.
-        if (diagnostic) |into| into.* = .{ .node = node };
-        return error.LocalCrossRead;
-    }
-}
-
-/// Check for LocalUnboundedAttempts: slots under unbounded ranges.
-fn checkUnboundedAttempts(ir: *const Ir, node: Ir.Node.Index, diagnostic: ?*Diagnostic) Error!void {
-    const tag = ir.tagOf(node);
-    const data = ir.dataOf(node);
-
-    switch (tag) {
-        .prop_always => {
-            // Unbounded always with any assigns beneath is refused
-            const range = ir.propRangeOf(node);
-            if (range.hi == Ir.unbounded) {
-                if (hasAssignmentsBelow(ir, @enumFromInt(data.lhs))) {
-                    if (diagnostic) |into| into.* = .{ .node = node };
-                    return error.LocalUnboundedAttempts;
+        // F.5.5 evaluates both operands of a product from the SAME input context,
+        // so a slot one operand assigns is not in the other's context and no legal
+        // sequence reads it there (LRM 16.10 rule a). A product thread here holds
+        // ONE valuation, which would show the sibling's write, so the shape is
+        // refused rather than mislowered.
+        //
+        // TODO: LRM 16.10 -- this is F.5.4's condition read conservatively. An
+        // operand that assigns the slot itself before reading it is legal and is
+        // refused here too; telling the two apart needs the per-node flow sets
+        // rather than the subtree unions.
+        .seq_intersect, .seq_and => {
+            const left: Ir.Node.Index = @enumFromInt(data.lhs);
+            const right: Ir.Node.Index = @enumFromInt(data.rhs);
+            if (hasAssignmentsBelow(ir, left) or hasAssignmentsBelow(ir, right)) {
+                const scratch = try gpa.alloc(Word, @as(usize, words) * 4);
+                defer gpa.free(scratch);
+                @memset(scratch, 0);
+                const left_sample = scratch[0..words];
+                const right_sample = scratch[words..][0..words];
+                const left_read = scratch[words * 2 ..][0..words];
+                const right_read = scratch[words * 3 ..][0..words];
+                samplesBelow(ir, left, left_sample);
+                samplesBelow(ir, right, right_sample);
+                readsBelow(ir, left, left_read);
+                readsBelow(ir, right, right_read);
+                for (left_sample, right_read) |written, read| {
+                    if (written & read != 0) {
+                        if (diagnostic) |into| into.* = .{ .node = node };
+                        return error.LocalCrossRead;
+                    }
+                }
+                for (right_sample, left_read) |written, read| {
+                    if (written & read != 0) {
+                        if (diagnostic) |into| into.* = .{ .node = node };
+                        return error.LocalCrossRead;
+                    }
                 }
             }
         },
+        // A universal operator with no upper bound keeps one attempt per cycle
+        // pending for ever. Counted tracking exists to collapse those into a
+        // counter per state, and two attempts in one state with different
+        // valuations have different futures, so they cannot share one.
+        .prop_always => {
+            const range = ir.propRangeOf(node);
+            if (range.hi == Ir.unbounded and hasAssignmentsBelow(ir, node)) {
+                if (diagnostic) |into| into.* = .{ .node = node };
+                return error.LocalUnboundedAttempts;
+            }
+        },
         .prop_until, .prop_until_with, .prop_s_until, .prop_s_until_with => {
-            // Either operand with assignments is refused
-            const left = @as(Ir.Node.Index, @enumFromInt(data.lhs));
-            const right = @as(Ir.Node.Index, @enumFromInt(data.rhs));
-            if (hasAssignmentsBelow(ir, left) or hasAssignmentsBelow(ir, right)) {
+            if (hasAssignmentsBelow(ir, node)) {
                 if (diagnostic) |into| into.* = .{ .node = node };
                 return error.LocalUnboundedAttempts;
             }
         },
         else => {},
     }
-}
 
+    var buf: [Ir.max_operands]Ir.Node.Index = undefined;
+    for (ir.operandsOf(node, &buf)) |operand| {
+        try checkLocalHazards(gpa, ir, operand, diagnostic);
+    }
+}
 // -- Tests -------------------------------------------------------------------
 //
 // The load-bearing test is differential: a direct recursive reading of the
@@ -3965,6 +4061,10 @@ fn bruteForceMatches(ir: *const Ir, node: Ir.Node.Index, trace: []const u64, sta
             if (ends == 0) return 0;
             return @as(u64, 1) << @intCast(@ctz(ends));
         },
+        // The assignments are invisible to the LANGUAGE: they change values, not
+        // which words match (LRM 16.10). This reference matcher is about the
+        // language, so it looks straight through them.
+        .seq_match => return bruteForceMatches(ir, @enumFromInt(data.lhs), trace, start),
         .seq_delay => {
             const delay = ir.delayOf(node);
             const hi = @min(delay.hi, length);
@@ -10702,4 +10802,113 @@ test "mutation sweep: every wrong spelling is reachable by a test" {
 
 test {
     testing.refAllDecls(@This());
+}
+
+test "a match item's assignments land on the exit positions of its subsequence" {
+    const gpa = testing.allocator;
+
+    // LRM 16.10's `data_check`, shortened: `a ##1 (!a, x = data) ##1 b && (data_out
+    // == x)`. The assignment is attached to the one-cycle subsequence `!a`, so it
+    // belongs to that position and to no other -- and the position that READS `x`
+    // carries no program of its own.
+    var ir: Ir = .init();
+    defer ir.deinit(gpa);
+
+    const slot = try ir.localDeclare(gpa, 0, Ir.local_no_init);
+    try testing.expectEqual(@as(u32, 0), slot);
+
+    const capture = try ir.seqMatch(gpa, try atomCycle(&ir, gpa, 1), &.{ slot, 7 });
+    const tail = try atomCycle(&ir, gpa, 2);
+    // Atom 2 is the comparison against `x`, so it reads slot 0.
+    var reads = [_]Word{1};
+    try ir.atomReads(gpa, @enumFromInt(2), &reads);
+
+    const whole = try ir.seqDelay(
+        gpa,
+        try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, 1, capture),
+        1,
+        1,
+        tail,
+    );
+    const directive = try addDirective(&ir, gpa, try ir.propSeq(gpa, .prop_seq_weak, whole), null);
+
+    var monitor = try assertion(gpa, &ir, directive, .{}, null);
+    defer monitor.deinit(gpa);
+
+    // One site, writing slot 0 with handle 7, and the monitor is threaded because
+    // it has a slot at all.
+    try testing.expectEqual(Monitor.Mode.threaded, monitor.mode);
+    try testing.expectEqual(@as(usize, 1), monitor.locals.len);
+    try testing.expectEqual(@as(usize, 1), monitor.assign_slot.len);
+    try testing.expectEqual(@as(u32, 0), monitor.assign_slot[0]);
+    try testing.expectEqual(@as(u32, 7), monitor.assign_handle[0]);
+
+    // Exactly one state carries a program, and it is not the state that reads.
+    const obligation = &monitor.obligation;
+    var carrying: u32 = 0;
+    for (0..obligation.state_count) |index| {
+        if (obligation.programOf(@intCast(index)).len != 0) carrying += 1;
+    }
+    try testing.expectEqual(@as(u32, 1), carrying);
+
+    // The slot is live where it is still going to be read, and dead after the
+    // comparison: liveness is what lets two groups holding different dead values
+    // merge again.
+    var live_anywhere = false;
+    for (0..obligation.state_count) |index| {
+        if (obligation.liveOf(@intCast(index))[0] & 1 != 0) live_anywhere = true;
+    }
+    try testing.expect(live_anywhere);
+
+    // A root that reads a slot is evaluated per group; the others are not.
+    var per_group: u32 = 0;
+    for (0..monitor.alphabet.roots.len) |index| {
+        if (Nfa.bitIsSet(monitor.root_local, @intCast(index))) per_group += 1;
+    }
+    try testing.expectEqual(@as(u32, 1), per_group);
+}
+
+test "the shapes one valuation per thread cannot represent are refused" {
+    const gpa = testing.allocator;
+
+    // Each of these is a shape where a group's single valuation would be wrong
+    // rather than merely coarse; see the design doc's hazard list.
+    const cases = [_]struct { which: []const u8, want: anyerror }{
+        .{ .which = "first_match", .want = error.LocalUnderDeterminisation },
+        .{ .which = "cross", .want = error.LocalCrossRead },
+        .{ .which = "until", .want = error.LocalUnboundedAttempts },
+    };
+
+    for (cases) |case| {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const slot = try ir.localDeclare(gpa, 0, Ir.local_no_init);
+        const capture = try ir.seqMatch(gpa, try atomCycle(&ir, gpa, 0), &.{ slot, 0 });
+
+        // The reading atom exists only in the cross-read case, and declaring a
+        // read for an atom no node mentions is a caller bug the IR asserts on.
+        const reader = if (std.mem.eql(u8, case.which, "cross")) try atomCycle(&ir, gpa, 1) else undefined;
+        if (std.mem.eql(u8, case.which, "cross")) {
+            var reads = [_]Word{1};
+            try ir.atomReads(gpa, @enumFromInt(1), &reads);
+        }
+
+        const property = if (std.mem.eql(u8, case.which, "first_match"))
+            try ir.propSeq(gpa, .prop_seq_weak, try ir.seqFirstMatch(gpa, capture))
+        else if (std.mem.eql(u8, case.which, "cross"))
+            // The right operand reads the slot the left one assigns, which F.5.5
+            // gives it no view of.
+            try ir.propSeq(gpa, .prop_seq_weak, try ir.seqIntersect(gpa, capture, reader))
+        else
+            try ir.propUntil(
+                gpa,
+                .prop_until,
+                try ir.propSeq(gpa, .prop_seq_weak, capture),
+                try ir.propSeq(gpa, .prop_seq_weak, try atomCycle(&ir, gpa, 2)),
+            );
+
+        const directive = try addDirective(&ir, gpa, property, null);
+        var diagnostic: Diagnostic = undefined;
+        try testing.expectError(case.want, assertion(gpa, &ir, directive, .{}, &diagnostic));
+    }
 }

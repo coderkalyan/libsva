@@ -849,68 +849,70 @@ pub const sva_locals = extern struct {
     user: ?*anyopaque,
 };
 
-/// Count of local variable slots in the monitor's obligation.
+/// The LRM 16.10 local variable slots, in declaration order. Zero for a monitor
+/// without any, which is then never SVA_MODE_THREADED.
 export fn sva_monitor_local_count(monitor: *const Monitor) u32 {
-    return monitor.local_count;
+    return @intCast(monitor.locals.len);
 }
 
-/// Words per local variable slot mask.
 export fn sva_monitor_local_words(monitor: *const Monitor) u32 {
     return monitor.local_words;
 }
 
-/// Type handle of a local variable slot. Indices are dense from zero.
+/// The opaque type the slot was declared with; libsva never reads it.
 export fn sva_monitor_local_type(monitor: *const Monitor, slot: u32) u32 {
-    if (slot >= monitor.locals.len) return 0;
+    std.debug.assert(slot < monitor.locals.len);
     return monitor.locals[slot].type;
 }
 
-/// Initialization handle of a local variable slot.
+/// The slot's initializer handle, or SVA_LOCAL_NO_INIT.
 export fn sva_monitor_local_init(monitor: *const Monitor, slot: u32) u32 {
-    if (slot >= monitor.locals.len) return 0;
+    std.debug.assert(slot < monitor.locals.len);
     return monitor.locals[slot].init;
 }
 
-/// Count of assignment sites in the monitor (slots assigned per state).
+/// Assignment sites, dense from zero. A state's program names these.
 export fn sva_monitor_assign_count(monitor: *const Monitor) u32 {
-    return @intCast(monitor.sites.len / 2);
+    return @intCast(monitor.assign_slot.len);
 }
 
-/// Slot index of a given assignment site (pair index).
 export fn sva_monitor_assign_slot(monitor: *const Monitor, site: u32) u32 {
-    const idx = site * 2;
-    if (idx >= monitor.sites.len) return 0;
-    return monitor.sites[idx];
+    std.debug.assert(site < monitor.assign_slot.len);
+    return monitor.assign_slot[site];
 }
 
-/// Handle index (RHS) of a given assignment site.
 export fn sva_monitor_assign_handle(monitor: *const Monitor, site: u32) u32 {
-    const idx = site * 2 + 1;
-    if (idx >= monitor.sites.len) return 0;
-    return monitor.sites[idx];
+    std.debug.assert(site < monitor.assign_handle.len);
+    return monitor.assign_handle[site];
 }
 
-/// Slots read by roots (atomic guards). A mask of sva_monitor_local_words words.
+/// Which roots read a local variable slot, one bit each, and so are evaluated per
+/// valuation group rather than once per cycle. All-zero without slots.
 export fn sva_monitor_root_local(monitor: *const Monitor) [*]const Word {
-    if (monitor.root_local.len == 0) return &.{};
     return monitor.root_local.ptr;
 }
 
-/// Assignment sites to perform on arriving in a state (from obligation automaton).
-/// Returns pointer to site indices, or null if no locals or this state has no assignments.
-export fn sva_automaton_program(automaton: *const Nfa, state: u32) ?[*]const u32 {
+/// The assignment sites to perform on arriving in `state`, in order. Writes the
+/// count; returns null for a state that assigns nothing, which is every state of a
+/// monitor without local variables.
+export fn sva_automaton_program(automaton: *const Nfa, state: u32, count: *u32) ?[*]const u32 {
     const program = Nfa.programOf(automaton, state);
+    count.* = @intCast(program.len);
     if (program.len == 0) return null;
     return program.ptr;
 }
 
-/// Live-slot mask for a state: which slots may still be read onward.
-/// Dimensions: sva_monitor_local_words words. Empty if no locals.
+/// The slots whose values may still be read from `state` onward: F.5.4's flow set
+/// projected onto the automaton, `sva_monitor_local_words` words.
 export fn sva_automaton_live(automaton: *const Nfa, state: u32) [*]const Word {
     const live = Nfa.liveOf(automaton, state);
-    if (live.len == 0) return &.{};
+    if (live.len == 0) return @ptrCast(&empty_word);
     return live.ptr;
 }
+
+/// A zero word `sva_automaton_live` and friends can hand back for an automaton
+/// with no slot masks, so a caller never sees a null it would have to branch on.
+const empty_word: Word = 0;
 
 /// Bind a run to local variable callbacks for threaded stepping.
 /// Called before stepping a monitor with locals (SVA_MODE_THREADED).
