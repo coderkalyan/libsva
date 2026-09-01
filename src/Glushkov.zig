@@ -226,6 +226,43 @@ pub const Error = error{
     /// `determinise` over the other automaton, and `Monitor.Mode` would grow a
     /// third discipline to read it.
     AntecedentNotBounded,
+    /// One operand of an `intersect` or `and` assigns a local variable slot
+    /// that the sibling operand reads from the incoming context. LRM F.5.5
+    /// requires both operands to be evaluated from the SAME input context, so
+    /// the read sibling cannot see the write; one valuation per state cannot
+    /// express both views at once, and the two operands of a product are one
+    /// thread here.
+    LocalCrossRead,
+    /// A local variable assignment under an operator that determinises its
+    /// operand — `seq_first_match` or `prop_not`. A determinised state
+    /// stands for a SET of operand threads, and with an assignment beneath it
+    /// those threads hold different valuations, which is exactly what one
+    /// valuation per state cannot carry. Reading a local under either is fine:
+    /// with no assignment there, every operand thread carries the valuation
+    /// that flowed in.
+    LocalUnderDeterminisation,
+    /// A zero-delay fusion whose right-hand component reads a local variable
+    /// slot the left-hand component assigns in the same cycle. Fusion conjoins
+    /// the two guards into one cube, and this shape needs the cube split around
+    /// the assignment: the left half must be evaluated before the assignment
+    /// and the right half after. One valuation per state cannot express both.
+    LocalFusedRead,
+    /// Local variables under a universal operator with no upper bound — an
+    /// unbounded `prop_always` range, or either operand of a `prop_until*`.
+    /// Those leave one attempt per cycle pending for ever, which the counted
+    /// discipline exists to collapse into a counter per state; a valuation
+    /// makes the collapse unsound: two attempts in one state with different
+    /// valuations have different futures. An unbounded *sequence* obligation
+    /// is a different shape and stays supported.
+    LocalUnboundedAttempts,
+    /// The IR declares local variable slots and this lowering does not carry them
+    /// yet: no projection onto states, no flow sets, no group discipline. Every
+    /// local table would come out empty, which a backend reads as "no local
+    /// variables" and simulates as though the match items were absent -- so the
+    /// directive is refused rather than lowered into a wrong answer.
+    ///
+    /// TODO: LRM 16.10. Goes away with the group step.
+    LocalIncomplete,
     /// The obligation is bounded but deeper than `Options.depth_limit`, or the
     /// antecedent is and has more attempts in flight than that.
     DepthLimitExceeded,
@@ -280,6 +317,15 @@ pub fn assertion(
 ) Error!Monitor {
     const directive = ir.assertions.get(@intFromEnum(index));
 
+    // The shapes one valuation per thread cannot represent, refused before
+    // anything is built so a diagnostic names a node the front-end can still map
+    // back to source (LRM 16.10, F.5.4, F.5.5).
+    if (ir.localCount() > 0) {
+        var flow = try Flow.compute(gpa, ir);
+        defer flow.deinit(gpa);
+        try checkLocalHazards(ir, &flow, directive.prop, diagnostic);
+    }
+
     var builder: Builder = .{ .gpa = gpa, .ir = ir, .options = options, .diagnostic = diagnostic };
     defer builder.deinit();
     try builder.reserveCubes();
@@ -295,7 +341,17 @@ pub fn assertion(
         if (diagnostic) |into| into.* = .{ .node = node };
         return error.ObligationModeMixed;
     }
-    const mode: Monitor.Mode = if (bound.length == null) .counted else .ring;
+    // A local variable makes a thread a (position, valuation) pair, and neither a
+    // state vector nor a counter per state can tell two valuations apart, so a
+    // monitor with slots is tracked as a list of valuation GROUPS instead --
+    // whatever bound its obligation has. `depth` stays the attempt bound where
+    // there is one and 0 where there is not, which is what the header promises.
+    const mode: Monitor.Mode = if (ir.localCount() > 0)
+        .threaded
+    else if (bound.length == null)
+        .counted
+    else
+        .ring;
     // Only a ring has a depth; counted mode reports zero and means it.
     const depth = if (bound.length) |longest|
         try builder.checkDepth(bound.culprit, longest)
@@ -402,6 +458,20 @@ pub fn assertion(
     // masks and is read back at the narrower width for the same reason.
     if (mode == .counted) @memcpy(automata[0].dead, dead[0..words]);
 
+    // The local variable tables the backend reads, owned by the monitor: the slot
+    // table verbatim from the IR, the dense assignment-site table the states'
+    // programs index, and the per-root read mask that splits root evaluation.
+    const locals = try gpa.dupe(Ir.Local, ir.locals.items);
+    errdefer gpa.free(locals);
+    const assign_slot = try gpa.dupe(u32, builder.assign_slot.items);
+    errdefer gpa.free(assign_slot);
+    const assign_handle = try gpa.dupe(u32, builder.assign_handle.items);
+    errdefer gpa.free(assign_handle);
+    // Over the alphabet's roots, not the builder's: materialisation compacts and
+    // renumbers them, and this mask is indexed the way a backend indexes them.
+    const root_local = try rootLocalMask(&builder, gpa, alphabet.roots);
+    errdefer gpa.free(root_local);
+
     return .{
         .id = directive.id,
         .kind = directive.kind,
@@ -417,7 +487,37 @@ pub fn assertion(
         .reset = pinned[0],
         .aborts = aborts,
         .abort_masks = abort_masks,
+        .locals = locals,
+        .local_words = if (ir.localCount() == 0) 0 else ir.localWords(),
+        .assign_slot = assign_slot,
+        .assign_handle = assign_handle,
+        .root_local = root_local,
     };
+}
+
+/// Which roots read a local variable slot, one bit each. A backend evaluates those
+/// per valuation group and the rest once per cycle, so this is the whole of what
+/// local variables cost a monitor whose sequences only READ them.
+fn rootLocalMask(builder: *Builder, gpa: Allocator, roots: []const Ir.Node.Index) Allocator.Error![]Word {
+    const words = Nfa.wordsFor(@intCast(roots.len));
+    const mask = try gpa.alloc(Word, words);
+    @memset(mask, 0);
+    if (builder.ir.localCount() == 0) return mask;
+
+    const slot_words = builder.ir.localWords();
+    const reads = try gpa.alloc(Word, slot_words);
+    defer gpa.free(reads);
+    for (roots, 0..) |root, index| {
+        @memset(reads, 0);
+        builder.boolReads(root, reads);
+        for (reads) |word| {
+            if (word != 0) {
+                Nfa.bitSet(mask, @intCast(index));
+                break;
+            }
+        }
+    }
+    return mask;
 }
 
 /// Whether any of `aborts` was written above the implication, and so covers the
@@ -515,6 +615,9 @@ fn maxLength(ir: *const Ir, node: Ir.Node.Index) ?u64 {
         // path over the automaton and this reads the tree, so the answer is a
         // rejected obligation rather than a wrong `depth`.
         .seq_first_match => return maxLength(ir, @enumFromInt(data.lhs)),
+        // LRM 16.10's assignments happen at the end of a match of the operand
+        // and change no cycle of it, so the bound is the operand's.
+        .seq_match => return maxLength(ir, @enumFromInt(data.lhs)),
         .seq_delay => {
             const delay = ir.delayOf(node);
             if (delay.hi == Ir.unbounded) return null;
@@ -708,6 +811,16 @@ const Fragment = struct {
     follow: []Word,
     first: []Word,
     last: []Word,
+    /// Per state, the LRM 16.10 assignment program that runs on arriving there,
+    /// indexing `Builder.sites`. `Nfa.Program.none` for every state of a
+    /// local-free lowering, which is what keeps this one array's cost the whole
+    /// cost of the feature here: the pool it points into is never allocated.
+    ///
+    /// Positions are renumbered by every combinator, so this travels with them —
+    /// `blit` carries it, and the constructions that build a state out of a PAIR
+    /// of positions (a zero-delay fusion, an intersect or and product) have to
+    /// concatenate the two programs themselves, in that order.
+    program: []Nfa.Program,
 
     /// `state_count` states, all guarded by `always`, with no edges.
     fn init(gpa: Allocator, state_count: u32) Allocator.Error!Fragment {
@@ -719,11 +832,14 @@ const Fragment = struct {
         const first = try gpa.alloc(Word, words);
         errdefer gpa.free(first);
         const last = try gpa.alloc(Word, words);
+        errdefer gpa.free(last);
+        const program = try gpa.alloc(Nfa.Program, state_count);
 
         @memset(guard, .always);
         @memset(follow, 0);
         @memset(first, 0);
         @memset(last, 0);
+        @memset(program, Nfa.Program.none);
         return .{
             .state_count = state_count,
             .words = words,
@@ -731,6 +847,7 @@ const Fragment = struct {
             .follow = follow,
             .first = first,
             .last = last,
+            .program = program,
         };
     }
 
@@ -739,6 +856,7 @@ const Fragment = struct {
         gpa.free(fragment.follow);
         gpa.free(fragment.first);
         gpa.free(fragment.last);
+        gpa.free(fragment.program);
     }
 
     fn row(fragment: *Fragment, state: u32) []Word {
@@ -749,15 +867,51 @@ const Fragment = struct {
         return fragment.follow[@as(usize, state) * fragment.words ..][0..fragment.words];
     }
 
-    /// Copy `source`'s states and internal edges in starting at `base`. Entry
-    /// and exit sets are the caller's business: a combinator rarely wants them
-    /// verbatim.
+    /// Copy `source`'s states, internal edges and assignment programs in starting
+    /// at `base`. Entry and exit sets are the caller's business: a combinator
+    /// rarely wants them verbatim.
+    ///
+    /// A program travels as an index pair into a pool that is never renumbered, so
+    /// relocating a state is a plain copy — which is why every combinator that
+    /// only relocates states needs nothing else for LRM 16.10.
     fn blit(fragment: *Fragment, source: *const Fragment, base: u32) void {
         for (0..source.state_count) |index| {
             const state: u32 = @intCast(index);
             fragment.guard[base + state] = source.guard[state];
+            fragment.program[base + state] = source.program[state];
             blitMask(fragment.row(base + state), source.rowConst(state), base);
         }
+    }
+
+    /// The program of a state built out of two positions at once: `left`'s sites
+    /// then `right`'s. LRM 16.10 runs a match item list at the end of the match it
+    /// is attached to, and a fused or product state ends both, so the left
+    /// operand's assignments precede the right's — the same order the source text
+    /// has them in.
+    fn fuseProgram(
+        fragment: *Fragment,
+        sites: *std.ArrayListUnmanaged(u32),
+        gpa: Allocator,
+        state: u32,
+        left: Nfa.Program,
+        right: Nfa.Program,
+    ) Allocator.Error!void {
+        if (left.len == 0 and right.len == 0) return;
+        if (right.len == 0) {
+            fragment.program[state] = left;
+            return;
+        }
+        if (left.len == 0) {
+            fragment.program[state] = right;
+            return;
+        }
+        // Reserved up front: the copy reads out of the same list it appends to, and
+        // an append that reallocates would leave the source slice dangling.
+        try sites.ensureUnusedCapacity(gpa, left.len + right.len);
+        const start: u32 = @intCast(sites.items.len);
+        for (0..left.len) |offset| sites.appendAssumeCapacity(sites.items[left.start + offset]);
+        for (0..right.len) |offset| sites.appendAssumeCapacity(sites.items[right.start + offset]);
+        fragment.program[state] = .{ .start = start, .len = left.len + right.len };
     }
 };
 
@@ -803,6 +957,15 @@ const Builder = struct {
     root_of: std.AutoHashMapUnmanaged(u64, u31) = .empty,
     /// Backing pool for interned cubes.
     literals: std.ArrayListUnmanaged(Literal) = .empty,
+    /// Backing pool the fragments' `program` slices index: LRM 16.10 assignment
+    /// site numbers, dense over the monitor's site table and appended in the order
+    /// the `seq_match` nodes are lowered. Never renumbered, so relocating a state
+    /// is a copy of the index pair. Empty for a local-free assertion.
+    sites: std.ArrayListUnmanaged(u32) = .empty,
+    /// Per assignment site, the slot it writes and the opaque handle the backend
+    /// evaluates for its value. Parallel to `sites`' contents by index.
+    assign_slot: std.ArrayListUnmanaged(u32) = .empty,
+    assign_handle: std.ArrayListUnmanaged(u32) = .empty,
     /// Interned cubes; slots 0 and 1 are `always` and `never`.
     table: std.ArrayListUnmanaged(Guard) = .empty,
     /// Cube under construction.
@@ -819,6 +982,9 @@ const Builder = struct {
         builder.roots.deinit(builder.gpa);
         builder.root_of.deinit(builder.gpa);
         builder.literals.deinit(builder.gpa);
+        builder.sites.deinit(builder.gpa);
+        builder.assign_slot.deinit(builder.gpa);
+        builder.assign_handle.deinit(builder.gpa);
         builder.table.deinit(builder.gpa);
         builder.scratch.deinit(builder.gpa);
         builder.cube_bucket.deinit(builder.gpa);
@@ -2000,7 +2166,65 @@ const Builder = struct {
                     ir.tagOf(node) == .seq_repeat_nonconsec,
                 );
             },
+            .seq_match => {
+                // LRM 16.10 runs a match item list "at the end of any nonempty match
+                // of the subsequence", and a match of the operand ends in one of its
+                // exit positions -- so the program lands on every state in `last` and
+                // nowhere else. The automaton's shape does not change: the operand's
+                // own fragment comes back with those states annotated.
+                var operand = try builder.lower(@enumFromInt(data.lhs));
+                errdefer operand.deinit(builder.gpa);
+                try builder.attachMatchItems(node, &operand);
+                return operand;
+            },
             else => unreachable, // not a sequence-layer tag
+        }
+    }
+
+    /// Attach a `seq_match` node's assignments to every exit position of its
+    /// operand, appending them to the site pool.
+    ///
+    /// A position may already carry a program: match item lists nest
+    /// (`((a, x = 1), y = 2)`), and the inner list is attached first, so the outer
+    /// one's sites go after it — which is the order LRM 16.10 asks for, innermost
+    /// match ending first. Extending is a re-append rather than an in-place grow
+    /// because the pool is shared and a program is a contiguous slice of it; the
+    /// duplicated prefix costs a few words on a shape that nests match items and
+    /// nothing at all on every other.
+    fn attachMatchItems(builder: *Builder, node: Ir.Node.Index, fragment: *Fragment) Error!void {
+        const gpa = builder.gpa;
+        var assigns: std.ArrayListUnmanaged(Ir.Assign) = .empty;
+        defer assigns.deinit(gpa);
+        try builder.ir.matchOf(node, &assigns, gpa);
+        std.debug.assert(assigns.items.len > 0); // `seqMatch` folds an empty list away
+
+        // Site numbers are dense over the whole monitor and minted here, in the
+        // order the nodes are lowered, so the backend's site table is this list.
+        const first_site: u32 = @intCast(builder.assign_slot.items.len);
+        for (assigns.items) |assign| {
+            try builder.assign_slot.append(gpa, assign.slot);
+            try builder.assign_handle.append(gpa, assign.handle);
+        }
+
+        var exits: BitIterator = .init(fragment.last);
+        while (exits.next()) |index| {
+            const state: u32 = @intCast(index);
+            const held = fragment.program[state];
+            // Reserve first: appending from the same list would read through a
+            // slice the append itself may have reallocated.
+            try builder.sites.ensureUnusedCapacity(gpa, held.len + assigns.items.len);
+            const start: u32 = @intCast(builder.sites.items.len);
+            for (0..held.len) |offset| {
+                const site = builder.sites.items[held.start + offset];
+                builder.sites.appendAssumeCapacity(site);
+            }
+            for (0..assigns.items.len) |offset| {
+                builder.sites.appendAssumeCapacity(first_site + @as(u32, @intCast(offset)));
+            }
+            fragment.program[state] = .{
+                .start = start,
+                .len = held.len + @as(u32, @intCast(assigns.items.len)),
+            };
         }
     }
 
@@ -2112,6 +2336,19 @@ const Builder = struct {
             blitMask(fragment.row(state), right.rowConst(fusion.right_entry), left_count);
             if (Nfa.bitIsSet(left.first, fusion.left_exit)) Nfa.bitSet(fragment.first, state);
             if (Nfa.bitIsSet(right.last, fusion.right_entry)) Nfa.bitSet(fragment.last, state);
+            // The fused cycle ends the left operand's match and begins the right's,
+            // so it owes both positions' assignments, left first (LRM 16.10 and
+            // F.5.5's `##0` clause, which flows the left's output context into the
+            // right). A read on the right of a slot the left writes here would need
+            // the guard cube split around the assignment instead, which is what
+            // Error.LocalFusedRead refuses.
+            try fragment.fuseProgram(
+                &builder.sites,
+                gpa,
+                state,
+                left.program[fusion.left_exit],
+                right.program[fusion.right_entry],
+            );
         }
         for (0..left_count) |index| {
             const state: u32 = @intCast(index);
@@ -2342,6 +2579,18 @@ const Builder = struct {
         for (pairs.items, 0..) |pair, offset| {
             const state: u32 = @intCast(offset);
             fragment.guard[state] = pair.guard;
+            // A product state stands for one position of each operand at once, so
+            // it owes both their assignments, left first (LRM 16.10; F.5.5 gives the
+            // two operands the same input context, and Error.LocalCrossRead refuses
+            // the one shape where a shared valuation would be visible across the
+            // fork). `finished` is not a position and carries no program.
+            try fragment.fuseProgram(
+                &builder.sites,
+                gpa,
+                state,
+                if (pair.left == finished) Nfa.Program.none else left.program[pair.left],
+                if (pair.right == finished) Nfa.Program.none else right.program[pair.right],
+            );
             var left_next: BitIterator = .init(left.rowConst(pair.left));
             while (left_next.next()) |left_state| {
                 var right_next: BitIterator = .init(right.rowConst(pair.right));
@@ -2512,6 +2761,18 @@ const Builder = struct {
         for (pairs.items, 0..) |pair, offset| {
             const state: u32 = @intCast(offset);
             fragment.guard[state] = pair.guard;
+            // A product state stands for one position of each operand at once, so
+            // it owes both their assignments, left first (LRM 16.10; F.5.5 gives the
+            // two operands the same input context, and Error.LocalCrossRead refuses
+            // the one shape where a shared valuation would be visible across the
+            // fork). `finished` is not a position and carries no program.
+            try fragment.fuseProgram(
+                &builder.sites,
+                gpa,
+                state,
+                if (pair.left == finished) Nfa.Program.none else left.program[pair.left],
+                if (pair.right == finished) Nfa.Program.none else right.program[pair.right],
+            );
             try andSuccessors(gpa, left, right, pair, &successors);
             for (successors.items) |target| {
                 const next = index.get(pairKey(target.left, target.right)) orelse continue;
@@ -3175,6 +3436,11 @@ const Builder = struct {
             const state = kept.map[index];
             if (state == dropped) continue;
             into.guard[state] = fragment.guard[index];
+            // A program is an index pair into a pool pruning never touches, so it
+            // relocates with its state and needs no rewrite. A dropped state's
+            // program goes with it: no cycle can enter it, so its assignments were
+            // unreachable (LRM 16.10 attaches them to a match that cannot happen).
+            into.program[state] = fragment.program[index];
             var outgoing: BitIterator = .init(fragment.rowConst(@intCast(index)));
             while (outgoing.next()) |target| {
                 if (kept.map[target] != dropped) Nfa.bitSet(into.row(state), kept.map[target]);
@@ -3389,6 +3655,98 @@ const Builder = struct {
         };
     }
 
+    /// Union the slots a boolean node reads into `into`. A guard is a cube over
+    /// roots, a root is a boolean tree, and only its atoms read anything — the mask
+    /// is the front-end's, declared through `sva_atom_reads`.
+    fn boolReads(builder: *Builder, node: Ir.Node.Index, into: []Word) void {
+        const ir = builder.ir;
+        const data = ir.dataOf(node);
+        switch (ir.tagOf(node)) {
+            .bool_const => {},
+            .atom => {
+                const reads = ir.atomReadsOf(@enumFromInt(data.lhs)) orelse return;
+                for (into, reads) |*word, mask| word.* |= mask;
+            },
+            .bnot => builder.boolReads(@enumFromInt(data.lhs), into),
+            .band, .bor => {
+                builder.boolReads(@enumFromInt(data.lhs), into);
+                builder.boolReads(@enumFromInt(data.rhs), into);
+            },
+            else => unreachable, // not a boolean-layer tag
+        }
+    }
+
+    /// The slots a state's own cycle reads: every literal of its guard, plus every
+    /// slot its program WRITES.
+    ///
+    /// The writes belong here because a compound assignment reads the slot it
+    /// updates (LRM 16.6 admits exactly those operators on a local variable
+    /// lvalue), and the read is inside the handle the front-end evaluates rather
+    /// than in any atom, so nothing declares it. Treating a written slot as read at
+    /// its own site is the sound reading, and it costs only a merge that liveness
+    /// would otherwise have allowed.
+    fn stateReads(builder: *Builder, fragment: *const Fragment, state: u32, into: []Word) void {
+        const entry = builder.table.items[@intFromEnum(fragment.guard[state])];
+        for (builder.literals.items[entry.start..][0..entry.len]) |literal| {
+            builder.boolReads(builder.roots.items[literal.root], into);
+        }
+        const program = fragment.program[state];
+        for (0..program.len) |offset| {
+            const site = builder.sites.items[program.start + offset];
+            Nfa.bitSet(into, builder.assign_slot.items[site]);
+        }
+    }
+
+    /// F.5.4's flow set, projected onto the automaton: per state, the slots whose
+    /// values may still be read from that state onward.
+    ///
+    /// A group sitting in a state has already had that state's guard hold, so what
+    /// is still readable is what the states it can go on to read — a least fixpoint
+    /// over `follow`, iterated because the graph has cycles wherever a repetition
+    /// does. Restricting a valuation to this before comparing two groups is what
+    /// lets groups that differ only in dead slots merge, which is what stops an
+    /// accumulating assignment under an unbounded repetition growing a group per
+    /// cycle for ever.
+    fn liveness(
+        builder: *Builder,
+        fragment: *const Fragment,
+        kept: *const Surviving,
+        state_count: u32,
+        words: u32,
+        follow: []const Word,
+        live: []Word,
+        local_words: u32,
+    ) Allocator.Error!void {
+        const gpa = builder.gpa;
+        const reads = try gpa.alloc(Word, @as(usize, state_count) * local_words);
+        defer gpa.free(reads);
+        @memset(reads, 0);
+        for (0..fragment.state_count) |index| {
+            const state = kept.map[index];
+            if (state == dropped) continue;
+            builder.stateReads(fragment, @intCast(index), reads[@as(usize, state) * local_words ..][0..local_words]);
+        }
+
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (0..state_count) |index| {
+                const state: u32 = @intCast(index);
+                const into = live[@as(usize, state) * local_words ..][0..local_words];
+                var next: BitIterator = .init(follow[@as(usize, state) * words ..][0..words]);
+                while (next.next()) |target| {
+                    const target_reads = reads[@as(usize, target) * local_words ..][0..local_words];
+                    const target_live = live[@as(usize, target) * local_words ..][0..local_words];
+                    for (into, target_reads, target_live) |*word, read, alive| {
+                        const before = word.*;
+                        word.* |= read | alive;
+                        if (word.* != before) changed = true;
+                    }
+                }
+            }
+        }
+    }
+
     /// Renumber one pruned fragment into an `Nfa` over the compacted guards.
     fn emit(
         builder: *Builder,
@@ -3421,9 +3779,24 @@ const Builder = struct {
         @memset(dead, 0);
         @memset(guard_states, 0);
 
+        // LRM 16.10 assignment programs, and the slot liveness that lets two groups
+        // holding the same *readable* values merge. Both are empty for a local-free
+        // assertion, which is the gate every local-keyed path in Nfa is behind.
+        const local_words: u32 = if (builder.ir.localCount() == 0) 0 else builder.ir.localWords();
+        const program = if (local_words == 0)
+            try gpa.alloc(Nfa.Program, 0)
+        else
+            try gpa.alloc(Nfa.Program, state_count);
+        errdefer gpa.free(program);
+        if (program.len != 0) @memset(program, Nfa.Program.none);
+        const live = try gpa.alloc(Word, @as(usize, state_count) * local_words);
+        errdefer gpa.free(live);
+        @memset(live, 0);
+
         for (0..fragment.state_count) |index| {
             const state = kept.map[index];
             if (state == dropped) continue;
+            if (program.len != 0) program[state] = fragment.program[index];
             const guard = guard_map[@intFromEnum(fragment.guard[index])];
             guard_of[state] = @enumFromInt(guard);
             Nfa.bitSet(guard_states[@as(usize, guard) * words ..][0..words], state);
@@ -3437,6 +3810,10 @@ const Builder = struct {
             if (Nfa.bitIsSet(fragment.last, @intCast(index))) Nfa.bitSet(last, state);
         }
 
+        if (local_words != 0) {
+            try builder.liveness(fragment, kept, state_count, words, follow, live, local_words);
+        }
+
         return .{
             .state_count = state_count,
             .words = words,
@@ -3446,10 +3823,377 @@ const Builder = struct {
             .last = last,
             .dead = dead,
             .guard_states = guard_states,
+            .program = program,
+            // The pool is the builder's and outlives every fragment; each automaton
+            // gets its own copy so a monitor owns its tables outright.
+            .sites = try gpa.dupe(u32, builder.sites.items),
+            .live = live,
+            .local_words = local_words,
         };
     }
 };
+/// Flow analysis per F.5.4: sample, block, flow masks per IR node.
+/// Gate on localCount > 0; zero words means analysis was skipped.
+const FlowAnalysis = struct {
+    sample: []Word,
+    block: []Word,
+    out: []Word,
+    must: []Word,
+    words: u32,
+    local_count: u32,
 
+    fn nodeIndex(analysis: *const FlowAnalysis, node: Ir.Node.Index) usize {
+        return @as(usize, @intFromEnum(node)) * analysis.words;
+    }
+
+    fn sampleOf(analysis: *const FlowAnalysis, node: Ir.Node.Index) []Word {
+        if (analysis.words == 0) return &.{};
+        return analysis.sample[analysis.nodeIndex(node)..][0..analysis.words];
+    }
+
+    fn blockOf(analysis: *const FlowAnalysis, node: Ir.Node.Index) []Word {
+        if (analysis.words == 0) return &.{};
+        return analysis.block[analysis.nodeIndex(node)..][0..analysis.words];
+    }
+
+    fn outOf(analysis: *const FlowAnalysis, node: Ir.Node.Index) []Word {
+        if (analysis.words == 0) return &.{};
+        return analysis.out[analysis.nodeIndex(node)..][0..analysis.words];
+    }
+
+    fn mustOf(analysis: *const FlowAnalysis, node: Ir.Node.Index) []Word {
+        if (analysis.words == 0) return &.{};
+        return analysis.must[analysis.nodeIndex(node)..][0..analysis.words];
+    }
+
+    fn deinit(analysis: *FlowAnalysis, gpa: Allocator) void {
+        gpa.free(analysis.sample);
+        gpa.free(analysis.block);
+        gpa.free(analysis.out);
+        gpa.free(analysis.must);
+    }
+};
+/// Whether a subtree contains an assignment, i.e. a `seq_match` node.
+fn hasAssignmentsBelow(ir: *const Ir, node: Ir.Node.Index) bool {
+    if (ir.tagOf(node) == .seq_match) return true;
+    var buf: [Ir.max_operands]Ir.Node.Index = undefined;
+    for (ir.operandsOf(node, &buf)) |operand| {
+        if (hasAssignmentsBelow(ir, operand)) return true;
+    }
+    return false;
+}
+
+/// Union into `into` the slots any `seq_match` below `node` WRITES: F.5.4's
+/// `sample`, without the declaration scoping, which this IR has no node for.
+/// F.5.4's local variable flow, per IR node.
+///
+/// The standard defines three set-valued functions over an unclocked sequence --
+/// `sample` (the slots it assigns), `block` (the slots it stops from flowing out)
+/// and `flow` (what flows out given what flowed in) -- and one remark that makes
+/// them cheap here: `flow(X, R) = (X | flow({}, R)) - block(R)`. So `flow({}, R)`
+/// and `block(R)` are enough to answer any `flow`, and both are bottom-up. IR
+/// operands point strictly backwards, so one forward pass over the nodes fills
+/// every table.
+///
+/// A fourth set is not F.5.4's and exists for this implementation: `read_first`,
+/// the slots a sequence may READ before it assigns them itself. A group carries
+/// one valuation for both operands of a product, so a read that could observe the
+/// sibling's write is the shape that cannot be represented -- and a read of a slot
+/// the operand has already assigned itself cannot, whatever the sibling did. That
+/// distinction is what keeps `Error.LocalCrossRead` off the legal shapes.
+///
+/// This IR has no declaration node: slots are declared on the Ir and are in scope
+/// for the whole directive, so F.5.4's `( t v; R )` rules -- which subtract the
+/// declared variable -- have nothing to apply to and are omitted.
+const Flow = struct {
+    words: u32,
+    sample: []Word,
+    block: []Word,
+    out: []Word,
+    read_first: []Word,
+
+    fn rowOf(table: []Word, words: u32, node: Ir.Node.Index) []Word {
+        return table[@as(usize, @intFromEnum(node)) * words ..][0..words];
+    }
+
+    fn sampleOf(flow: *const Flow, node: Ir.Node.Index) []const Word {
+        return rowOf(flow.sample, flow.words, node);
+    }
+    fn blockOf(flow: *const Flow, node: Ir.Node.Index) []const Word {
+        return rowOf(flow.block, flow.words, node);
+    }
+    fn outOf(flow: *const Flow, node: Ir.Node.Index) []const Word {
+        return rowOf(flow.out, flow.words, node);
+    }
+    fn readFirstOf(flow: *const Flow, node: Ir.Node.Index) []const Word {
+        return rowOf(flow.read_first, flow.words, node);
+    }
+
+    fn deinit(flow: *Flow, gpa: Allocator) void {
+        gpa.free(flow.sample);
+        gpa.free(flow.block);
+        gpa.free(flow.out);
+        gpa.free(flow.read_first);
+    }
+
+    fn compute(gpa: Allocator, ir: *const Ir) Allocator.Error!Flow {
+        const words = ir.localWords();
+        const count = ir.nodes.len;
+        const total = count * @as(usize, words);
+
+        var flow: Flow = .{
+            .words = words,
+            .sample = try gpa.alloc(Word, total),
+            .block = try gpa.alloc(Word, total),
+            .out = try gpa.alloc(Word, total),
+            .read_first = try gpa.alloc(Word, total),
+        };
+        errdefer flow.deinit(gpa);
+        @memset(flow.sample, 0);
+        @memset(flow.block, 0);
+        @memset(flow.out, 0);
+        @memset(flow.read_first, 0);
+
+        for (0..count) |index| {
+            const node: Ir.Node.Index = @enumFromInt(index);
+            const data = ir.dataOf(node);
+            const sample = rowOf(flow.sample, words, node);
+            const block = rowOf(flow.block, words, node);
+            const out = rowOf(flow.out, words, node);
+            const reads = rowOf(flow.read_first, words, node);
+
+            switch (ir.tagOf(node)) {
+                // A boolean assigns nothing and blocks nothing; what it READS is
+                // the front-end's declared per-atom mask (F.5.4: sample(b) = {},
+                // block(b) = {}, flow(X, b) = X).
+                .atom => {
+                    if (ir.atomReadsOf(@enumFromInt(data.lhs))) |mask| {
+                        for (reads, mask) |*word, bit| word.* |= bit;
+                    }
+                },
+                .bool_const => {},
+                .bnot => copyInto(reads, rowOf(flow.read_first, words, @enumFromInt(data.lhs))),
+                .band, .bor => {
+                    copyInto(reads, rowOf(flow.read_first, words, @enumFromInt(data.lhs)));
+                    unionInto(reads, rowOf(flow.read_first, words, @enumFromInt(data.rhs)));
+                },
+                .seq_boolean => copyInto(reads, rowOf(flow.read_first, words, @enumFromInt(data.lhs))),
+
+                // `( 1, v = e )`: sample = {v}, block = {}, flow(X) = X | {v}. The
+                // right-hand side is read BEFORE the write lands, so its own reads
+                // are read-first even for the slot being written -- which is what a
+                // compound assignment does.
+                .seq_match => {
+                    const operand: Ir.Node.Index = @enumFromInt(data.lhs);
+                    copyInto(sample, flow.sampleOf(operand));
+                    copyInto(block, flow.blockOf(operand));
+                    copyInto(out, flow.outOf(operand));
+                    copyInto(reads, flow.readFirstOf(operand));
+                    const start = data.rhs;
+                    const items = ir.extra.items[start];
+                    for (0..items) |item| {
+                        const slot = ir.extra.items[start + 1 + item * 2];
+                        Nfa.bitSet(sample, slot);
+                        Nfa.bitSet(out, slot);
+                    }
+                },
+
+                // Concatenation, at either delay: sample and flow compose, and a
+                // slot blocked by the left flows again if the right assigns it
+                // (F.5.4: block(R1 ##1 R2) = (block(R1) - flow({}, R2)) | block(R2)).
+                // A read on the right is read-first only if the left has not
+                // already assigned it.
+                .seq_delay => {
+                    const delay = ir.delayOf(node);
+                    const left = delay.left;
+                    const right = delay.right;
+                    copyInto(sample, flow.sampleOf(left));
+                    unionInto(sample, flow.sampleOf(right));
+                    copyInto(out, flow.outOf(left));
+                    unionInto(out, flow.outOf(right));
+                    copyInto(reads, flow.readFirstOf(left));
+                    for (reads, flow.readFirstOf(right), flow.sampleOf(left)) |*word, later, done| {
+                        word.* |= later & ~done;
+                    }
+                    for (block, flow.blockOf(left), flow.outOf(right)) |*word, blocked, again| {
+                        word.* = blocked & ~again;
+                    }
+                    unionInto(block, flow.blockOf(right));
+                    // flow(X, R) = (X | flow({}, R)) - block(R): the remark keeps
+                    // `out` free of anything the composite blocks.
+                    maskOut(out, block);
+                },
+
+                // Disjunction: a slot flows out only if it flows out of BOTH
+                // operands, which is F.5.4's intersection and the reason
+                // `((a, x = 1) or (b, x = 2))` flows x while assigning it in one
+                // branch each does not.
+                .seq_or => {
+                    const left: Ir.Node.Index = @enumFromInt(data.lhs);
+                    const right: Ir.Node.Index = @enumFromInt(data.rhs);
+                    copyInto(sample, flow.sampleOf(left));
+                    unionInto(sample, flow.sampleOf(right));
+                    copyInto(block, flow.blockOf(left));
+                    unionInto(block, flow.blockOf(right));
+                    copyInto(reads, flow.readFirstOf(left));
+                    unionInto(reads, flow.readFirstOf(right));
+                    for (out, flow.outOf(left), flow.outOf(right)) |*word, a, bb| word.* = a & bb;
+                    maskOut(out, block);
+                },
+
+                // A product blocks what both operands assign, on top of what either
+                // blocks (F.5.4's intersect rule). `seq_and` is the same shape: the
+                // lowering builds it as a product too.
+                .seq_intersect, .seq_and => {
+                    const left: Ir.Node.Index = @enumFromInt(data.lhs);
+                    const right: Ir.Node.Index = @enumFromInt(data.rhs);
+                    copyInto(sample, flow.sampleOf(left));
+                    unionInto(sample, flow.sampleOf(right));
+                    copyInto(block, flow.blockOf(left));
+                    unionInto(block, flow.blockOf(right));
+                    for (block, flow.sampleOf(left), flow.sampleOf(right)) |*word, a, bb| word.* |= a & bb;
+                    copyInto(reads, flow.readFirstOf(left));
+                    unionInto(reads, flow.readFirstOf(right));
+                    copyInto(out, flow.outOf(left));
+                    unionInto(out, flow.outOf(right));
+                    maskOut(out, block);
+                },
+
+                // `exp throughout R`: the boolean is a condition on every cycle, so
+                // it assigns nothing and its reads join the operand's.
+                .seq_throughout => {
+                    const operand: Ir.Node.Index = @enumFromInt(data.rhs);
+                    copyInto(sample, flow.sampleOf(operand));
+                    copyInto(block, flow.blockOf(operand));
+                    copyInto(out, flow.outOf(operand));
+                    copyInto(reads, flow.readFirstOf(operand));
+                    unionInto(reads, flow.readFirstOf(@enumFromInt(data.lhs)));
+                },
+
+                // first_match keeps a subset of its operand's matches and changes no
+                // valuation: every set is the operand's (F.5.4).
+                .seq_first_match => {
+                    const operand: Ir.Node.Index = @enumFromInt(data.lhs);
+                    copyInto(sample, flow.sampleOf(operand));
+                    copyInto(block, flow.blockOf(operand));
+                    copyInto(out, flow.outOf(operand));
+                    copyInto(reads, flow.readFirstOf(operand));
+                },
+
+                // Repetition: F.5.4 gives `R[*1:$]` the operand's sets, and a bounded
+                // count is the concatenation of copies, which changes none of them --
+                // every iteration assigns and reads the same slots. `lo == 0` cannot
+                // occur: this IR has no empty match.
+                .seq_repeat_consec, .seq_repeat_goto, .seq_repeat_nonconsec => {
+                    const operand = ir.repeatOf(node).seq;
+                    copyInto(sample, flow.sampleOf(operand));
+                    copyInto(block, flow.blockOf(operand));
+                    copyInto(out, flow.outOf(operand));
+                    copyInto(reads, flow.readFirstOf(operand));
+                },
+
+                // The property layer carries no valuation of its own; what matters
+                // for the hazards is what its operands do, so the sets propagate.
+                else => {
+                    var buf: [Ir.max_operands]Ir.Node.Index = undefined;
+                    for (ir.operandsOf(node, &buf)) |operand| {
+                        unionInto(sample, flow.sampleOf(operand));
+                        unionInto(block, flow.blockOf(operand));
+                        unionInto(out, flow.outOf(operand));
+                        unionInto(reads, flow.readFirstOf(operand));
+                    }
+                },
+            }
+        }
+        return flow;
+    }
+};
+
+fn copyInto(into: []Word, from: []const Word) void {
+    for (into, from) |*word, bit| word.* = bit;
+}
+
+fn unionInto(into: []Word, from: []const Word) void {
+    for (into, from) |*word, bit| word.* |= bit;
+}
+
+fn maskOut(into: []Word, from: []const Word) void {
+    for (into, from) |*word, bit| word.* &= ~bit;
+}
+
+fn anyCommon(left: []const Word, right: []const Word) bool {
+    for (left, right) |a, b| {
+        if (a & b != 0) return true;
+    }
+    return false;
+}
+
+fn checkLocalHazards(
+    ir: *const Ir,
+    flow: *const Flow,
+    node: Ir.Node.Index,
+    diagnostic: ?*Diagnostic,
+) Error!void {
+    const tag = ir.tagOf(node);
+    const data = ir.dataOf(node);
+
+    switch (tag) {
+        // A determinised state stands for a SET of operand threads, and with an
+        // assignment beneath it those threads hold different valuations -- exactly
+        // what one valuation per thread cannot carry. A READ below either is fine:
+        // with nothing assigned there, every operand thread carries the valuation
+        // that flowed in.
+        .seq_first_match, .prop_not => {
+            if (hasAssignmentsBelow(ir, node)) {
+                if (diagnostic) |into| into.* = .{ .node = node };
+                return error.LocalUnderDeterminisation;
+            }
+        },
+        // F.5.5 evaluates both operands of a product from the SAME input context, so
+        // a slot one operand assigns is not in the other's context and no legal
+        // sequence reads it there (LRM 16.10 rule a). A product thread here holds ONE
+        // valuation, which would show the sibling's write.
+        //
+        // The test is on read_first, not on every read: a read of a slot the operand
+        // has already assigned ITSELF cannot observe the sibling's value whatever the
+        // sibling did, so `(d ##1 (true, x = data) ##0 (e == x))` beside an operand
+        // that also assigns x is fine -- which is F.5.4's own s8 shape. Only a read
+        // that could still see the incoming value is refused.
+        .seq_intersect, .seq_and => {
+            const left: Ir.Node.Index = @enumFromInt(data.lhs);
+            const right: Ir.Node.Index = @enumFromInt(data.rhs);
+            if (anyCommon(flow.sampleOf(left), flow.readFirstOf(right)) or
+                anyCommon(flow.sampleOf(right), flow.readFirstOf(left)))
+            {
+                if (diagnostic) |into| into.* = .{ .node = node };
+                return error.LocalCrossRead;
+            }
+        },
+        // A universal operator with no upper bound keeps one attempt per cycle
+        // pending for ever. Counted tracking exists to collapse those into a
+        // counter per state, and two attempts in one state with different
+        // valuations have different futures, so they cannot share one.
+        .prop_always => {
+            const range = ir.propRangeOf(node);
+            if (range.hi == Ir.unbounded and hasAssignmentsBelow(ir, node)) {
+                if (diagnostic) |into| into.* = .{ .node = node };
+                return error.LocalUnboundedAttempts;
+            }
+        },
+        .prop_until, .prop_until_with, .prop_s_until, .prop_s_until_with => {
+            if (hasAssignmentsBelow(ir, node)) {
+                if (diagnostic) |into| into.* = .{ .node = node };
+                return error.LocalUnboundedAttempts;
+            }
+        },
+        else => {},
+    }
+
+    var buf: [Ir.max_operands]Ir.Node.Index = undefined;
+    for (ir.operandsOf(node, &buf)) |operand| {
+        try checkLocalHazards(ir, flow, operand, diagnostic);
+    }
+}
 // -- Tests -------------------------------------------------------------------
 //
 // The load-bearing test is differential: a direct recursive reading of the
@@ -3511,6 +4255,10 @@ fn bruteForceMatches(ir: *const Ir, node: Ir.Node.Index, trace: []const u64, sta
             if (ends == 0) return 0;
             return @as(u64, 1) << @intCast(@ctz(ends));
         },
+        // The assignments are invisible to the LANGUAGE: they change values, not
+        // which words match (LRM 16.10). This reference matcher is about the
+        // language, so it looks straight through them.
+        .seq_match => return bruteForceMatches(ir, @enumFromInt(data.lhs), trace, start),
         .seq_delay => {
             const delay = ir.delayOf(node);
             const hi = @min(delay.hi, length);
@@ -10248,4 +10996,203 @@ test "mutation sweep: every wrong spelling is reachable by a test" {
 
 test {
     testing.refAllDecls(@This());
+}
+
+test "a match item's assignments land on the exit positions of its subsequence" {
+    const gpa = testing.allocator;
+
+    // LRM 16.10's `data_check`, shortened: `a ##1 (!a, x = data) ##1 b && (data_out
+    // == x)`. The assignment is attached to the one-cycle subsequence `!a`, so it
+    // belongs to that position and to no other -- and the position that READS `x`
+    // carries no program of its own.
+    var ir: Ir = .init();
+    defer ir.deinit(gpa);
+
+    const slot = try ir.localDeclare(gpa, 0, Ir.local_no_init);
+    try testing.expectEqual(@as(u32, 0), slot);
+
+    const capture = try ir.seqMatch(gpa, try atomCycle(&ir, gpa, 1), &.{ slot, 7 });
+    const tail = try atomCycle(&ir, gpa, 2);
+    // Atom 2 is the comparison against `x`, so it reads slot 0.
+    var reads = [_]Word{1};
+    try ir.atomReads(gpa, @enumFromInt(2), &reads);
+
+    const whole = try ir.seqDelay(
+        gpa,
+        try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, 1, capture),
+        1,
+        1,
+        tail,
+    );
+    const directive = try addDirective(&ir, gpa, try ir.propSeq(gpa, .prop_seq_weak, whole), null);
+
+    var monitor = try assertion(gpa, &ir, directive, .{}, null);
+    defer monitor.deinit(gpa);
+
+    // One site, writing slot 0 with handle 7, and the monitor is threaded because
+    // it has a slot at all.
+    try testing.expectEqual(Monitor.Mode.threaded, monitor.mode);
+    try testing.expectEqual(@as(usize, 1), monitor.locals.len);
+    try testing.expectEqual(@as(usize, 1), monitor.assign_slot.len);
+    try testing.expectEqual(@as(u32, 0), monitor.assign_slot[0]);
+    try testing.expectEqual(@as(u32, 7), monitor.assign_handle[0]);
+
+    // Exactly one state carries a program, and it is not the state that reads.
+    const obligation = &monitor.obligation;
+    var carrying: u32 = 0;
+    for (0..obligation.state_count) |index| {
+        if (obligation.programOf(@intCast(index)).len != 0) carrying += 1;
+    }
+    try testing.expectEqual(@as(u32, 1), carrying);
+
+    // The slot is live where it is still going to be read, and dead after the
+    // comparison: liveness is what lets two groups holding different dead values
+    // merge again.
+    var live_anywhere = false;
+    for (0..obligation.state_count) |index| {
+        if (obligation.liveOf(@intCast(index))[0] & 1 != 0) live_anywhere = true;
+    }
+    try testing.expect(live_anywhere);
+
+    // A root that reads a slot is evaluated per group; the others are not.
+    var per_group: u32 = 0;
+    for (0..monitor.alphabet.roots.len) |index| {
+        if (Nfa.bitIsSet(monitor.root_local, @intCast(index))) per_group += 1;
+    }
+    try testing.expectEqual(@as(u32, 1), per_group);
+}
+
+test "the shapes one valuation per thread cannot represent are refused" {
+    const gpa = testing.allocator;
+
+    // Each of these is a shape where a group's single valuation would be wrong
+    // rather than merely coarse; see the design doc's hazard list.
+    const cases = [_]struct { which: []const u8, want: anyerror }{
+        .{ .which = "first_match", .want = error.LocalUnderDeterminisation },
+        .{ .which = "cross", .want = error.LocalCrossRead },
+        .{ .which = "until", .want = error.LocalUnboundedAttempts },
+    };
+
+    for (cases) |case| {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const slot = try ir.localDeclare(gpa, 0, Ir.local_no_init);
+        const capture = try ir.seqMatch(gpa, try atomCycle(&ir, gpa, 0), &.{ slot, 0 });
+
+        // The reading atom exists only in the cross-read case, and declaring a
+        // read for an atom no node mentions is a caller bug the IR asserts on.
+        const reader = if (std.mem.eql(u8, case.which, "cross")) try atomCycle(&ir, gpa, 1) else undefined;
+        if (std.mem.eql(u8, case.which, "cross")) {
+            var reads = [_]Word{1};
+            try ir.atomReads(gpa, @enumFromInt(1), &reads);
+        }
+
+        const property = if (std.mem.eql(u8, case.which, "first_match"))
+            try ir.propSeq(gpa, .prop_seq_weak, try ir.seqFirstMatch(gpa, capture))
+        else if (std.mem.eql(u8, case.which, "cross"))
+            // The right operand reads the slot the left one assigns, which F.5.5
+            // gives it no view of.
+            try ir.propSeq(gpa, .prop_seq_weak, try ir.seqIntersect(gpa, capture, reader))
+        else
+            try ir.propUntil(
+                gpa,
+                .prop_until,
+                try ir.propSeq(gpa, .prop_seq_weak, capture),
+                try ir.propSeq(gpa, .prop_seq_weak, try atomCycle(&ir, gpa, 2)),
+            );
+
+        const directive = try addDirective(&ir, gpa, property, null);
+        var diagnostic: Diagnostic = undefined;
+        try testing.expectError(case.want, assertion(gpa, &ir, directive, .{}, &diagnostic));
+    }
+}
+
+test "F.5.4's flow sets, and the product read that is legal after all" {
+    const gpa = testing.allocator;
+
+    // LRM 16.10's s8, which the standard calls LEGAL: both operands of an `and`
+    // assign x, and the right operand READS it -- but only after assigning it
+    // itself, so the read cannot see the sibling's value and one valuation per
+    // thread is enough. The conservative test this replaces refused it.
+    //
+    //   (a ##1 (b, x = 1) ##1 c) and (d ##1 (`true, x = 2) ##0 (e == x))
+    {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const x = try ir.localDeclare(gpa, 0, Ir.local_no_init);
+
+        const left = try ir.seqDelay(
+            gpa,
+            try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 0), 1, 1,
+                            try ir.seqMatch(gpa, try atomCycle(&ir, gpa, 1), &.{ x, 0 })),
+            1,
+            1,
+            try atomCycle(&ir, gpa, 2),
+        );
+        const right = try ir.seqDelay(
+            gpa,
+            try ir.seqMatch(gpa, try atomCycle(&ir, gpa, 3), &.{ x, 1 }),
+            0,
+            0,
+            try atomCycle(&ir, gpa, 4),
+        );
+        // Atom 4 is `e == x`, and its read mask can only be declared once the atom
+        // exists -- the IR asserts on a handle no node mentions.
+        var reads = [_]Word{1};
+        try ir.atomReads(gpa, @enumFromInt(4), &reads);
+
+        const property = try ir.propSeq(gpa, .prop_seq_weak, try ir.seqAnd(gpa, left, right));
+        const directive = try addDirective(&ir, gpa, property, null);
+        var monitor = try assertion(gpa, &ir, directive, .{}, null);
+        monitor.deinit(gpa);
+    }
+
+    // And the shape that really is unrepresentable: LRM 16.10's rule (a), where one
+    // operand assigns x and the SIBLING reads it with nothing of its own written
+    // first. F.5.5 gives that read the incoming context, which a shared valuation
+    // cannot show it.
+    {
+        var ir: Ir = .init();
+        defer ir.deinit(gpa);
+        const x = try ir.localDeclare(gpa, 0, Ir.local_no_init);
+        const left = try ir.seqMatch(gpa, try atomCycle(&ir, gpa, 0), &.{ x, 0 });
+        const right = try ir.seqDelay(gpa, try atomCycle(&ir, gpa, 1), 1, 1,
+                                      try atomCycle(&ir, gpa, 2));
+        var reads = [_]Word{1};
+        try ir.atomReads(gpa, @enumFromInt(2), &reads); // atom 2 is `e == x`
+        const property = try ir.propSeq(gpa, .prop_seq_weak, try ir.seqIntersect(gpa, left, right));
+        const directive = try addDirective(&ir, gpa, property, null);
+        var diagnostic: Diagnostic = undefined;
+        try testing.expectError(error.LocalCrossRead, assertion(gpa, &ir, directive, .{}, &diagnostic));
+    }
+}
+
+test "F.5.4's or rule: a slot flows out only if it flows out of both operands" {
+    const gpa = testing.allocator;
+
+    // `((a, x = 1) or (b, x = 2))` flows x out -- both operands assign it -- while
+    // `((a, x = 1) or b)` does not, because the right branch leaves it unassigned.
+    // The sets are what the state liveness and the merge are derived from, so this
+    // pins the rule rather than its consequences.
+    var ir: Ir = .init();
+    defer ir.deinit(gpa);
+    const x = try ir.localDeclare(gpa, 0, Ir.local_no_init);
+
+    const both = try ir.seqOr(
+        gpa,
+        try ir.seqMatch(gpa, try atomCycle(&ir, gpa, 0), &.{ x, 0 }),
+        try ir.seqMatch(gpa, try atomCycle(&ir, gpa, 1), &.{ x, 1 }),
+    );
+    const one = try ir.seqOr(
+        gpa,
+        try ir.seqMatch(gpa, try atomCycle(&ir, gpa, 0), &.{ x, 0 }),
+        try atomCycle(&ir, gpa, 1),
+    );
+
+    var flow = try Flow.compute(gpa, &ir);
+    defer flow.deinit(gpa);
+    try testing.expectEqual(@as(Word, 1), flow.outOf(both)[0]);
+    try testing.expectEqual(@as(Word, 0), flow.outOf(one)[0]);
+    // Either way x is SAMPLED by the disjunction: F.5.4's sample is a union.
+    try testing.expectEqual(@as(Word, 1), flow.sampleOf(one)[0]);
 }

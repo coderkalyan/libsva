@@ -225,6 +225,45 @@ typedef enum sva_status {
        attempts ended together. Both tracking modes refuse it: the obligation's
        discipline has no bearing on the antecedent. */
     SVA_ERROR_UNBOUNDED_ANTECEDENT = 11,
+    /* One operand of an intersect or an and assigns a local variable slot that
+       the sibling operand reads from the incoming context. LRM F.5.5 evaluates
+       both operands from the SAME input context, so the sibling must not see
+       that write; one valuation per thread cannot express both views at once,
+       and the two operands of a product are one thread here. The diagnostic
+       names the product. */
+    SVA_ERROR_LOCAL_CROSS_READ = 12,
+    /* A local variable assignment under an operator that determinises its
+       operand — sva_seq_first_match or sva_prop_not. A determinised state
+       stands for a SET of operand threads, and with an assignment beneath it
+       those threads hold different valuations, which is exactly what one
+       valuation per state cannot carry. Reading a local under either is fine:
+       with no assignment there, every operand thread carries the valuation
+       that flowed in. The diagnostic names the determinising operator. */
+    SVA_ERROR_LOCAL_UNDER_DETERMINISATION = 13,
+    /* A zero-delay fusion whose right-hand component reads a local variable
+       slot the left-hand component assigns in the same cycle. Fusion conjoins
+       the two guards into one cube, and this shape needs the cube split around
+       the assignment: the left half is read before it and the right half
+       after. The diagnostic names the delay. */
+    SVA_ERROR_LOCAL_FUSED_READ = 14,
+    /* Local variables under a universal operator with no upper bound — an
+       unbounded sva_prop_always range, or either operand of an sva_prop_until.
+       Those leave one attempt per cycle pending for ever, which SVA_MODE_COUNTED
+       exists to collapse into a counter per state and a valuation makes
+       uncollapsible: two attempts in one state with different valuations have
+       different futures. An unbounded *sequence* obligation is not this shape
+       and is supported. The diagnostic names the operator. */
+    SVA_ERROR_LOCAL_UNBOUNDED_ATTEMPTS = 15,
+    /* The IR declares local variable slots and this libsva does not lower them
+       yet: the projection onto states, the flow sets and the threaded group step
+       are unimplemented (../clotho-svalocal/docs/design/sva-local-variables.md
+       is the design they are being built to). Every table below would read as
+       empty, which a backend would take for "no local variables" and simulate as
+       though the assignments were not there -- a wrong answer rather than a
+       missing feature, so it is refused here instead.
+
+       TODO: LRM 16.10. Delete this status once the group discipline lands. */
+    SVA_ERROR_LOCAL_INCOMPLETE = 16,
 } sva_status;
 
 /* ------------------------------------------------------------------------- *
@@ -254,7 +293,7 @@ typedef enum sva_status {
  * archive — reported at the first call rather than executed.
  * ------------------------------------------------------------------------- */
 
-#define SVA_ABI_VERSION 4
+#define SVA_ABI_VERSION 5
 
 uint32_t sva_abi_version(void);
 
@@ -365,6 +404,12 @@ typedef enum sva_mode {
     /* One uint64_t counter per obligation state, and the obligation
        determinised. */
     SVA_MODE_COUNTED = 1,
+    /* One valuation group list per pending obligation attempt: a group is a
+       state mask plus a valuation of the monitor's local variable slots. Always
+       the mode when sva_monitor_local_count is non-zero, and never otherwise.
+       sva_monitor_depth is the attempt bound where the obligation has one and
+       zero where it does not. See the LOCAL VARIABLES section. */
+    SVA_MODE_THREADED = 2,
 } sva_mode;
 
 typedef enum sva_abort {
@@ -476,6 +521,89 @@ sva_status sva_seq_first_match(sva_ir *ir, sva_node sequence, sva_node *out);
    of the cycles in which the operand does not hold. */
 sva_status sva_seq_repeat(sva_ir *ir, sva_repeat kind, sva_node sequence,
                           uint32_t lo, uint32_t hi, sva_node *out);
+
+/* A state mask is sva_automaton_words of these, least significant bit of word
+   zero first. A slot mask is sva_ir_local_words of them, read the same way. */
+typedef uint64_t sva_word;
+
+/* A literal is a root, possibly complemented. */
+typedef uint32_t sva_literal;
+#define SVA_LITERAL_ROOT(literal)    ((literal) >> 1)
+#define SVA_LITERAL_NEGATED(literal) ((literal) & 1u)
+
+/* ------------------------------------------------------------------------- *
+ * LOCAL VARIABLES
+ *
+ * A local variable is per evaluation ATTEMPT and per THREAD within it (LRM
+ * 16.10): two threads of one attempt may hold different values for the same
+ * variable and continue separately. libsva owns where a value moves; it never
+ * owns what a value is. A SLOT is an opaque numbered box, a TYPE is a uint32_t
+ * libsva stores and never reads, and an assignment's right-hand side is an
+ * opaque HANDLE the backend evaluates.
+ *
+ * Slots are dense from zero in declaration order, which is the order the LRM
+ * gives initialization: local variable formal arguments first, then
+ * assertion_variable_declarations, each in source order. An initializer runs
+ * when an attempt is created, in slot order.
+ *
+ * A local variable makes a thread a (position, valuation) pair, and a state
+ * mask cannot tell two valuations apart, so a monitor with slots is lowered
+ * SVA_MODE_THREADED: per attempt, a list of GROUPS, each a valuation plus the
+ * mask of the states reachable with it. Every position sharing a valuation
+ * shares a mask, so the mask arithmetic of the other two modes is unchanged and
+ * a group list of one is exactly them. The step is in the RUNNING section.
+ *
+ * Reads are declared, not discovered. sva_atom_reads tells libsva which slots
+ * an atom's expression reads; libsva propagates that to roots and states, so
+ * sva_monitor_root_local says which roots a backend must evaluate once per
+ * group rather than once per cycle, and so the four SVA_ERROR_LOCAL_* shapes
+ * can be found rather than mislowered. An atom with no declared reads is
+ * assumed to read none.
+ * ------------------------------------------------------------------------- */
+
+/* A slot with no initializer: unassigned when the attempt begins. LRM 16.10 is
+   explicit that local variables have no default initial value, and a reference
+   to an unassigned one is a static error in the source language rather than
+   something with a value here. */
+#define SVA_LOCAL_NO_INIT UINT32_MAX
+
+/* Declare one local variable slot. `type` and `init` are opaque; `*out`
+   receives the slot number, dense from zero in declaration order. */
+sva_status sva_local_declare(sva_ir *ir, uint32_t type, uint32_t init,
+                             uint32_t *out);
+uint32_t sva_ir_local_count(const sva_ir *ir);
+/* Words in a slot mask: sva_ir_local_count rounded up to 64. */
+uint32_t sva_ir_local_words(const sva_ir *ir);
+
+/* The slots `atom` reads. `slots` is sva_ir_local_words words, least
+   significant bit of word zero being slot zero. Every slot named must already
+   be declared. Calling this twice for one atom replaces the mask, and not
+   calling it leaves the atom local-free. */
+sva_status sva_atom_reads(sva_ir *ir, uint32_t atom, const sva_word *slots);
+
+/* One local variable assignment: `slot = handle`, where `handle` is opaque and
+   the backend evaluates it against the arriving valuation. A compound
+   assignment (`x += e`) and an increment are this, with the read folded into
+   the handle's own expression — libsva does not model operators on values. */
+typedef struct sva_assign {
+    uint32_t slot;
+    uint32_t handle;
+} sva_assign;
+
+/* `sequence`, with `count` assignments performed in order at the end of every
+   nonempty match of it — LRM 16.10's `( sequence_expr, sequence_match_item )`.
+   They run AFTER the last cycle's own boolean holds, so an assignment and a
+   guard reading the same slot in one match item see the old value in the guard
+   and the new one after it.
+ *
+ * `sequence` must not admit an empty match, which this IR guarantees for every
+ * sequence it can build, so there is nothing to check here that 16.10's
+ * prohibition would catch.
+ *
+ * count of zero is legal and returns `sequence` unchanged, so a front-end need
+ * not special-case an empty match item list. */
+sva_status sva_seq_match(sva_ir *ir, sva_node sequence, const sva_assign *assigns,
+                         uint32_t count, sva_node *out);
 
 /* Property layer. */
 sva_status sva_prop_sequence(sva_ir *ir, sva_strength strength, sva_node sequence,
@@ -645,15 +773,6 @@ sva_status sva_ir_add(sva_ir *ir, const sva_directive *directive, uint32_t *out)
  * reachable simulation, and uint64_t is not reachable at all.
  * ------------------------------------------------------------------------- */
 
-/* A state mask is sva_automaton_words of these, least significant bit of word
-   zero first. */
-typedef uint64_t sva_word;
-
-/* A literal is a root, possibly complemented. */
-typedef uint32_t sva_literal;
-#define SVA_LITERAL_ROOT(literal)    ((literal) >> 1)
-#define SVA_LITERAL_NEGATED(literal) ((literal) & 1u)
-
 typedef struct sva_options {
     /* 0 selects the library default. */
     uint32_t state_limit;
@@ -798,12 +917,39 @@ bool sva_monitor_abort_covers_trigger(const sva_monitor *monitor, uint32_t abort
 /* sva_automaton_words(sva_monitor_obligation(monitor)) words. */
 const uint64_t *sva_monitor_abort_mask(const sva_monitor *monitor, uint32_t abort);
 
-/* The boolean nodes to evaluate once per cycle, one bit each, in this order.
-   This is the whole of what a backend has to understand; everything past it is
-   bit arithmetic over the result. Walk one with sva_bool_read — a root is any
-   boolean expression, not necessarily an atom. */
+/* The boolean nodes to evaluate, one bit each, in this order. This is the whole
+   of what a backend has to understand; everything past it is bit arithmetic over
+   the result. Walk one with sva_bool_read — a root is any boolean expression,
+   not necessarily an atom.
+
+   Once per cycle, except for the roots sva_monitor_root_local names, which read
+   a local variable and are evaluated once per valuation group. */
 uint32_t sva_monitor_root_count(const sva_monitor *monitor);
 const sva_node *sva_monitor_roots(const sva_monitor *monitor);
+/* [(root_count + 63) / 64] — the roots that read a local variable slot, and so
+   must be evaluated per group against that group's valuation rather than once
+   for the cycle. All-zero without local variables, which is what keeps a
+   local-free monitor's step exactly what it was. */
+const sva_word *sva_monitor_root_local(const sva_monitor *monitor);
+
+/* Local variable slots, in declaration order. Zero for a monitor without any,
+   which is then never SVA_MODE_THREADED. */
+uint32_t sva_monitor_local_count(const sva_monitor *monitor);
+/* Words in a slot mask. */
+uint32_t sva_monitor_local_words(const sva_monitor *monitor);
+/* The opaque type the slot was declared with. */
+uint32_t sva_monitor_local_type(const sva_monitor *monitor, uint32_t slot);
+/* The opaque handle of the slot's initializer, or SVA_LOCAL_NO_INIT. Run them in
+   slot order when an attempt is created, before the attempt's first cycle is
+   evaluated: an initializer may read a lower-numbered slot's initial value. */
+uint32_t sva_monitor_local_init(const sva_monitor *monitor, uint32_t slot);
+
+/* Assignment sites, dense from zero. A site belongs to whichever states'
+   programs name it, and its handle is evaluated against the valuation arriving
+   at that state. */
+uint32_t sva_monitor_assign_count(const sva_monitor *monitor);
+uint32_t sva_monitor_assign_slot(const sva_monitor *monitor, uint32_t site);
+uint32_t sva_monitor_assign_handle(const sva_monitor *monitor, uint32_t site);
 
 /* Interned guard cubes, shared by both automata so a term the antecedent and the
    consequent share is evaluated once. Guard 0 is the empty cube, which always
@@ -847,6 +993,21 @@ const sva_word *sva_automaton_dead(const sva_automaton *automaton);
 const sva_word *sva_automaton_guard_states(const sva_automaton *automaton,
                                            uint32_t guard);
 
+/* [count] — the assignment sites to perform, in order, on arriving in `state`,
+   and after that state's own guard has been found to hold. Writes the count and
+   returns the sites, or writes 0 and returns NULL for a state that assigns
+   nothing, which is every state of a monitor without local variables.
+
+   A state produced by a zero-delay fusion carries the concatenation of the
+   fused positions' programs, left to right. */
+const uint32_t *sva_automaton_program(const sva_automaton *automaton,
+                                      uint32_t state, uint32_t *count);
+/* [sva_monitor_local_words] — the slots whose values may still be read from
+   `state` onward: F.5.4's flow set, projected onto the automaton. A valuation is
+   restricted to this before two groups are compared, which is what lets groups
+   differing only in dead slots merge again. All-zero without local variables. */
+const sva_word *sva_automaton_live(const sva_automaton *automaton, uint32_t state);
+
 /* ------------------------------------------------------------------------- *
  * Running
  *
@@ -876,6 +1037,38 @@ const sva_word *sva_automaton_guard_states(const sva_automaton *automaton,
  * Seeding before taking verdicts is not incidental: under |-> the obligation
  * starts on the trigger's last cycle, so a one-cycle consequent has to be able
  * to discharge in the cycle it was created.
+ *
+ * SVA_MODE_THREADED changes steps 3, 6, 7 and 8 and nothing else. A pending
+ * attempt is a list of GROUPS rather than one state vector; a group is a
+ * valuation of the local variable slots plus the mask of states holding it.
+ * Per group:
+ *
+ *   3'. The roots sva_monitor_root_local names are evaluated against this
+ *       group's valuation; the rest are the cycle's, evaluated once. The
+ *       satisfied mask then folds over guards exactly as before.
+ *   6'. next = advance(group.mask) & satisfied(group), unchanged arithmetic.
+ *   6". SPLIT ON ASSIGNMENT. For each state in `next` with a non-empty
+ *       sva_automaton_program, emit a new group carrying that state alone and
+ *       the valuation the program produces, and clear that state from this
+ *       group's mask. States that assign nothing stay where they are.
+ *   6"'. RESTRICT AND MERGE. Mask each group's valuation to the union of
+ *       sva_automaton_live over its states, then merge groups with equal
+ *       valuations by OR-ing their masks. Merging is not an optimisation the
+ *       way it looks: without it an accumulating assignment under a repetition
+ *       grows a group per cycle for ever.
+ *   7'. A seeded attempt starts as one group whose valuation is the
+ *       initializers of sva_monitor_local_init, or — under an implication — the
+ *       valuation that flowed out of the antecedent match that seeded it. Two
+ *       antecedent matches ending in one cycle with DIFFERENT valuations seed
+ *       two attempts, not one attempt worth two verdicts.
+ *   8'. An attempt holds when any of its groups meets `last` and fails when
+ *       every group's mask is empty. Verdicts are per attempt, as before.
+ *
+ * A trigger with local variables carries groups too, each with the id set of
+ * step 4, so the valuation reaching an exit is the one handed to the attempt.
+ *
+ * The group count is the resource local variables consume and it is the caller's
+ * to bound: nothing here caps it.
  * ------------------------------------------------------------------------- */
 
 typedef struct sva_report {
@@ -899,6 +1092,29 @@ void sva_run_destroy(sva_run *run);
 
 /* Abandon everything in flight, as a reset does. */
 void sva_run_clear(sva_run *run);
+
+/* Values, for the reference run only.
+
+   libsva stores no value and computes on none, so a run of an SVA_MODE_THREADED
+   monitor asks for the two things it cannot know: what an assignment site
+   produces, and whether a local-reading root holds. A valuation is
+   sva_monitor_local_count uint64_t slots, in slot order, which is a stand-in for
+   whatever the backend's own values are — enough to differential-test the group
+   discipline, not a value model anyone has to adopt.
+
+   `frame` is the valuation arriving at the state, so an assignment reading its
+   own slot (`x += e`) or a lower one (`y = x && f`) reads it there. Sites of one
+   program are called in order and each sees the previous one's write.
+
+   Binding is required before stepping a threaded monitor and pointless
+   otherwise. */
+typedef struct sva_locals {
+    uint64_t (*assign)(void *user, uint32_t site, const uint64_t *frame);
+    bool (*root)(void *user, uint32_t root, const uint64_t *frame);
+    void *user;
+} sva_locals;
+
+void sva_run_bind(sva_run *run, const sva_locals *locals);
 
 /* Advance one cycle. `root_bits` holds one bit per sva_monitor_root_count, in
    order, packed into sva_words. */

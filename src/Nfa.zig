@@ -62,6 +62,39 @@ dead: []Word,
 /// `alphabet.guards.len * words` matrix; use `statesOf`. This is what lets
 /// `satisfy` fold over guards instead of gathering per state.
 guard_states: []Word,
+/// Per state, the assignment program that runs on *arriving* there — after that
+/// state's own guard has been found to hold, which is what LRM 16.10's "at the
+/// end of any nonempty match of the subsequence" means once the subsequence is
+/// a set of positions. A flat `[state_count]`, or **empty** for an automaton
+/// with no local variables: length zero rather than one empty entry per state,
+/// so every local-keyed path here is gated on one length check and a local-free
+/// lowering allocates nothing. Use `programOf`.
+program: []Program,
+/// Backing pool `program` slices into: assignment site indices, dense over the
+/// monitor's site table.
+sites: []u32,
+/// Per state, the slots whose values may still be read from that state onward —
+/// F.5.4's flow set projected onto the automaton, `local_words` words each.
+/// Restricting a valuation to this before two groups are compared is what lets
+/// groups differing only in *dead* slots merge again, which is what stops an
+/// accumulating assignment under a repetition growing a group per cycle. Empty
+/// without local variables; use `liveOf`.
+live: []Word,
+/// Words in one slot mask. Zero without local variables, which is the same gate
+/// `program` is behind.
+local_words: u32,
+
+/// One state's assignment program: `sites[start..start + len]`, performed in
+/// that order. A state produced by a zero-delay fusion carries the
+/// concatenation of the fused positions' programs, left to right.
+pub const Program = extern struct {
+    start: u32,
+    len: u32,
+
+    /// A state that assigns nothing, which is every state of a local-free
+    /// automaton.
+    pub const none: Program = .{ .start = 0, .len = 0 };
+};
 
 pub fn deinit(nfa: *Nfa, gpa: Allocator) void {
     gpa.free(nfa.guard_of);
@@ -70,6 +103,9 @@ pub fn deinit(nfa: *Nfa, gpa: Allocator) void {
     gpa.free(nfa.last);
     gpa.free(nfa.guard_states);
     gpa.free(nfa.dead);
+    gpa.free(nfa.program);
+    gpa.free(nfa.sites);
+    gpa.free(nfa.live);
 }
 
 // -- The alphabet ------------------------------------------------------------
@@ -180,6 +216,20 @@ pub fn followOf(nfa: *const Nfa, state: u32) []const Word {
 /// The states carrying `guard`.
 pub fn statesOf(nfa: *const Nfa, guard: Guard.Index) []const Word {
     return nfa.guard_states[@as(usize, @intFromEnum(guard)) * nfa.words ..][0..nfa.words];
+}
+
+/// The assignment sites to perform on arriving in `state`, in order. Empty for
+/// a state that assigns nothing.
+pub fn programOf(nfa: *const Nfa, state: u32) []const u32 {
+    if (nfa.program.len == 0) return &.{};
+    const entry = nfa.program[state];
+    return nfa.sites[entry.start..][0..entry.len];
+}
+
+/// The slots whose values may still be read from `state` onward.
+pub fn liveOf(nfa: *const Nfa, state: u32) []const Word {
+    if (nfa.local_words == 0) return &.{};
+    return nfa.live[@as(usize, state) * nfa.local_words ..][0..nfa.local_words];
 }
 
 /// The states whose guard holds this cycle, given a `roots` valuation. `out` is

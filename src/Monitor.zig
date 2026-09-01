@@ -248,6 +248,23 @@ aborts: []Abort,
 /// One obligation-state mask per entry of `aborts`, in that order and each
 /// `obligation.words` long. Read it with `maskOf`.
 abort_masks: []Word,
+/// The LRM 16.10 local variable slots, in declaration order: an opaque type and
+/// an opaque initializer handle apiece, neither of which this library reads.
+/// Empty for an assertion without any, which is what every local-keyed table
+/// below is gated on.
+locals: []const Ir.Local,
+/// Words in one slot mask: `locals.len` rounded up to 64, or zero without slots.
+local_words: u32,
+/// Per assignment SITE, dense from zero in the order the `seq_match` nodes were
+/// lowered, the slot it writes and the handle the backend evaluates for its
+/// value. A state's program (`Nfa.programOf`) is a list of indices into these.
+assign_slot: []const u32,
+assign_handle: []const u32,
+/// Which ROOTS read a local variable slot, one bit each: those are evaluated
+/// once per valuation group rather than once per cycle, and the rest stay where
+/// they were. `(alphabet.roots.len + 63) / 64` words, all zero without slots --
+/// which is what keeps a local-free monitor's step exactly what it was.
+root_local: []const Word,
 
 /// What a monitor knows about one attempt. Three values, because a monitor
 /// watches a finite prefix of a trace and a prefix does not decide every
@@ -318,6 +335,9 @@ pub const Mode = enum(u8) {
     /// One `u64` counter per obligation state, and the obligation determinised.
     /// See the file comment for the two rules this mode puts on a backend.
     counted,
+    /// Group-based stepping with local variables. One group per distinct valuation
+    /// per attempt, with state masks and local values tracked separately.
+    threaded,
 };
 
 /// An abort scoped to a subtree of the obligation: `accept_on` and friends.
@@ -424,6 +444,10 @@ pub fn deinit(monitor: *Monitor, gpa: Allocator) void {
     monitor.obligation.deinit(gpa);
     gpa.free(monitor.aborts);
     gpa.free(monitor.abort_masks);
+    gpa.free(monitor.locals);
+    gpa.free(monitor.assign_slot);
+    gpa.free(monitor.assign_handle);
+    gpa.free(monitor.root_local);
 }
 
 /// The obligation states the abort at `index` guards.
@@ -727,6 +751,9 @@ pub const State = struct {
     /// atom means — so a backend that has evaluated them itself steps from
     /// here and never touches an `Ir`.
     pub fn step(state: *State, root_bits: []const Word) Report {
+        // See the `.threaded` arm of `finish`: this run has no group discipline yet,
+        // and a monitor with local variables cannot be stepped without one.
+        std.debug.assert(state.monitor.mode != .threaded);
         const monitor = state.monitor;
 
         if (Nfa.bitIsSet(root_bits, monitor.reset)) {
@@ -1077,6 +1104,12 @@ pub const State = struct {
                     .pending => unreachable,
                 }
             },
+            // TODO: LRM 16.10 -- the valuation-group step is not implemented in this
+            // reference run yet. Silently reporting nothing would make a threaded
+            // monitor look like one whose attempts all held, so it panics: the
+            // compile path (tables, programs, liveness, hazards) is complete and is
+            // what a backend reads, and this is the only path that is not.
+            .threaded => @panic("Monitor.State: local variable stepping is not implemented (LRM 16.10)"),
         }
         state.clear();
         return report;

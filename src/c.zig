@@ -58,6 +58,11 @@ const Status = enum(c_int) {
     mode_mix = 9,
     unsupported_complement = 10,
     unbounded_antecedent = 11,
+    local_cross_read = 12,
+    local_under_determinisation = 13,
+    local_fused_read = 14,
+    local_unbounded_attempts = 15,
+    local_incomplete = 16,
 
     fn of(err: glushkov.Error) Status {
         return switch (err) {
@@ -68,10 +73,15 @@ const Status = enum(c_int) {
             error.ObligationModeMixed => .mode_mix,
             error.UnsupportedConsequent => .unsupported_consequent,
             error.UnsupportedRepeatOperand => .unsupported_repeat_operand,
+            error.AntecedentNotBounded => .unbounded_antecedent,
+            error.LocalCrossRead => .local_cross_read,
+            error.LocalUnderDeterminisation => .local_under_determinisation,
+            error.LocalFusedRead => .local_fused_read,
+            error.LocalUnboundedAttempts => .local_unbounded_attempts,
+            error.LocalIncomplete => .local_incomplete,
             error.MixedStrength => .mixed_strength,
             error.UnsupportedAbortScope => .unsupported_abort_scope,
             error.UnsupportedComplement => .unsupported_complement,
-            error.AntecedentNotBounded => .unbounded_antecedent,
         };
     }
 };
@@ -89,7 +99,7 @@ fn deliver(out: *u32, result: Allocator.Error!Ir.Node.Index) Status {
 /// can read a C macro, so `test/smoke.c` is what holds the two in step — it
 /// compiles against the header, links this archive, and asserts they agree.
 export fn sva_abi_version() u32 {
-    return 4;
+    return 5;
 }
 
 // -- The IR ------------------------------------------------------------------
@@ -118,6 +128,59 @@ export fn sva_ir_node_count(ir: *const Ir) u32 {
 /// valuation a backend allocates.
 export fn sva_ir_atom_count(ir: *const Ir) u32 {
     return ir.atom_count;
+}
+
+// -- Local variables ---------------------------------------------------------
+
+export fn sva_local_declare(ir: *Ir, type_: u32, init: u32, out: *u32) Status {
+    const slot = Ir.localDeclare(ir, gpa, type_, init) catch return .out_of_memory;
+    out.* = slot;
+    return .ok;
+}
+
+export fn sva_ir_local_count(ir: *const Ir) u32 {
+    return Ir.localCount(ir);
+}
+
+export fn sva_ir_local_words(ir: *const Ir) u32 {
+    return Ir.localWords(ir);
+}
+
+export fn sva_atom_reads(ir: *Ir, atom: u32, slots: [*]const u64) Status {
+    const lw = Ir.localWords(ir);
+    if (lw == 0) return .ok; // no locals declared, no reads to record
+    Ir.atomReads(ir, gpa, @enumFromInt(atom), slots[0..lw]) catch return .out_of_memory;
+    return .ok;
+}
+/// One assignment of a match item list, laid out as the header's `sva_assign`.
+const Assign = extern struct {
+    slot: u32,
+    handle: u32,
+};
+
+export fn sva_seq_match(
+    ir: *Ir,
+    sequence: u32,
+    assigns: ?[*]const Assign,
+    count: u32,
+    out: *u32,
+) Status {
+    // An empty list is the sequence itself, so a front-end need not special-case a
+    // match item list it built and found empty.
+    if (count == 0) {
+        out.* = sequence;
+        return .ok;
+    }
+    const items = assigns.?[0..count];
+
+    // `Ir.seqMatch` takes the pairs flat, which is how they are encoded in `extra`.
+    const raw = gpa.alloc(u32, @as(usize, count) * 2) catch return .out_of_memory;
+    defer gpa.free(raw);
+    for (items, 0..) |item, index| {
+        raw[index * 2] = item.slot;
+        raw[index * 2 + 1] = item.handle;
+    }
+    return deliver(out, ir.seqMatch(gpa, @enumFromInt(sequence), raw));
 }
 
 // -- Boolean layer -----------------------------------------------------------
@@ -462,7 +525,7 @@ export fn sva_monitor_clock(monitor: *const Monitor) u32 {
     return @intFromEnum(monitor.clock);
 }
 
-const Mode = enum(c_int) { ring, counted };
+const Mode = enum(c_int) { ring, counted, threaded };
 
 /// How the monitor's pending obligation attempts are held, which decides which
 /// step a backend emits. See the header for the two rules `SVA_MODE_COUNTED`
@@ -806,6 +869,93 @@ fn rootOfAtom(ir: *const Ir, monitor: *const Monitor, atom: u32) ?u32 {
         if (view.op == .atom and view.lhs == atom) return @intCast(index);
     }
     return null;
+}
+/// Callbacks for evaluating local variable reads and performing assignments.
+pub const sva_locals = extern struct {
+    /// (user, site_index, frame_ptr) -> assigned_value
+    assign: ?*const fn (?*anyopaque, u32, [*]const u64) callconv(.C) u64,
+    /// (user, root_index, frame_ptr) -> root_value
+    root: ?*const fn (?*anyopaque, u32, [*]const u64) callconv(.C) bool,
+    /// User-provided context passed to callbacks
+    user: ?*anyopaque,
+};
+
+/// The LRM 16.10 local variable slots, in declaration order. Zero for a monitor
+/// without any, which is then never SVA_MODE_THREADED.
+export fn sva_monitor_local_count(monitor: *const Monitor) u32 {
+    return @intCast(monitor.locals.len);
+}
+
+export fn sva_monitor_local_words(monitor: *const Monitor) u32 {
+    return monitor.local_words;
+}
+
+/// The opaque type the slot was declared with; libsva never reads it.
+export fn sva_monitor_local_type(monitor: *const Monitor, slot: u32) u32 {
+    std.debug.assert(slot < monitor.locals.len);
+    return monitor.locals[slot].type;
+}
+
+/// The slot's initializer handle, or SVA_LOCAL_NO_INIT.
+export fn sva_monitor_local_init(monitor: *const Monitor, slot: u32) u32 {
+    std.debug.assert(slot < monitor.locals.len);
+    return monitor.locals[slot].init;
+}
+
+/// Assignment sites, dense from zero. A state's program names these.
+export fn sva_monitor_assign_count(monitor: *const Monitor) u32 {
+    return @intCast(monitor.assign_slot.len);
+}
+
+export fn sva_monitor_assign_slot(monitor: *const Monitor, site: u32) u32 {
+    std.debug.assert(site < monitor.assign_slot.len);
+    return monitor.assign_slot[site];
+}
+
+export fn sva_monitor_assign_handle(monitor: *const Monitor, site: u32) u32 {
+    std.debug.assert(site < monitor.assign_handle.len);
+    return monitor.assign_handle[site];
+}
+
+/// Which roots read a local variable slot, one bit each, and so are evaluated per
+/// valuation group rather than once per cycle. All-zero without slots.
+export fn sva_monitor_root_local(monitor: *const Monitor) [*]const Word {
+    return monitor.root_local.ptr;
+}
+
+/// The assignment sites to perform on arriving in `state`, in order. Writes the
+/// count; returns null for a state that assigns nothing, which is every state of a
+/// monitor without local variables.
+export fn sva_automaton_program(automaton: *const Nfa, state: u32, count: *u32) ?[*]const u32 {
+    const program = Nfa.programOf(automaton, state);
+    count.* = @intCast(program.len);
+    if (program.len == 0) return null;
+    return program.ptr;
+}
+
+/// The slots whose values may still be read from `state` onward: F.5.4's flow set
+/// projected onto the automaton, `sva_monitor_local_words` words.
+export fn sva_automaton_live(automaton: *const Nfa, state: u32) [*]const Word {
+    const live = Nfa.liveOf(automaton, state);
+    if (live.len == 0) return @ptrCast(&empty_word);
+    return live.ptr;
+}
+
+/// A zero word `sva_automaton_live` and friends can hand back for an automaton
+/// with no slot masks, so a caller never sees a null it would have to branch on.
+const empty_word: Word = 0;
+
+/// Bind a run to local variable callbacks for threaded stepping.
+/// Called before stepping a monitor with locals (SVA_MODE_THREADED).
+export fn sva_run_bind(run: *Monitor.State, locals: *const sva_locals) void {
+    // TODO: LRM 16.10 -- the threaded group step is not implemented, so there is
+    // nothing to bind values to yet. A no-op would let a caller believe its
+    // callbacks were installed and then step a monitor that silently never calls
+    // them; sva_lower refuses an IR with slots for the same reason, so reaching
+    // here at all means a monitor was built by some other route.
+    _ = run;
+    _ = locals;
+    @panic("sva_run_bind: local variable stepping is not implemented (LRM 16.10)");
 }
 
 test "the C API builds, lowers and runs an implication" {
