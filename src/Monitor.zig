@@ -481,8 +481,48 @@ pub const Report = struct {
 /// A reference run of the protocol in the file comment. This is the executable
 /// form of the contract a backend has to reproduce, not something a backend
 /// would call.
+/// Whether the ANTECEDENT assigns a local variable, which is what decides whether
+/// the trigger needs valuations of its own. Reading one there needs nothing extra:
+/// the values it reads are the attempt's.
+fn triggerAssigns(monitor: *const Monitor) bool {
+    const trigger = &(monitor.trigger orelse return false);
+    if (trigger.program.len == 0) return false;
+    for (0..trigger.state_count) |position| {
+        if (trigger.programOf(@intCast(position)).len != 0) return true;
+    }
+    return false;
+}
+
+/// One LRM 16.10 valuation group: the states reachable with one valuation of the
+/// local variable slots, and that valuation.
+pub const Group = struct {
+    /// Slot in `State.pending` this group's attempt occupies.
+    owner: u32,
+    /// `obligation.words` (or `trigger.words`) of state mask, owned.
+    mask: []Word,
+    /// `local_count` values, owned.
+    values: []u64,
+
+    fn deinit(group: *Group, gpa: Allocator) void {
+        gpa.free(group.mask);
+        gpa.free(group.values);
+    }
+};
+
+/// The two questions libsva cannot answer about a value, as the header's
+/// `sva_locals` asks them.
+pub const Locals = struct {
+    assign: *const fn (?*anyopaque, u32, [*]const u64) callconv(.c) u64,
+    root: *const fn (?*anyopaque, u32, [*]const u64) callconv(.c) bool,
+    user: ?*anyopaque,
+};
+
 pub const State = struct {
     monitor: *const Monitor,
+    /// The allocator the LRM 16.10 group pools grow with. Held rather than passed
+    /// because a group is created and dropped inside `step`, which the C ABI calls
+    /// with no allocator in sight.
+    gpa: Allocator,
     /// A bit per entry of `alphabet.roots`.
     root_bits: []Word,
     /// Trigger and obligation states whose guard holds this cycle.
@@ -515,6 +555,29 @@ pub const State = struct {
     /// it reports three verdicts, because three antecedent matches ended in the
     /// cycle that seeded it and each owes one.
     attempts: []u64,
+    /// The LRM 16.10 valuation groups, and the values a threaded run computes on.
+    /// All empty for a monitor without local variable slots.
+    ///
+    /// A group is a valuation plus the mask of states holding it, and belongs to
+    /// one pending attempt: `group_owner[i]` is its slot in `pending`. The frames
+    /// are `local_count` u64s apiece, which is a stand-in for whatever a backend's
+    /// values really are -- enough to check the discipline, not a value model
+    /// anyone has to adopt (see `sva_locals` in the header).
+    groups: std.ArrayListUnmanaged(Group),
+    /// The trigger's own groups, when the ANTECEDENT assigns: the values live there
+    /// while the antecedent matches, and the group whose match ends hands them to
+    /// the attempt it seeds. Empty otherwise, including when the antecedent only
+    /// reads a slot.
+    trigger_groups: std.ArrayListUnmanaged(Group),
+    /// The valuation that flowed out of the antecedent match, held for the cycle
+    /// `|=>` seeds in.
+    fired_values: []u64,
+    /// What the caller supplies: the value of an assignment site, and whether a
+    /// local-reading root holds, both against a given frame. Null until
+    /// `sva_run_bind`, and stepping a threaded monitor without them is a caller
+    /// bug.
+    locals: ?Locals,
+
     /// How many antecedent matches ended in the previous cycle, for `|=>`.
     fired: u64,
     /// `aborts.len * depth` flags: whether an abort's subtree could hold a
@@ -573,8 +636,21 @@ pub const State = struct {
         errdefer gpa.free(counts);
         const next_counts = try gpa.alloc(u64, slots);
 
+        // The valuation frames a threaded run carries. `fired_values` is one frame
+        // wide: at most one antecedent match ends per cycle in every shape that
+        // reaches here, which is what refusing a non-zero attempt window with local
+        // variables guarantees.
+        const fired_values = try gpa.alloc(u64, monitor.locals.len);
+        errdefer gpa.free(fired_values);
+        @memset(fired_values, 0);
+
         var state: State = .{
             .monitor = monitor,
+            .gpa = gpa,
+            .groups = .empty,
+            .trigger_groups = .empty,
+            .fired_values = fired_values,
+            .locals = null,
             .root_bits = root_bits,
             .trigger_satisfied = trigger_satisfied,
             .obligation_satisfied = obligation_satisfied,
@@ -596,6 +672,15 @@ pub const State = struct {
         return state;
     }
 
+    /// Every group of both pools, freed. `clear` and a reset use it; the lists keep
+    /// their capacity, since a reset is followed by more attempts.
+    fn dropGroups(state: *State) void {
+        for (state.groups.items) |*group| group.deinit(state.gpa);
+        state.groups.clearRetainingCapacity();
+        for (state.trigger_groups.items) |*group| group.deinit(state.gpa);
+        state.trigger_groups.clearRetainingCapacity();
+    }
+
     pub fn deinit(state: *State, gpa: Allocator) void {
         gpa.free(state.root_bits);
         gpa.free(state.trigger_satisfied);
@@ -611,10 +696,18 @@ pub const State = struct {
         gpa.free(state.scratch);
         gpa.free(state.counts);
         gpa.free(state.next_counts);
+        gpa.free(state.fired_values);
+        for (state.groups.items) |*group| group.deinit(gpa);
+        state.groups.deinit(gpa);
+        for (state.trigger_groups.items) |*group| group.deinit(gpa);
+        state.trigger_groups.deinit(gpa);
     }
 
     /// Abandon everything in flight.
     pub fn clear(state: *State) void {
+        // A reset abandons every attempt, and a group belongs to one, so the pools go
+        // with them. The allocator is the list's own; only the frames are freed here.
+        state.dropGroups();
         @memset(state.trigger_current, 0);
         @memset(state.pending, 0);
         @memset(state.attempts, 0);
@@ -750,10 +843,328 @@ pub const State = struct {
     /// half of the contract — it is the only part that needs to know what an
     /// atom means — so a backend that has evaluated them itself steps from
     /// here and never touches an `Ir`.
+    // -- The threaded discipline (LRM 16.10) ---------------------------------
+    //
+    // The header's RUNNING section is the specification; this is it executed. A
+    // pending attempt is a list of GROUPS -- a valuation plus the mask of states
+    // holding it -- and the mask arithmetic inside a group is the ring's, so what
+    // the groups replace is the per-attempt advance and nothing else.
+
+    /// The roots as this group sees them: the ones that read a slot are asked of the
+    /// caller against this group's values, the rest are the cycle's.
+    fn groupRoots(state: *State, group: *const Group, into: []Word) void {
+        const monitor = state.monitor;
+        @memcpy(into, state.root_bits);
+        const locals = state.locals.?;
+        for (0..monitor.alphabet.roots.len) |index| {
+            if (!Nfa.bitIsSet(monitor.root_local, @intCast(index))) continue;
+            const holds = locals.root(locals.user, @intCast(index), group.values.ptr);
+            if (holds) Nfa.bitSet(into, @intCast(index)) else Nfa.bitClear(into, @intCast(index));
+        }
+    }
+
+    /// A new group, owned by `owner`, holding `mask` and a copy of `values`.
+    fn addGroup(
+        state: *State,
+        list: *std.ArrayListUnmanaged(Group),
+        owner: u32,
+        words: u32,
+        mask: []const Word,
+        values: []const u64,
+    ) Allocator.Error!void {
+        const own_mask = try state.gpa.dupe(Word, mask[0..words]);
+        errdefer state.gpa.free(own_mask);
+        const own_values = try state.gpa.dupe(u64, values);
+        try list.append(state.gpa, .{ .owner = owner, .mask = own_mask, .values = own_values });
+    }
+
+    /// Run one state's assignment program over `values`, in order. LRM 16.10
+    /// performs the items in the order they appear, each against the values as they
+    /// stand, so a compound assignment reads the slot it writes.
+    fn runProgram(state: *State, nfa: *const Nfa, position: u32, values: []u64) void {
+        const monitor = state.monitor;
+        const locals = state.locals.?;
+        for (nfa.programOf(position)) |site| {
+            values[monitor.assign_slot[site]] = locals.assign(locals.user, site, values.ptr);
+        }
+    }
+
+    /// Split `mask` on assignment: every state with a program leaves the group it
+    /// arrived in and becomes one of its own, carrying what its program produced.
+    /// The states that assign nothing stay behind, which is what `mask` is left as.
+    fn splitOnAssignment(
+        state: *State,
+        list: *std.ArrayListUnmanaged(Group),
+        nfa: *const Nfa,
+        owner: u32,
+        mask: []Word,
+        values: []const u64,
+    ) Allocator.Error!void {
+        var bits: Nfa.BitIterator = .init(mask);
+        var positions: [64]u32 = undefined;
+        var count: usize = 0;
+        while (bits.next()) |position| {
+            if (nfa.programOf(position).len == 0) continue;
+            if (count == positions.len) break;
+            positions[count] = position;
+            count += 1;
+        }
+        for (positions[0..count]) |position| {
+            const scratch = try state.gpa.alloc(Word, nfa.words);
+            defer state.gpa.free(scratch);
+            @memset(scratch, 0);
+            Nfa.bitSet(scratch, position);
+
+            const own = try state.gpa.dupe(u64, values);
+            defer state.gpa.free(own);
+            state.runProgram(nfa, position, own);
+            try state.addGroup(list, owner, nfa.words, scratch, own);
+            Nfa.bitClear(mask, position);
+        }
+    }
+
+    /// Drop the groups that died, and merge the ones that agree.
+    ///
+    /// Two groups of one attempt with equal values have the same future, so their
+    /// masks join. That is not an optimisation: without it an `or` whose branches
+    /// both match under a repetition adds a group per cycle for ever. Groups of
+    /// different attempts never merge, however equal their values -- their verdicts
+    /// are owed separately.
+    fn compactGroups(state: *State, list: *std.ArrayListUnmanaged(Group), owned: bool) void {
+        var index: usize = 0;
+        while (index < list.items.len) {
+            const group = &list.items[index];
+            if (Nfa.bitAny(group.mask)) {
+                var probe: usize = 0;
+                var merged = false;
+                while (probe < index) : (probe += 1) {
+                    const other = &list.items[probe];
+                    if (owned and other.owner != group.owner) continue;
+                    if (!std.mem.eql(u64, other.values, group.values)) continue;
+                    for (other.mask, group.mask) |*into, bit| into.* |= bit;
+                    merged = true;
+                    break;
+                }
+                if (!merged) {
+                    index += 1;
+                    continue;
+                }
+            }
+            var dead = list.swapRemove(index);
+            dead.deinit(state.gpa);
+        }
+    }
+
+    /// One cycle of the threaded discipline. The header's RUNNING section documents
+    /// the order and the reasons; the deviations from the ring are steps 3, 6, 7 and
+    /// 8, which is exactly what the groups replace.
+    fn stepThreaded(state: *State, root_bits: []const Word) Allocator.Error!Report {
+        const monitor = state.monitor;
+        @memcpy(state.root_bits, root_bits);
+
+        if (Nfa.bitIsSet(root_bits, monitor.reset)) {
+            state.clear();
+            return .{ .reset = true };
+        }
+        // An unbounded obligation has no ring for its attempts to live in, which is
+        // the one shape a backend refuses rather than tracks; a run of it would need
+        // dynamic attempts too.
+        std.debug.assert(monitor.depth > 0);
+
+        const obligation = &monitor.obligation;
+        var report: Report = .{};
+
+        // The antecedent, when it assigns: its own groups carry the values, and the
+        // group whose match ends hands them to the attempt it seeds (LRM 16.10,
+        // F.5.5). Otherwise the plain existential vector is all it needs.
+        var fires: u64 = 0;
+        if (monitor.trigger) |*trigger| {
+            if (state.trigger_groups.items.len != 0 or triggerAssigns(monitor)) {
+                fires = try state.stepTriggerGroups(trigger);
+            } else {
+                trigger.satisfy(&monitor.alphabet, root_bits, state.trigger_satisfied);
+                const next = state.scratch[0..trigger.words];
+                trigger.advance(state.trigger_current, state.trigger_satisfied, next);
+                @memcpy(state.trigger_current, next);
+                trigger.seed(state.trigger_satisfied, state.trigger_current);
+                fires = if (trigger.matched(state.trigger_current)) 1 else 0;
+            }
+        }
+
+        // Advance every group: its own roots, its own satisfied mask, the same
+        // constant follow rows the ring walks, then the split on assignment.
+        const roots = try state.gpa.alloc(Word, monitor.alphabet.words());
+        defer state.gpa.free(roots);
+        const next = try state.gpa.alloc(Word, obligation.words);
+        defer state.gpa.free(next);
+        const satisfied = try state.gpa.alloc(Word, obligation.words);
+        defer state.gpa.free(satisfied);
+
+        const live = state.groups.items.len;
+        for (0..live) |index| {
+            const group = &state.groups.items[index];
+            state.groupRoots(group, roots);
+            obligation.satisfy(&monitor.alphabet, roots, satisfied);
+            obligation.advance(group.mask, satisfied, next);
+            @memcpy(group.mask, next);
+            // The values are copied out first: the split may reallocate the list and
+            // move the group this pointer names.
+            const values = try state.gpa.dupe(u64, group.values);
+            defer state.gpa.free(values);
+            const owner = group.owner;
+            const mask = try state.gpa.dupe(Word, group.mask);
+            defer state.gpa.free(mask);
+            try state.splitOnAssignment(&state.groups, obligation, owner, mask, values);
+            @memcpy(state.groups.items[index].mask, mask);
+        }
+
+        // Seed. `|->` seeds in the cycle the antecedent match ends, `|=>` the cycle
+        // after, and a bare sequence every cycle.
+        const seeding: u64 = if (monitor.trigger == null)
+            1
+        else if (monitor.overlap)
+            fires
+        else
+            state.fired;
+        if (monitor.trigger != null) state.fired = fires;
+
+        if (seeding != 0) {
+            const slot = state.freeSlot() orelse @panic("no free attempt slot for a threaded seed");
+            state.attempts[slot] = seeding;
+            const values = try state.gpa.alloc(u64, monitor.locals.len);
+            defer state.gpa.free(values);
+            if (state.trigger_groups.items.len != 0 or triggerAssigns(monitor)) {
+                @memcpy(values, state.fired_values);
+            } else {
+                for (monitor.locals, 0..) |local, slot_index| {
+                    values[slot_index] = if (local.init == Ir.local_no_init)
+                        0
+                    else
+                        state.locals.?.assign(state.locals.?.user, local.init, values.ptr);
+                }
+            }
+            @memset(satisfied, 0);
+            state.groupRootsFor(values, roots);
+            obligation.satisfy(&monitor.alphabet, roots, satisfied);
+            @memset(next, 0);
+            obligation.seed(satisfied, next);
+            try state.addGroup(&state.groups, @intCast(slot), obligation.words, next, values);
+            const seeded = state.groups.items.len - 1;
+            const mask = try state.gpa.dupe(Word, state.groups.items[seeded].mask);
+            defer state.gpa.free(mask);
+            try state.splitOnAssignment(&state.groups, obligation, @intCast(slot), mask, values);
+            @memcpy(state.groups.items[seeded].mask, mask);
+        }
+
+        // Verdicts, per attempt: the union of its groups' masks is its state vector,
+        // and the lattice is the ring's.
+        for (0..monitor.depth) |slot| {
+            if (state.attempts[slot] == 0) continue;
+            const vector = state.pending[slot * obligation.words ..][0..obligation.words];
+            @memset(vector, 0);
+            for (state.groups.items) |group| {
+                if (group.owner == slot) Nfa.bitUnion(vector, group.mask);
+            }
+            const held = state.attempts[slot];
+            if (obligation.matched(vector)) {
+                report.matches += held;
+                state.attempts[slot] = 0;
+            } else if (!Nfa.bitAny(vector)) {
+                report.failures += held;
+                state.attempts[slot] = 0;
+            }
+        }
+
+        // A resolved attempt's groups go with it, then what is left is compacted and
+        // merged.
+        for (state.groups.items) |*group| {
+            if (state.attempts[group.owner] == 0) @memset(group.mask, 0);
+        }
+        state.compactGroups(&state.groups, true);
+        return report;
+    }
+
+    /// The roots as a valuation sees them, for a frame that is not a group's yet.
+    fn groupRootsFor(state: *State, values: []const u64, into: []Word) void {
+        const monitor = state.monitor;
+        @memcpy(into, state.root_bits);
+        const locals = state.locals.?;
+        for (0..monitor.alphabet.roots.len) |index| {
+            if (!Nfa.bitIsSet(monitor.root_local, @intCast(index))) continue;
+            const holds = locals.root(locals.user, @intCast(index), values.ptr);
+            if (holds) Nfa.bitSet(into, @intCast(index)) else Nfa.bitClear(into, @intCast(index));
+        }
+    }
+
+    /// The trigger's own groups: advance, seed one per cycle, and report whether a
+    /// match ended -- latching its values for the attempt that match seeds.
+    fn stepTriggerGroups(state: *State, trigger: *const Nfa) Allocator.Error!u64 {
+        const monitor = state.monitor;
+        const roots = try state.gpa.alloc(Word, monitor.alphabet.words());
+        defer state.gpa.free(roots);
+        const satisfied = try state.gpa.alloc(Word, trigger.words);
+        defer state.gpa.free(satisfied);
+        const next = try state.gpa.alloc(Word, trigger.words);
+        defer state.gpa.free(next);
+
+        const live = state.trigger_groups.items.len;
+        for (0..live) |index| {
+            const group = &state.trigger_groups.items[index];
+            state.groupRoots(group, roots);
+            trigger.satisfy(&monitor.alphabet, roots, satisfied);
+            trigger.advance(group.mask, satisfied, next);
+            @memcpy(group.mask, next);
+            const values = try state.gpa.dupe(u64, group.values);
+            defer state.gpa.free(values);
+            const mask = try state.gpa.dupe(Word, group.mask);
+            defer state.gpa.free(mask);
+            try state.splitOnAssignment(&state.trigger_groups, trigger, 0, mask, values);
+            @memcpy(state.trigger_groups.items[index].mask, mask);
+        }
+
+        // An attempt of the assertion starts every cycle, and 16.10 creates the local
+        // variables when the attempt does -- so the antecedent's own thread runs the
+        // declaration initializers.
+        {
+            const values = try state.gpa.alloc(u64, monitor.locals.len);
+            defer state.gpa.free(values);
+            for (monitor.locals, 0..) |local, slot_index| {
+                values[slot_index] = if (local.init == Ir.local_no_init)
+                    0
+                else
+                    state.locals.?.assign(state.locals.?.user, local.init, values.ptr);
+            }
+            state.groupRootsFor(values, roots);
+            trigger.satisfy(&monitor.alphabet, roots, satisfied);
+            @memset(next, 0);
+            trigger.seed(satisfied, next);
+            try state.addGroup(&state.trigger_groups, 0, trigger.words, next, values);
+            const seeded = state.trigger_groups.items.len - 1;
+            const mask = try state.gpa.dupe(Word, state.trigger_groups.items[seeded].mask);
+            defer state.gpa.free(mask);
+            try state.splitOnAssignment(&state.trigger_groups, trigger, 0, mask, values);
+            @memcpy(state.trigger_groups.items[seeded].mask, mask);
+        }
+
+        // Whose match ends now, and with what values. At most one: an antecedent that
+        // can match twice in one attempt is refused alongside local variables.
+        var fires: u64 = 0;
+        for (state.trigger_groups.items) |group| {
+            if (!trigger.matched(group.mask)) continue;
+            @memcpy(state.fired_values, group.values);
+            fires = 1;
+        }
+        state.compactGroups(&state.trigger_groups, false);
+        return fires;
+    }
+
     pub fn step(state: *State, root_bits: []const Word) Report {
-        // See the `.threaded` arm of `finish`: this run has no group discipline yet,
-        // and a monitor with local variables cannot be stepped without one.
-        std.debug.assert(state.monitor.mode != .threaded);
+        if (state.monitor.mode == .threaded) {
+            // Stepping a monitor with local variable slots needs the two questions
+            // libsva cannot answer about a value; see `sva_run_bind`.
+            std.debug.assert(state.locals != null);
+            return state.stepThreaded(root_bits) catch @panic("out of memory stepping a threaded monitor");
+        }
         const monitor = state.monitor;
 
         if (Nfa.bitIsSet(root_bits, monitor.reset)) {
@@ -1104,12 +1515,21 @@ pub const State = struct {
                     .pending => unreachable,
                 }
             },
-            // TODO: LRM 16.10 -- the valuation-group step is not implemented in this
-            // reference run yet. Silently reporting nothing would make a threaded
-            // monitor look like one whose attempts all held, so it panics: the
-            // compile path (tables, programs, liveness, hazards) is complete and is
-            // what a backend reads, and this is the only path that is not.
-            .threaded => @panic("Monitor.State: local variable stepping is not implemented (LRM 16.10)"),
+            // Every group of a still-pending attempt counts once for its attempt,
+            // whatever valuation it holds: the verdict is the attempt's, and a
+            // trace that has ended decides it (LRM 16.10 changes which values an
+            // attempt was reasoning about, not how many verdicts it owes).
+            .threaded => {
+                for (0..state.monitor.depth) |slot| {
+                    const count = state.attempts[slot];
+                    if (count == 0) continue;
+                    switch (at_end) {
+                        .fails => report.failures += count,
+                        .holds => {},
+                        .pending => unreachable,
+                    }
+                }
+            },
         }
         state.clear();
         return report;

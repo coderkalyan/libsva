@@ -322,6 +322,12 @@ pub fn wordsFor(bits: u32) u32 {
     return (bits + word_bits - 1) / word_bits;
 }
 
+/// Clear one bit of a mask. The complement of `bitSet`, and needed by the LRM
+/// 16.10 split: a state that assigns leaves the group it arrived in.
+pub fn bitClear(bits: []Word, index: u32) void {
+    bits[index / word_bits] &= ~(@as(Word, 1) << @intCast(index % word_bits));
+}
+
 pub fn bitSet(bits: []Word, index: u32) void {
     bits[index / word_bits] |= @as(Word, 1) << @intCast(index % word_bits);
 }

@@ -873,9 +873,9 @@ fn rootOfAtom(ir: *const Ir, monitor: *const Monitor, atom: u32) ?u32 {
 /// Callbacks for evaluating local variable reads and performing assignments.
 pub const sva_locals = extern struct {
     /// (user, site_index, frame_ptr) -> assigned_value
-    assign: ?*const fn (?*anyopaque, u32, [*]const u64) callconv(.C) u64,
+    assign: ?*const fn (?*anyopaque, u32, [*]const u64) callconv(.c) u64,
     /// (user, root_index, frame_ptr) -> root_value
-    root: ?*const fn (?*anyopaque, u32, [*]const u64) callconv(.C) bool,
+    root: ?*const fn (?*anyopaque, u32, [*]const u64) callconv(.c) bool,
     /// User-provided context passed to callbacks
     user: ?*anyopaque,
 };
@@ -948,14 +948,13 @@ const empty_word: Word = 0;
 /// Bind a run to local variable callbacks for threaded stepping.
 /// Called before stepping a monitor with locals (SVA_MODE_THREADED).
 export fn sva_run_bind(run: *Monitor.State, locals: *const sva_locals) void {
-    // TODO: LRM 16.10 -- the threaded group step is not implemented, so there is
-    // nothing to bind values to yet. A no-op would let a caller believe its
-    // callbacks were installed and then step a monitor that silently never calls
-    // them; sva_lower refuses an IR with slots for the same reason, so reaching
-    // here at all means a monitor was built by some other route.
-    _ = run;
-    _ = locals;
-    @panic("sva_run_bind: local variable stepping is not implemented (LRM 16.10)");
+    // The two questions libsva cannot answer about a value. Required before a
+    // threaded monitor is stepped and pointless otherwise; the header says so.
+    run.locals = .{
+        .assign = locals.assign.?,
+        .root = locals.root.?,
+        .user = locals.user,
+    };
 }
 
 test "the C API builds, lowers and runs an implication" {

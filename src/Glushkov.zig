@@ -11196,3 +11196,101 @@ test "F.5.4's or rule: a slot flows out only if it flows out of both operands" {
     // Either way x is SAMPLED by the disjunction: F.5.4's sample is a union.
     try testing.expectEqual(@as(Word, 1), flow.sampleOf(one)[0]);
 }
+
+/// Which root of a monitor's alphabet is the bare atom `handle`, for a test that
+/// has to set one bit of a valuation by hand.
+fn rootOfAtom(ir: *const Ir, monitor: *const Monitor, handle: u32) ?u32 {
+    for (monitor.alphabet.roots, 0..) |root, index| {
+        if (ir.tagOf(root) != .atom) continue;
+        if (ir.dataOf(root).lhs == handle) return @intCast(index);
+    }
+    return null;
+}
+
+test "the reference run carries a valuation through an attempt" {
+    const gpa = testing.allocator;
+
+    // `(a, x = d) ##1 (o == x)`: the value captured when `a` holds is compared one
+    // cycle later. The trace makes the comparison true for the attempt that
+    // captured 5 and false for the one that captured 9, so a run has to tell the
+    // two attempts apart by their values and not merely by their cycles -- which is
+    // the whole of LRM 16.10 in four cycles.
+    var ir: Ir = .init();
+    defer ir.deinit(gpa);
+
+    const x = try ir.localDeclare(gpa, 0, Ir.local_no_init);
+    const capture = try ir.seqMatch(gpa, try ir.seqBoolean(gpa, try ir.atom(gpa, @enumFromInt(0))), &.{ x, 0 });
+    const compare = try ir.seqBoolean(gpa, try ir.atom(gpa, @enumFromInt(1)));
+    var reads = [_]Word{1};
+    try ir.atomReads(gpa, @enumFromInt(1), &reads);
+
+    const whole = try ir.seqDelay(gpa, capture, 1, 1, compare);
+    const directive = try ir.addAssertion(gpa, .{
+        .id = @enumFromInt(0),
+        .kind = .assert,
+        .clock = .none,
+        .reset = try ir.boolConst(gpa, false),
+        .prop = try ir.propSeq(gpa, .prop_seq_weak, whole),
+    });
+
+    var monitor = try assertion(gpa, &ir, directive, .{}, null);
+    defer monitor.deinit(gpa);
+    try testing.expectEqual(Monitor.Mode.threaded, monitor.mode);
+
+    // The harness: assignment site 0 stores whatever `d` holds this cycle, and the
+    // comparison root holds when the frame's slot equals `o`. Both are the
+    // front-end's business in a real backend; here they are two closures over the
+    // trace.
+    const Harness = struct {
+        d: u64 = 0,
+        o: u64 = 0,
+
+        fn assign(user: ?*anyopaque, site: u32, frame: [*]const u64) callconv(.c) u64 {
+            _ = site;
+            _ = frame;
+            const self: *@This() = @ptrCast(@alignCast(user.?));
+            return self.d;
+        }
+        fn root(user: ?*anyopaque, index: u32, frame: [*]const u64) callconv(.c) bool {
+            _ = index;
+            const self: *@This() = @ptrCast(@alignCast(user.?));
+            return frame[0] == self.o;
+        }
+    };
+    var harness: Harness = .{};
+
+    var run = try Monitor.State.init(gpa, &monitor);
+    defer run.deinit(gpa);
+    run.locals = .{ .assign = &Harness.assign, .root = &Harness.root, .user = &harness };
+
+    const words = monitor.alphabet.words();
+    const bits = try gpa.alloc(Word, words);
+    defer gpa.free(bits);
+
+    // Cycle 0: `a` holds and d is 5, so one attempt captures 5. Nothing resolves --
+    // the comparison root is the second cycle's.
+    harness.d = 5;
+    @memset(bits, 0);
+    Nfa.bitSet(bits, rootOfAtom(&ir, &monitor, 0).?);
+    var report = run.step(bits);
+    try testing.expectEqual(@as(u64, 0), report.matches);
+
+    // Cycle 1: `a` holds again with d = 9, and o = 5. The attempt from cycle 0 sees
+    // its own 5 and matches; the one starting now captures 9.
+    harness.d = 9;
+    harness.o = 5;
+    @memset(bits, 0);
+    Nfa.bitSet(bits, rootOfAtom(&ir, &monitor, 0).?);
+    report = run.step(bits);
+    try testing.expectEqual(@as(u64, 1), report.matches);
+
+    // Cycle 2: o is 5 still, but the live attempt captured 9, so it fails -- a run
+    // that shared one valuation would have reported a match here instead. Two
+    // failures, not one: a bare sequence starts an attempt every cycle (the IR's
+    // implicit quantification), and the one starting now has no first cycle because
+    // `a` is low, which is a failure in the cycle it began.
+    @memset(bits, 0);
+    report = run.step(bits);
+    try testing.expectEqual(@as(u64, 0), report.matches);
+    try testing.expectEqual(@as(u64, 2), report.failures);
+}

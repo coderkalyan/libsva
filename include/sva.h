@@ -1107,7 +1107,7 @@ void sva_run_clear(sva_run *run);
    program are called in order and each sees the previous one's write.
 
    Binding is required before stepping a threaded monitor and pointless
-   otherwise. */
+   otherwise; stepping one unbound is a caller bug and asserts. */
 typedef struct sva_locals {
     uint64_t (*assign)(void *user, uint32_t site, const uint64_t *frame);
     bool (*root)(void *user, uint32_t root, const uint64_t *frame);
